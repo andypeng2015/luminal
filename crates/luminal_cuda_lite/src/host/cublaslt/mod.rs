@@ -1481,7 +1481,16 @@ impl CuBlasLt {
         )
         .entered();
 
-        const WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+        // Per-matmul cuBLASLt workspace. Defaults to 32 MiB; lower it via
+        // LUMINAL_CUBLASLT_WORKSPACE_MB for memory-tight models, where the sum
+        // of per-node workspaces (one allocation per matmul) is significant.
+        let workspace_size_mb: usize = std::env::var("LUMINAL_CUBLASLT_WORKSPACE_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(32);
+        let workspace_size = workspace_size_mb * 1024 * 1024;
+        #[allow(non_snake_case)]
+        let WORKSPACE_SIZE = workspace_size;
         let c_spec = LtMatrixSpec {
             dtype: c_cuda_dtype,
             rows: m,
@@ -1683,7 +1692,16 @@ impl HostOp for CuBlasLt {
         let cublaslt = self.get_cublaslt(stream)?;
 
         // Allocate workspace (32 MiB)
-        const WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+        // Per-matmul cuBLASLt workspace. Defaults to 32 MiB; lower it via
+        // LUMINAL_CUBLASLT_WORKSPACE_MB for memory-tight models, where the sum
+        // of per-node workspaces (one allocation per matmul) is significant.
+        let workspace_size_mb: usize = std::env::var("LUMINAL_CUBLASLT_WORKSPACE_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(32);
+        let workspace_size = workspace_size_mb * 1024 * 1024;
+        #[allow(non_snake_case)]
+        let WORKSPACE_SIZE = workspace_size;
         let c_spec = LtMatrixSpec {
             dtype: c_cuda_dtype,
             rows: m,
