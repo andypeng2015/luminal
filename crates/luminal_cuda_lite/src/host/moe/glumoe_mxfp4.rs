@@ -52,7 +52,11 @@ use crate::{
 use super::{WORKSPACE_SIZE, buf_ptr, cublas_matmul, cublas_matmul_mixed, slice_ptr};
 
 const MXFP4_BLOCK: usize = 32;
+// Used only by the reference activation in the unit test (the kernel inlines
+// these as literals in its NVRTC source).
+#[cfg(test)]
 const SWIGLU_LIMIT: f32 = 7.0;
+#[cfg(test)]
 const SWIGLU_ALPHA: f32 = 1.702;
 
 pub struct GLUMoEMXFP4 {

@@ -200,24 +200,17 @@ fn main() {
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
 
-    // ── Anti-fragmentation arena reserve ──
-    // The intermediate arena (~7.7-8 GiB at s=1, 36 layers) is allocated lazily
-    // by the search/run below, *after* the ~63 GB weight load. That load churns
-    // and fragments free VRAM, so no contiguous block big enough for the arena
-    // survives — we measured ~18 GiB free yet the largest hole was < 8 GiB, so
-    // the arena's cudaMalloc returns CUDA_ERROR_OUT_OF_MEMORY (deterministically,
-    // unlike the dense example whose KV cache isn't 72 separate buffers). Reserve
-    // a contiguous block now, while VRAM is empty (so it is guaranteed
-    // contiguous), and free it just before the arena is allocated so the arena
-    // reuses that clean hole. Set PAGED_ARENA_RESERVE_GIB=0 to disable. (The
-    // robust fix is a pooled allocator / cross-layer arena reuse in
-    // luminal_cuda_lite — see LUM-645.)
-    // The GLUMoEMXFP4 fusion moves the MoE out of the arena, so the arena now
-    // fits with headroom and this anti-fragmentation reserve is unneeded
-    // (default 0 = off; kept only as an escape hatch).
-    let reserve_gib = env_usize("PAGED_ARENA_RESERVE_GIB", 0);
-    let mut arena_reserve = (reserve_gib > 0)
-        .then(|| stream.alloc_zeros::<u8>(reserve_gib << 30).unwrap());
+    // Anti-fragmentation reserve. The intermediate arena (~7-8 GiB at s=1, 36
+    // layers) is allocated lazily during the search below, *after* the ~63 GB
+    // weight load has churned and fragmented free VRAM — so even with ~17 GiB
+    // free there may be no contiguous block big enough and the arena's
+    // cudaMalloc OOMs (a fragmentation lottery). Reserve a contiguous block now,
+    // while VRAM is empty, and free it just before the arena is allocated so the
+    // arena reuses that clean hole. The real fix is a pooled allocator /
+    // cross-layer arena reuse (LUM-645). Set PAGED_ARENA_RESERVE_GIB=0 to disable.
+    let reserve_gib = env_usize("PAGED_ARENA_RESERVE_GIB", 10);
+    let mut arena_reserve =
+        (reserve_gib > 0).then(|| stream.alloc_zeros::<u8>(reserve_gib << 30).unwrap());
 
     let (model_dir, shard_paths) = prepare_hf_model().expect("Failed to prepare model");
     println!("Using model directory: {}", model_dir.display());
@@ -336,9 +329,9 @@ fn main() {
     runtime.set_data(inp.mask_full, vec![0.0f32; ss * sc]);
     runtime.set_data(inp.mask_sliding, vec![0.0f32; ss * sc]);
     set_consts(&mut runtime);
-    // Release the reserved contiguous block right before the arena is allocated
-    // (during search) so the arena's cudaMalloc reuses this clean hole instead
-    // of failing in the fragmented free space left by the weight load.
+    // Free the reserved contiguous block right before the arena is allocated
+    // (during search) so the arena reuses this clean hole instead of OOMing in
+    // the fragmented free space left by the weight load.
     drop(arena_reserve.take());
     stream.synchronize().unwrap();
     let search_options = CompileOptions::default().search_graph_limit(1);

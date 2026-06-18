@@ -2350,36 +2350,24 @@ pub fn kernel_to_host(
 ) {
     let _span = span!(Level::TRACE, "kernel_to_host").entered();
 
-    // Escape hatch: still package kernels into CUDA graphs (so they execute),
-    // but do NOT absorb cuBLASLt / FlashInfer host ops into them. Host-op
-    // absorption is the only thing that force-enables
-    // `stabilize_intermediate_pointers`, which rounds every arena buffer up to a
-    // power of two and pins offsets (to keep absorbed-graph pointers valid as
-    // shapes grow) — bloating the arena ~8x (2.2 GiB -> 17.3 GiB) and OOMing
-    // paged_gpt_oss at 36 layers. Un-absorbing reverts to the pre-#344 behavior
-    // (cuBLASLt/FlashInfer run as standalone host ops between graph launches),
-    // so the arena packs to ~EST while kernels still run correctly. See LUM-645.
-    let absorb_host_ops = std::env::var_os("LUMINAL_NO_GRAPH_ABSORB").is_none();
-
     let graph_packagable_ops = llir_graph
         .node_indices()
         .filter(|n| {
             llir_graph[*n].to_dialect::<dyn KernelOp>().is_some()
-                || (absorb_host_ops
-                    && llir_graph[*n].to_dialect::<dyn HostOp>().is_some_and(|op| {
-                        let host = op.as_ref().as_ref();
-                        host.as_any()
-                            .downcast_ref::<CuBlasLt>()
-                            .is_some_and(|cublaslt| cublaslt.graph_inputs() > 0)
-                            || host
-                                .as_any()
-                                .downcast_ref::<FlashInferAttention>()
-                                .is_some_and(|flashinfer| {
-                                    let incoming =
-                                        llir_graph.edges_directed(*n, Direction::Incoming).count();
-                                    incoming == flashinfer.graph_inputs() || incoming == 6
-                                })
-                    }))
+                || llir_graph[*n].to_dialect::<dyn HostOp>().is_some_and(|op| {
+                    let host = op.as_ref().as_ref();
+                    host.as_any()
+                        .downcast_ref::<CuBlasLt>()
+                        .is_some_and(|cublaslt| cublaslt.graph_inputs() > 0)
+                        || host
+                            .as_any()
+                            .downcast_ref::<FlashInferAttention>()
+                            .is_some_and(|flashinfer| {
+                                let incoming =
+                                    llir_graph.edges_directed(*n, Direction::Incoming).count();
+                                incoming == flashinfer.graph_inputs() || incoming == 6
+                            })
+                })
         })
         .collect::<FxHashSet<_>>();
 

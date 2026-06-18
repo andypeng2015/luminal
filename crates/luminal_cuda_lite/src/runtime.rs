@@ -1107,24 +1107,6 @@ impl CudaRuntime {
             return;
         }
 
-        if std::env::var_os("LUMINAL_ARENA_PROBE").is_some() {
-            let n_steps: usize = bucket
-                .exec_graph
-                .node_weights()
-                .filter_map(|op| op.internal.as_any().downcast_ref::<CudaGraphOp>())
-                .map(|g| g.debug_summary().n_steps)
-                .sum();
-            eprintln!(
-                "ARENA_PROBE real | conflicts={} slots={} arena_bytes={} stabilize={} graph_steps={} dyn={:?}",
-                bucket.arena_conflicts.len(),
-                bucket.arena_slots.len(),
-                bucket.arena_bytes,
-                bucket.stabilize_intermediate_pointers,
-                n_steps,
-                dyn_dims,
-            );
-        }
-
         if bucket
             .arena
             .as_ref()
@@ -1136,17 +1118,15 @@ impl CudaRuntime {
                 bucket.arena_bytes
             };
             let timer = std::time::Instant::now();
-            // Probe: free the OLD arena before allocating the new one. The normal
-            // path (`bucket.arena = Some(stream.alloc(..))`) evaluates the new
-            // allocation before dropping the old CudaSlice, so old+new are both
-            // resident during the cudaMalloc — a transient ~2x spike that OOMs
-            // when an arena grows (e.g. paged context exceeding the compiled
-            // size). Dropping first avoids the double; correctness depends on the
-            // subsequent materialize() re-pointing absorbed graph nodes. See LUM-645.
-            if std::env::var_os("LUMINAL_FREE_ARENA_BEFORE_REALLOC").is_some() {
-                bucket.arena = None;
-                stream.synchronize().ok();
-            }
+            // Free the old arena before allocating the new one, so old+new are
+            // not both resident during the cudaMalloc. The naive order (assign
+            // `Some(stream.alloc(..))` while the old CudaSlice is still in the
+            // field) keeps both alive across the malloc — a transient ~2x spike
+            // that OOMs when the arena grows (e.g. paged context exceeding the
+            // compiled size). The subsequent materialize() re-points absorbed
+            // graph nodes to the new arena, so dropping first is safe.
+            bucket.arena = None;
+            stream.synchronize().ok();
             bucket.arena = Some(unsafe { stream.alloc(allocation_bytes).unwrap() });
             cuda_alloc_time += timer.elapsed();
             allocated_bytes = allocation_bytes;
@@ -1383,9 +1363,7 @@ impl CudaRuntime {
                     continue;
                 }
                 bucket.logical_buffer_bytes.insert(member.node, bytes);
-                let planned_capacity = if bucket.stabilize_intermediate_pointers
-                    && std::env::var_os("LUMINAL_NO_POW2_ARENA").is_none()
-                {
+                let planned_capacity = if bucket.stabilize_intermediate_pointers {
                     bytes.checked_next_power_of_two().unwrap_or(bytes)
                 } else {
                     bytes
@@ -1709,11 +1687,7 @@ impl CudaRuntime {
                     .get(&buf.node)
                     .copied()
                     .unwrap_or(0)
-                    .max(if std::env::var_os("LUMINAL_NO_POW2_ARENA").is_some() {
-                        buf.bytes
-                    } else {
-                        buf.bytes.checked_next_power_of_two().unwrap_or(buf.bytes)
-                    });
+                    .max(buf.bytes.checked_next_power_of_two().unwrap_or(buf.bytes));
                 let offset = align_up(arena_end, ARENA_ALIGNMENT);
                 bucket.logical_buffer_offsets.insert(buf.node, offset);
                 bucket.logical_buffer_bytes.insert(buf.node, buf.bytes);
@@ -1770,9 +1744,7 @@ impl CudaRuntime {
         }
 
         for buf in placement_order {
-            let planned_capacity = if bucket.stabilize_intermediate_pointers
-                && std::env::var_os("LUMINAL_NO_POW2_ARENA").is_none()
-            {
+            let planned_capacity = if bucket.stabilize_intermediate_pointers {
                 buf.bytes.checked_next_power_of_two().unwrap_or(buf.bytes)
             } else {
                 buf.bytes
@@ -2532,24 +2504,6 @@ impl Runtime for CudaRuntime {
         };
         Self::dry_plan_intermediate_buffers(&mut bucket, &allocation_dyn_map);
         let planned_bytes = Self::planned_allocation_bytes(&bucket);
-        if std::env::var_os("LUMINAL_ARENA_PROBE").is_some() {
-            let n_steps: usize = bucket
-                .exec_graph
-                .node_weights()
-                .filter_map(|op| op.internal.as_any().downcast_ref::<CudaGraphOp>())
-                .map(|g| g.debug_summary().n_steps)
-                .sum();
-            eprintln!(
-                "ARENA_PROBE dry  | conflicts={} slots={} arena_bytes={} planned={} stabilize={} graph_steps={} dyn={:?}",
-                bucket.arena_conflicts.len(),
-                bucket.arena_slots.len(),
-                bucket.arena_bytes,
-                planned_bytes,
-                bucket.stabilize_intermediate_pointers,
-                n_steps,
-                allocation_dyn_map,
-            );
-        }
         let display = format!("EST: {}", format_memory_bytes(planned_bytes));
         if self
             .max_intermediate_memory_bytes

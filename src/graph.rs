@@ -1125,13 +1125,6 @@ impl Graph {
         let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
 
         let (program, root) = hlir_to_egglog(self);
-        if let Ok(path) = std::env::var("DUMP_EGGLOG_PROGRAM") {
-            let _ = std::fs::write(&path, &program);
-            eprintln!("DUMP_EGGLOG_PROGRAM wrote {} bytes to {path}", program.len());
-            if std::env::var_os("DUMP_EGGLOG_EXIT").is_some() {
-                std::process::exit(0);
-            }
-        }
         let contexts = self.search_space_contexts(&dim_buckets);
         self.egraphs = contexts
             .iter()
@@ -1230,13 +1223,6 @@ impl Graph {
         let late_passes = Rt::late_egglog_passes(&ops, &options, &late_pass_dyn_map);
 
         let (program, root) = hlir_to_egglog(self);
-        if let Ok(path) = std::env::var("DUMP_EGGLOG_PROGRAM") {
-            let _ = std::fs::write(&path, &program);
-            eprintln!("DUMP_EGGLOG_PROGRAM wrote {} bytes to {path}", program.len());
-            if std::env::var_os("DUMP_EGGLOG_EXIT").is_some() {
-                std::process::exit(0);
-            }
-        }
         let contexts = self.search_space_contexts(&dim_buckets);
         self.egraphs = contexts
             .iter()
