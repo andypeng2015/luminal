@@ -38,18 +38,14 @@ use luminal::{
 use crate::{
     compile_module_image_for_current_device,
     cudarc::{
-        cublas::sys::cublasOperation_t,
-        cublaslt::{
-            CudaBlasLT,
-            sys::{cublasComputeType_t, cudaDataType},
-        },
+        cublaslt::CudaBlasLT,
         driver::{CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg},
     },
     host::{DeviceBuffer, HostOp},
     try_create_cublaslt,
 };
 
-use super::{WORKSPACE_SIZE, buf_ptr, cublas_matmul, cublas_matmul_mixed, slice_ptr};
+use super::{MoeDims, WORKSPACE_SIZE, buf_ptr, read_routing, run_moe_experts, slice_ptr};
 
 const MXFP4_BLOCK: usize = 32;
 // Used only by the reference activation in the unit test (the kernel inlines
@@ -387,21 +383,15 @@ impl HostOp for GLUMoEMXFP4 {
         let cublaslt = self.get_cublaslt(stream)?;
         let (_, f32_to_bf16_fn, dequant_fn, activation_fn, accum_bias_fn) = self.get_kernels(stream);
 
-        // Host-side top-k routing.
-        let topk_idx_host = topk_idx_buf.clone_dtoh(stream)?;
-        let topk_idx_i32: &[i32] = bytemuck::cast_slice(&topk_idx_host);
-        let topk_vals_host = topk_vals_buf.clone_dtoh(stream)?;
-        let topk_vals_f32: &[f32] = bytemuck::cast_slice(&topk_vals_host);
-        if !topk_idx_i32.len().is_multiple_of(seq) || !topk_vals_f32.len().is_multiple_of(seq) {
-            anyhow::bail!("GLUMoEMXFP4 topk element counts not divisible by seq {seq}");
+        // Host-side top-k routing, compacted to a dense top_k stride. top-k
+        // weights are applied directly (no normalization).
+        let (topk_idx, topk_vals) =
+            read_routing(stream, topk_idx_buf, topk_vals_buf, seq, top_k, "GLUMoEMXFP4")?;
+        for &expert_idx in &topk_idx {
+            if expert_idx < 0 || expert_idx as usize >= num_experts {
+                anyhow::bail!("GLUMoEMXFP4 expert index {expert_idx} out of range");
+            }
         }
-        let idx_stride = topk_idx_i32.len() / seq;
-        let val_stride = topk_vals_f32.len() / seq;
-        if idx_stride < top_k || val_stride < top_k {
-            anyhow::bail!("GLUMoEMXFP4 topk row stride smaller than top_k");
-        }
-        let idx_at = |t: usize, i: usize| topk_idx_i32[t * idx_stride + i];
-        let val_at = |t: usize, i: usize| topk_vals_f32[t * val_stride + i];
 
         // Reused scratch (freed at end of this layer's execute).
         let x_bf16 = unsafe { stream.alloc::<u8>(seq * hidden * 2)? };
@@ -448,17 +438,29 @@ impl HostOp for GLUMoEMXFP4 {
             ],
         )?;
 
-        for t in 0..seq {
-            let x_t_ptr = xbf16_ptr + (t * hidden * 2) as u64;
-            for i in 0..top_k {
-                let expert_idx = idx_at(t, i);
-                if expert_idx < 0 || expert_idx as usize >= num_experts {
-                    anyhow::bail!("GLUMoEMXFP4 expert index {expert_idx} out of range");
-                }
-                let e = expert_idx as usize;
-                let weight = val_at(t, i);
-
-                // 1. Dequant gate_up expert -> [gate_up_dim, hidden] bf16
+        // Per-token expert computation via the shared MoE skeleton. The MXFP4
+        // specifics live in the hooks: dequant the gathered expert into reused
+        // scratch (gate_up / down), the clamped interleaved SwiGLU + gate_up
+        // bias activation, and the weighted down-bias accumulate epilogue.
+        let dims = MoeDims {
+            seq,
+            hidden,
+            intermediate,
+            gate_up_dim,
+            top_k,
+        };
+        run_moe_experts(
+            stream,
+            &cublaslt,
+            ws_ptr,
+            &dims,
+            xbf16_ptr,
+            output_ptr,
+            gu_out_ptr,
+            hid_ptr,
+            &topk_idx,
+            &topk_vals,
+            |e| {
                 launch(
                     dequant_fn,
                     gate_up_dim * hidden,
@@ -470,42 +472,21 @@ impl HostOp for GLUMoEMXFP4 {
                         KernelArg::I32(hidden as i32),
                     ],
                 )?;
-
-                // 2. gate_up matmul: [gate_up_dim, hidden]^T @ x_t[hidden] -> gu_out[gate_up_dim]
-                cublas_matmul(
-                    stream,
-                    &cublaslt,
-                    ws_ptr,
-                    gate_up_dim as u64,
-                    1,
-                    hidden as u64,
-                    gu_w_deq_ptr,
-                    cublasOperation_t::CUBLAS_OP_T,
-                    hidden as i64,
-                    x_t_ptr,
-                    cublasOperation_t::CUBLAS_OP_N,
-                    hidden as i64,
-                    gu_out_ptr,
-                    gate_up_dim as i64,
-                    cudaDataType::CUDA_R_16BF,
-                    cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                    1.0,
-                    0.0,
-                )?;
-
-                // 3. clamped interleaved SwiGLU + gate_up bias -> hid[intermediate]
+                Ok(gu_w_deq_ptr)
+            },
+            |e, gu, hid_out| {
                 launch(
                     activation_fn,
                     intermediate,
                     &[
-                        KernelArg::U64(gu_out_ptr),
+                        KernelArg::U64(gu),
                         KernelArg::U64(gu_bias_ptr + (e * gu_bias_stride) as u64),
-                        KernelArg::U64(hid_ptr),
+                        KernelArg::U64(hid_out),
                         KernelArg::I32(intermediate as i32),
                     ],
-                )?;
-
-                // 4. Dequant down expert -> [hidden, intermediate] bf16
+                )
+            },
+            |e| {
                 launch(
                     dequant_fn,
                     hidden * intermediate,
@@ -517,45 +498,22 @@ impl HostOp for GLUMoEMXFP4 {
                         KernelArg::I32(intermediate as i32),
                     ],
                 )?;
-
-                // 5. down matmul: [hidden, intermediate]^T @ hid[intermediate] -> out_t[hidden],
-                //    scaled by the top-k weight, accumulated across experts.
-                let out_t_ptr = output_ptr + (t * hidden * 4) as u64;
-                let beta = if i == 0 { 0.0f32 } else { 1.0f32 };
-                cublas_matmul_mixed(
-                    stream,
-                    &cublaslt,
-                    ws_ptr,
-                    hidden as u64,
-                    1,
-                    intermediate as u64,
-                    dn_w_deq_ptr,
-                    cublasOperation_t::CUBLAS_OP_T,
-                    intermediate as i64,
-                    hid_ptr,
-                    cublasOperation_t::CUBLAS_OP_N,
-                    intermediate as i64,
-                    out_t_ptr,
-                    hidden as i64,
-                    weight,
-                    beta,
-                )?;
-
-                // 6. Add weight * down_bias[e] to the accumulator.
+                Ok(dn_w_deq_ptr)
+            },
+            |_t, e, w, out| {
                 launch(
                     accum_bias_fn,
                     hidden,
                     &[
-                        KernelArg::U64(out_t_ptr),
+                        KernelArg::U64(out),
                         KernelArg::U64(dn_bias_ptr + (e * dn_bias_stride) as u64),
                         KernelArg::I32(hidden as i32),
-                        KernelArg::F32(weight),
+                        KernelArg::F32(w),
                     ],
-                )?;
-            }
-        }
+                )
+            },
+        )?;
 
-        stream.synchronize()?;
         Ok(())
     }
 

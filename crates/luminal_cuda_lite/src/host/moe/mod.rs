@@ -444,52 +444,16 @@ impl HostOp for GLUMoE {
         let cublaslt = self.get_cublaslt(stream)?;
         let (_, f32_to_bf16_fn, activation_fn) = self.get_kernels(stream);
 
-        // Read top-k routing values from GPU
-        let topk_idx_host: Vec<u8> = topk_idx_buf.clone_dtoh(stream)?;
-        let topk_idx_i32: &[i32] = bytemuck::cast_slice(&topk_idx_host);
-        let topk_vals_host: Vec<u8> = topk_vals_buf.clone_dtoh(stream)?;
-        let topk_vals_f32: &[f32] = bytemuck::cast_slice(&topk_vals_host);
+        // Read top-k routing, compacted to a dense top_k stride.
+        let (topk_idx, topk_vals) =
+            read_routing(stream, topk_idx_buf, topk_vals_buf, seq, top_k, "GLUMoE")?;
 
-        if !topk_idx_i32.len().is_multiple_of(seq) {
-            anyhow::bail!(
-                "GLUMoE topk index element count {} is not divisible by seq {seq}",
-                topk_idx_i32.len()
-            );
-        }
-        if !topk_vals_f32.len().is_multiple_of(seq) {
-            anyhow::bail!(
-                "GLUMoE topk value element count {} is not divisible by seq {seq}",
-                topk_vals_f32.len()
-            );
-        }
-        let topk_idx_row_stride = topk_idx_i32.len() / seq;
-        let topk_vals_row_stride = topk_vals_f32.len() / seq;
-        if topk_idx_row_stride < top_k {
-            anyhow::bail!(
-                "GLUMoE topk index row stride {topk_idx_row_stride} is smaller than top_k {top_k}"
-            );
-        }
-        if topk_vals_row_stride < top_k {
-            anyhow::bail!(
-                "GLUMoE topk value row stride {topk_vals_row_stride} is smaller than top_k {top_k}"
-            );
-        }
-
-        let topk_idx_at = |token: usize, expert: usize| -> i32 {
-            topk_idx_i32[token * topk_idx_row_stride + expert]
-        };
-        let topk_val_at = |token: usize, expert: usize| -> f32 {
-            topk_vals_f32[token * topk_vals_row_stride + expert]
-        };
-
-        for t in 0..seq {
-            for i in 0..top_k {
-                let expert_idx = topk_idx_at(t, i);
-                if expert_idx < 0 || expert_idx as usize >= num_experts {
-                    anyhow::bail!(
-                        "GLUMoE expert index {expert_idx} at token {t} top-k position {i} out of bounds for {num_experts} experts"
-                    );
-                }
+        for (slot, &expert_idx) in topk_idx.iter().enumerate() {
+            if expert_idx < 0 || expert_idx as usize >= num_experts {
+                let (t, i) = (slot / top_k, slot % top_k);
+                anyhow::bail!(
+                    "GLUMoE expert index {expert_idx} at token {t} top-k position {i} out of bounds for {num_experts} experts"
+                );
             }
         }
 
@@ -497,31 +461,18 @@ impl HostOp for GLUMoE {
         // - SwiGLU: direct topk values
         // - SwiGLUNormalized: normalize topk values row-wise
         // - GemmaGELU: normalize topk values and scale by per-expert factors
-        let mut expert_weights_storage: Vec<f32> = Vec::new();
-        let expert_weights_f32: &[f32] = match self.mode {
-            GLUMoEMode::SwiGLU => {
-                if topk_vals_row_stride == top_k {
-                    topk_vals_f32
-                } else {
-                    expert_weights_storage.resize(seq * top_k, 0.0);
-                    for t in 0..seq {
-                        for i in 0..top_k {
-                            expert_weights_storage[t * top_k + i] = topk_val_at(t, i);
-                        }
-                    }
-                    &expert_weights_storage
-                }
-            }
+        let expert_weights: Vec<f32> = match self.mode {
+            GLUMoEMode::SwiGLU => topk_vals.clone(),
             GLUMoEMode::SwiGLUNormalized => {
-                expert_weights_storage.resize(seq * top_k, 0.0);
+                let mut w = vec![0.0f32; seq * top_k];
                 for t in 0..seq {
-                    let norm = (0..top_k).map(|i| topk_val_at(t, i)).sum::<f32>();
+                    let norm = (0..top_k).map(|i| topk_vals[t * top_k + i]).sum::<f32>();
                     let inv_norm = if norm != 0.0 { norm.recip() } else { 0.0 };
                     for i in 0..top_k {
-                        expert_weights_storage[t * top_k + i] = topk_val_at(t, i) * inv_norm;
+                        w[t * top_k + i] = topk_vals[t * top_k + i] * inv_norm;
                     }
                 }
-                &expert_weights_storage
+                w
             }
             GLUMoEMode::GemmaGELU => {
                 let per_expert_scale_host: Vec<u8> = mode_aux_buf.clone_dtoh(stream)?;
@@ -534,12 +485,12 @@ impl HostOp for GLUMoE {
                 }
                 let per_expert_scale_f32: &[f32] =
                     bytemuck::cast_slice(&per_expert_scale_host[..per_expert_scale_bytes]);
-                expert_weights_storage.resize(seq * top_k, 0.0);
+                let mut w = vec![0.0f32; seq * top_k];
                 for t in 0..seq {
-                    let norm = (0..top_k).map(|i| topk_val_at(t, i)).sum::<f32>();
+                    let norm = (0..top_k).map(|i| topk_vals[t * top_k + i]).sum::<f32>();
                     let inv_norm = if norm != 0.0 { norm.recip() } else { 0.0 };
                     for i in 0..top_k {
-                        let expert_idx = topk_idx_at(t, i) as usize;
+                        let expert_idx = topk_idx[t * top_k + i] as usize;
                         if expert_idx >= per_expert_scale_f32.len() {
                             anyhow::bail!(
                                 "GLUMoE Gemma mode expert index {} out of bounds {}",
@@ -548,11 +499,10 @@ impl HostOp for GLUMoE {
                             );
                         }
                         let scale = per_expert_scale_f32[expert_idx];
-                        expert_weights_storage[t * top_k + i] =
-                            topk_val_at(t, i) * inv_norm * scale;
+                        w[t * top_k + i] = topk_vals[t * top_k + i] * inv_norm * scale;
                     }
                 }
-                &expert_weights_storage
+                w
             }
         };
 
@@ -583,49 +533,40 @@ impl HostOp for GLUMoE {
                 })?;
         }
 
-        // Per-token expert computation
+        // Per-token expert computation via the shared MoE skeleton.
         let gu_stride = gu_stride_bytes as u64; // bytes per expert gate_up (BF16)
         let down_stride = down_stride_bytes as u64; // bytes per expert down (BF16)
+        let moe_int = intermediate as i32;
+        let activation_mode = self.mode.activation_kernel_mode();
+        let activation_blocks = (moe_int as u32).div_ceil(256);
 
-        for t in 0..seq {
-            let x_t_ptr = xbf16_ptr + (t * hidden * 2) as u64; // BF16
-            let weights = &expert_weights_f32[t * top_k..(t + 1) * top_k];
-
-            for (i, &weight) in weights.iter().enumerate() {
-                let expert_idx = topk_idx_at(t, i) as usize;
-
-                // a. Gate+Up matmul (BF16 in, BF16 out)
-                let expert_gu_ptr = gate_up_ptr + expert_idx as u64 * gu_stride;
-                cublas_matmul(
-                    stream,
-                    &cublaslt,
-                    ws_ptr,
-                    gate_up_dim as u64,
-                    1,
-                    hidden as u64,
-                    expert_gu_ptr,
-                    cublasOperation_t::CUBLAS_OP_T,
-                    hidden as i64,
-                    x_t_ptr,
-                    cublasOperation_t::CUBLAS_OP_N,
-                    hidden as i64,
-                    gu_out_ptr,
-                    gate_up_dim as i64,
-                    cudaDataType::CUDA_R_16BF,
-                    cublasComputeType_t::CUBLAS_COMPUTE_32F,
-                    1.0f32,
-                    0.0f32,
-                )?;
-
-                // b. Mode-specific gated activation (BF16 → BF16)
-                let moe_int = intermediate as i32;
-                let activation_mode = self.mode.activation_kernel_mode();
-                let activation_blocks = (moe_int as u32).div_ceil(256);
+        let dims = MoeDims {
+            seq,
+            hidden,
+            intermediate,
+            gate_up_dim,
+            top_k,
+        };
+        run_moe_experts(
+            stream,
+            &cublaslt,
+            ws_ptr,
+            &dims,
+            xbf16_ptr,
+            output_ptr,
+            gu_out_ptr,
+            hid_ptr,
+            &topk_idx,
+            &expert_weights,
+            // gate_up weight: gather the resident bf16 expert directly
+            |e| Ok(gate_up_ptr + e as u64 * gu_stride),
+            // activation: mode-selected SwiGLU / GemmaGELU (no bias)
+            |_e, gu, hid| {
                 unsafe {
                     stream
                         .launch_builder(activation_fn)
-                        .arg(&gu_out_ptr)
-                        .arg(&hid_ptr)
+                        .arg(&gu)
+                        .arg(&hid)
                         .arg(&moe_int)
                         .arg(&activation_mode)
                         .launch(LaunchConfig {
@@ -634,34 +575,14 @@ impl HostOp for GLUMoE {
                             shared_mem_bytes: 0,
                         })?;
                 }
+                Ok(())
+            },
+            // down weight: gather the resident bf16 expert directly
+            |e| Ok(down_ptr + e as u64 * down_stride),
+            // no down epilogue (bf16 GLUMoE folds bias into weights upstream)
+            |_t, _e, _w, _out| Ok(()),
+        )?;
 
-                // c. Down matmul (BF16 in → F32 out) with fused accumulate
-                let expert_down_ptr = down_ptr + expert_idx as u64 * down_stride;
-                let out_t_ptr = output_ptr + (t * hidden * 4) as u64; // F32
-
-                let beta = if i == 0 { 0.0f32 } else { 1.0f32 };
-                cublas_matmul_mixed(
-                    stream,
-                    &cublaslt,
-                    ws_ptr,
-                    hidden as u64,
-                    1,
-                    intermediate as u64,
-                    expert_down_ptr,
-                    cublasOperation_t::CUBLAS_OP_T,
-                    intermediate as i64,
-                    hid_ptr,
-                    cublasOperation_t::CUBLAS_OP_N,
-                    intermediate as i64,
-                    out_t_ptr,
-                    hidden as i64,
-                    weight,
-                    beta,
-                )?;
-            }
-        }
-
-        stream.synchronize()?;
         Ok(())
     }
 
@@ -692,6 +613,165 @@ fn buf_ptr(buf: DeviceBuffer, _stream: &Arc<CudaStream>) -> u64 {
 fn slice_ptr(buf: &CudaSlice<u8>, stream: &Arc<CudaStream>) -> u64 {
     let (ptr, _guard) = buf.device_ptr(stream);
     ptr
+}
+
+/// Dimensions shared by the GLU-MoE host ops.
+pub(crate) struct MoeDims {
+    pub seq: usize,
+    pub hidden: usize,
+    pub intermediate: usize,
+    pub gate_up_dim: usize,
+    pub top_k: usize,
+}
+
+/// Copy the top-k routing (expert indices + values) from device to host and
+/// compact both to a dense `top_k` stride (`[token * top_k + i]`), regardless of
+/// any row padding in the source buffers. Returns `(indices, values)`, each of
+/// length `seq * top_k`. Shared by every GLU-MoE host op.
+pub(crate) fn read_routing(
+    stream: &Arc<CudaStream>,
+    topk_idx_buf: DeviceBuffer,
+    topk_vals_buf: DeviceBuffer,
+    seq: usize,
+    top_k: usize,
+    op: &str,
+) -> anyhow::Result<(Vec<i32>, Vec<f32>)> {
+    let topk_idx_host: Vec<u8> = topk_idx_buf.clone_dtoh(stream)?;
+    let topk_idx_i32: &[i32] = bytemuck::cast_slice(&topk_idx_host);
+    let topk_vals_host: Vec<u8> = topk_vals_buf.clone_dtoh(stream)?;
+    let topk_vals_f32: &[f32] = bytemuck::cast_slice(&topk_vals_host);
+
+    if !topk_idx_i32.len().is_multiple_of(seq) {
+        anyhow::bail!(
+            "{op} topk index element count {} is not divisible by seq {seq}",
+            topk_idx_i32.len()
+        );
+    }
+    if !topk_vals_f32.len().is_multiple_of(seq) {
+        anyhow::bail!(
+            "{op} topk value element count {} is not divisible by seq {seq}",
+            topk_vals_f32.len()
+        );
+    }
+    let idx_stride = topk_idx_i32.len() / seq;
+    let val_stride = topk_vals_f32.len() / seq;
+    if idx_stride < top_k {
+        anyhow::bail!("{op} topk index row stride {idx_stride} is smaller than top_k {top_k}");
+    }
+    if val_stride < top_k {
+        anyhow::bail!("{op} topk value row stride {val_stride} is smaller than top_k {top_k}");
+    }
+
+    let mut idx = vec![0i32; seq * top_k];
+    let mut vals = vec![0f32; seq * top_k];
+    for t in 0..seq {
+        for i in 0..top_k {
+            idx[t * top_k + i] = topk_idx_i32[t * idx_stride + i];
+            vals[t * top_k + i] = topk_vals_f32[t * val_stride + i];
+        }
+    }
+    Ok((idx, vals))
+}
+
+/// The shared per-(token, expert) MoE execution loop: gate_up matmul → activation
+/// → down matmul with weighted (`alpha = expert weight`) accumulation across the
+/// top-k experts (`beta = 0` for the first expert, `1` after). The three points
+/// where the bf16 and MXFP4 variants diverge are passed as hooks:
+/// - `gate_up_weight(expert_idx) -> bf16 weight ptr` (gather vs dequant)
+/// - `activation(expert_idx, gate_up_out_ptr, hidden_tmp_ptr)` (mode kernel)
+/// - `down_epilogue(token, expert_idx, weight, out_t_ptr)` (e.g. bias accumulate)
+///
+/// `topk_idx` / `expert_weights` are dense `[token * top_k + i]` (see
+/// [`read_routing`]); callers are responsible for validating expert indices and
+/// allocating the scratch the ptrs point at. Synchronizes the stream at the end.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn run_moe_experts(
+    stream: &Arc<CudaStream>,
+    cublaslt: &Arc<CudaBlasLT>,
+    ws_ptr: u64,
+    dims: &MoeDims,
+    x_bf16_ptr: u64,
+    output_ptr: u64,
+    gate_up_out_ptr: u64,
+    hidden_tmp_ptr: u64,
+    topk_idx: &[i32],
+    expert_weights: &[f32],
+    mut gate_up_weight: impl FnMut(usize) -> anyhow::Result<u64>,
+    mut activation: impl FnMut(usize, u64, u64) -> anyhow::Result<()>,
+    mut down_weight: impl FnMut(usize) -> anyhow::Result<u64>,
+    mut down_epilogue: impl FnMut(usize, usize, f32, u64) -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let MoeDims {
+        seq,
+        hidden,
+        intermediate,
+        gate_up_dim,
+        top_k,
+    } = *dims;
+
+    for t in 0..seq {
+        let x_t_ptr = x_bf16_ptr + (t * hidden * 2) as u64; // BF16
+
+        for i in 0..top_k {
+            let expert_idx = topk_idx[t * top_k + i] as usize;
+            let weight = expert_weights[t * top_k + i];
+
+            // a. Gate+Up matmul (BF16 in, BF16 out)
+            let gu_w_ptr = gate_up_weight(expert_idx)?;
+            cublas_matmul(
+                stream,
+                cublaslt,
+                ws_ptr,
+                gate_up_dim as u64,
+                1,
+                hidden as u64,
+                gu_w_ptr,
+                cublasOperation_t::CUBLAS_OP_T,
+                hidden as i64,
+                x_t_ptr,
+                cublasOperation_t::CUBLAS_OP_N,
+                hidden as i64,
+                gate_up_out_ptr,
+                gate_up_dim as i64,
+                cudaDataType::CUDA_R_16BF,
+                cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                1.0f32,
+                0.0f32,
+            )?;
+
+            // b. Gated activation (BF16 → BF16)
+            activation(expert_idx, gate_up_out_ptr, hidden_tmp_ptr)?;
+
+            // c. Down matmul (BF16 in → F32 out) with fused weighted accumulate
+            let dn_w_ptr = down_weight(expert_idx)?;
+            let out_t_ptr = output_ptr + (t * hidden * 4) as u64; // F32
+            let beta = if i == 0 { 0.0f32 } else { 1.0f32 };
+            cublas_matmul_mixed(
+                stream,
+                cublaslt,
+                ws_ptr,
+                hidden as u64,
+                1,
+                intermediate as u64,
+                dn_w_ptr,
+                cublasOperation_t::CUBLAS_OP_T,
+                intermediate as i64,
+                hidden_tmp_ptr,
+                cublasOperation_t::CUBLAS_OP_N,
+                intermediate as i64,
+                out_t_ptr,
+                hidden as i64,
+                weight,
+                beta,
+            )?;
+
+            // d. Per-expert down epilogue (e.g. weighted bias accumulate)
+            down_epilogue(t, expert_idx, weight, out_t_ptr)?;
+        }
+    }
+
+    stream.synchronize()?;
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
