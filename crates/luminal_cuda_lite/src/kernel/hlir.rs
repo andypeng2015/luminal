@@ -12,7 +12,7 @@ use luminal::{
         base::{DTYPE, ELIST, EXPRESSION, F64, OP_KIND, SORTS, dtype, ilist, op_term},
         extract_dtype, extract_expr, extract_expr_list,
     },
-    hlir::{LessThan, MaxReduce, Mod, Scatter, SumReduce},
+    hlir::{LessThan, Max, MaxReduce, Mod, Scatter, SumReduce},
     op::*,
     prelude::*,
 };
@@ -50,6 +50,7 @@ pub fn dtype_includes(dtypes: &[DType]) -> String {
 pub type Ops = (
     KernelMod,
     KernelLessThan,
+    KernelMax,
     KernelIota,
     KernelGather,
     KernelScatter,
@@ -1537,6 +1538,183 @@ extern \"C\" {{
 
     fn kernel_name(&self) -> &'static str {
         "LessThan"
+    }
+}
+
+#[derive(Default, Debug, Clone)]
+pub struct KernelMax {
+    out_shape: Vec<Expression>,
+    a_stride: Vec<Expression>,
+    b_stride: Vec<Expression>,
+    out_stride: Vec<Expression>,
+    dtype: DType,
+}
+
+impl EgglogOp for KernelMax {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelEltMax",
+            &[
+                ("shape", ELIST),
+                ("a_strides", ELIST),
+                ("b_strides", ELIST),
+                ("out_strides", ELIST),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        2
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        let hlir = Max::default().sort();
+        let (mut args, hlir_kind_term) = hlir.new_call();
+        let inp_a = v("?__inp_a");
+        let inp_b = v("?__inp_b");
+        let hlir_inputs = ilist(vec![inp_a.clone(), inp_b.clone()]);
+        let hlir_op = op_term(hlir_kind_term, hlir_inputs.clone());
+        let dt = v("?__dt");
+        args.add("dtype", dt.clone());
+        let kernel_kind_term = self.sort().call(&args);
+        let kernel_op = op_term(kernel_kind_term, hlir_inputs);
+        vec![
+            rule(union(hlir_op, kernel_op))
+                .fact(eq(dt, dtype(inp_a)))
+                .ruleset("kernel_lower"),
+        ]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
+                    .unwrap(),
+                a_stride: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
+                    .unwrap(),
+                b_stride: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
+                    .unwrap(),
+                out_stride: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
+                    .unwrap(),
+                dtype: extract_dtype(egraph, kind_children[4]),
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl KernelOp for KernelMax {
+    fn compile(
+        &self,
+        stream: &Arc<CudaStream>,
+        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<char, CudaSlice<u8>>,
+    ) {
+        let vars = self
+            .out_shape
+            .iter()
+            .flat_map(|e| e.dyn_vars())
+            .chain(self.a_stride.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.b_stride.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.out_stride.iter().flat_map(|e| e.dyn_vars()))
+            .collect::<FxHashSet<_>>();
+        let dtype = cuda_dtype(self.dtype);
+        let includes = dtype_includes(&[self.dtype, self.dtype]);
+        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
+        let dyn_dims_param = if vars.is_empty() {
+            ""
+        } else {
+            ", const int* dyn_dims"
+        };
+        let n_elements = self
+            .out_shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .to_kernel();
+        let out_idx = flatten_strides(&self.out_shape, &self.out_stride).to_kernel();
+        let a_idx = flatten_strides(&self.out_shape, &self.a_stride).to_kernel();
+        let b_idx = flatten_strides(&self.out_shape, &self.b_stride).to_kernel();
+        let kernel = format!(
+            "{includes}
+{dyn_defines}
+extern \"C\" {{
+    __global__ void max_k({dtype} *C, const {dtype} *A, const {dtype} *B{dyn_dims_param}) {{
+        long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        if (const_z >= {n_elements}) return;
+        {dtype} a = A[{a_idx}];
+        {dtype} b = B[{b_idx}];
+        C[{out_idx}] = a > b ? a : b;
+    }}
+}}"
+        );
+        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
+            (module.clone(), func.clone())
+        } else {
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
+            let module = stream.context().load_module(ptx).unwrap();
+            let func = module.load_function("max_k").unwrap();
+            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+            (module, func)
+        };
+        let out_size = self.out_shape.iter().copied().product::<Expression>();
+        (
+            func,
+            module,
+            kernel,
+            (out_size.ceil_div(256), 1.into(), 1.into()),
+            (out_size.min(256), 1.into(), 1.into()),
+            0.into(),
+            FxHashMap::default(),
+        )
+    }
+
+    fn output_size(&self) -> Expression {
+        self.out_shape.iter().copied().product()
+    }
+
+    fn output_bytes(&self) -> Expression {
+        (self.output_size() * self.dtype.bits()).ceil_div(8)
+    }
+
+    fn bytes_loaded(&self) -> Expression {
+        (self.output_size() * self.dtype.bits()).ceil_div(8) * 2
+    }
+
+    fn bytes_stored(&self) -> Expression {
+        self.output_bytes()
+    }
+
+    fn flops(&self) -> Expression {
+        self.out_shape.iter().copied().product()
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn kernel_name(&self) -> &'static str {
+        "EltMax"
     }
 }
 

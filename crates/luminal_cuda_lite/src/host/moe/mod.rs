@@ -38,6 +38,10 @@ use crate::{
 
 const WORKSPACE_SIZE: usize = 32 * 1024 * 1024; // 32 MiB
 
+// MXFP4 grouped-MoE variant: fuses the gpt-oss MXFP4 MoE subgraph (see
+// glumoe_mxfp4_rewrite.egg) so the experts run as a host op outside the arena.
+pub mod glumoe_mxfp4;
+
 /// Fused GLU-MoE HostOp matched via egglog pattern.
 ///
 /// Replaces the expert computation subgraph (expert gathers + matmuls + gated

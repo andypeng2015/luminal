@@ -10,6 +10,7 @@ pub type Ops = (
     cublaslt::CuBlasLt,
     cublaslt::CuBlasLtScaled,
     moe::GLUMoE,
+    moe::glumoe_mxfp4::GLUMoEMXFP4,
     flashinfer::FlashInferAttention,
 );
 

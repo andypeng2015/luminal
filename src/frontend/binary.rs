@@ -354,9 +354,26 @@ impl GraphTensor {
 
     // Clipping ops (minimum, maximum, clip)
 
-    /// Take the elementwise maximum of two tensors
+    /// Take the elementwise maximum of two tensors.
+    ///
+    /// Emits a single `Max` HLIR op (rather than a `lt`/`cast`/`mul`/`add`
+    /// formula) so downstream pattern matching stays small — see the
+    /// gpt-oss MXFP4 MoE fusion (GLUMoEMXFP4).
     pub fn maximum(self, rhs: GraphTensor) -> GraphTensor {
-        (self.lt(rhs).cast(self.dtype) * rhs) + (rhs.le(self).cast(self.dtype) * self)
+        assert_eq!(self.dims(), rhs.dims(), "Dims must match to maximum tensors.");
+        assert_eq!(
+            self.dtype, rhs.dtype,
+            "Dtypes must match to maximum tensors. Got {:?} and {:?}",
+            self.dtype, rhs.dtype
+        );
+        let new_id = self.graph().add_op(
+            crate::hlir::Max {
+                input_shapes: vec![self.shape, rhs.shape],
+                ..Default::default()
+            },
+            &[self.id, rhs.id],
+        );
+        GraphTensor::from_id(new_id, self.shape.contiguous(), self.graph_ref, self.dtype)
     }
 
     /// Take the elementwise maximum of a tensor and a float

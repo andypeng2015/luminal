@@ -200,6 +200,25 @@ fn main() {
     let ctx = CudaContext::new(0).unwrap();
     let stream = ctx.default_stream();
 
+    // ── Anti-fragmentation arena reserve ──
+    // The intermediate arena (~7.7-8 GiB at s=1, 36 layers) is allocated lazily
+    // by the search/run below, *after* the ~63 GB weight load. That load churns
+    // and fragments free VRAM, so no contiguous block big enough for the arena
+    // survives — we measured ~18 GiB free yet the largest hole was < 8 GiB, so
+    // the arena's cudaMalloc returns CUDA_ERROR_OUT_OF_MEMORY (deterministically,
+    // unlike the dense example whose KV cache isn't 72 separate buffers). Reserve
+    // a contiguous block now, while VRAM is empty (so it is guaranteed
+    // contiguous), and free it just before the arena is allocated so the arena
+    // reuses that clean hole. Set PAGED_ARENA_RESERVE_GIB=0 to disable. (The
+    // robust fix is a pooled allocator / cross-layer arena reuse in
+    // luminal_cuda_lite — see LUM-645.)
+    // The GLUMoEMXFP4 fusion moves the MoE out of the arena, so the arena now
+    // fits with headroom and this anti-fragmentation reserve is unneeded
+    // (default 0 = off; kept only as an escape hatch).
+    let reserve_gib = env_usize("PAGED_ARENA_RESERVE_GIB", 0);
+    let mut arena_reserve = (reserve_gib > 0)
+        .then(|| stream.alloc_zeros::<u8>(reserve_gib << 30).unwrap());
+
     let (model_dir, shard_paths) = prepare_hf_model().expect("Failed to prepare model");
     println!("Using model directory: {}", model_dir.display());
     let tokenizer = Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap();
@@ -275,17 +294,13 @@ fn main() {
 
     println!("Loading weights ({} shards)...", shard_paths.len());
     let cap_gib = env_usize("GPTOSS_MEM_CAP_GIB", 14);
-    let mut runtime = CudaRuntime::initialize(stream).with_max_memory_gib(cap_gib);
-    for p in &shard_paths {
-        runtime.load_safetensors(&cx, p.to_str().unwrap());
-    }
+    let mut runtime = CudaRuntime::initialize(stream.clone()).with_max_memory_gib(cap_gib);
+
     let set_consts = |rt: &mut CudaRuntime| {
         rt.set_data(inv_freq_id, inv_freq_vals.clone());
         rt.set_data(lut_lo_id, lut_lo_vals.clone());
         rt.set_data(lut_hi_id, lut_hi_vals.clone());
     };
-    set_consts(&mut runtime);
-
     let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<f32>();
     let zero_cache = |rt: &mut CudaRuntime| {
         for i in 0..kv_cache.k_caches.len() {
@@ -293,10 +308,25 @@ fn main() {
             rt.set_zeros(kv_cache.v_caches[i], cache_bytes);
         }
     };
+
+    // Allocate the persistent KV-cache pool and constant buffers BEFORE loading
+    // the weights. They then sit "below" the weights in VRAM, leaving the large
+    // post-weight free region contiguous for the intermediate arena + CUDA-graph
+    // capture. Doing this *after* the weight load (the obvious order) instead
+    // splinters that region, so the ~7.7 GiB arena's cudaMalloc OOMs even with
+    // ~18 GiB free — this is the one structural difference from the dense
+    // gpt_oss example, which has no separate KV buffers and fits. See LUM-645.
+    set_consts(&mut runtime);
     zero_cache(&mut runtime);
 
+    for p in &shard_paths {
+        runtime.load_safetensors(&cx, p.to_str().unwrap());
+    }
+
     println!("Compiling...");
-    let (ss, sc) = (if batch_demo { 2 } else { 1 }, 16usize);
+    // Compile the context dim large enough to cover prompt + generation so the
+    // intermediate arena is allocated once (no mid-prefill realloc).
+    let (ss, sc) = (if batch_demo { 2 } else { 1 }, env_usize("COMPILE_C", 64));
     cx.set_dim('s', ss);
     cx.set_dim('c', sc);
     runtime.set_data(inp.input, vec![1i32; ss]);
@@ -306,6 +336,11 @@ fn main() {
     runtime.set_data(inp.mask_full, vec![0.0f32; ss * sc]);
     runtime.set_data(inp.mask_sliding, vec![0.0f32; ss * sc]);
     set_consts(&mut runtime);
+    // Release the reserved contiguous block right before the arena is allocated
+    // (during search) so the arena's cudaMalloc reuses this clean hole instead
+    // of failing in the fragmented free space left by the weight load.
+    drop(arena_reserve.take());
+    stream.synchronize().unwrap();
     let search_options = CompileOptions::default().search_graph_limit(1);
     runtime = cx.search(runtime, search_options);
     set_consts(&mut runtime);

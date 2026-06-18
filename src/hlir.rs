@@ -238,6 +238,7 @@ pub type HLIROps = (
     Mul,
     Mod,
     LessThan,
+    Max,
     Gather,
     Scatter,
     SumReduce,
@@ -2133,6 +2134,102 @@ impl ReferenceOp for LessThan {
                 ReferenceData::Bool(bin_cmp_fn(a_ind, a, b_ind, b, |x, y| !x & y))
             }
             _ => panic!("LessThan inputs must have the same dtype"),
+        }
+    }
+}
+
+/// Elementwise maximum of two tensors (same dtype in, same dtype out).
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct Max {
+    pub shape: Vec<Expression>,
+    pub a_strides: Vec<Expression>,
+    pub b_strides: Vec<Expression>,
+    pub input_shapes: Vec<ShapeTracker>,
+}
+impl Display for Max {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "EltMax")
+    }
+}
+impl HLIROp for Max {
+    fn to_egglog(&self, inputs: &[(NodeIndex, String)]) -> String {
+        format!(
+            "(Op (EltMax {} {} {} {}) {})",
+            elist_to_egglog(&self.input_shapes[0].dims),
+            elist_to_egglog(&self.input_shapes[0].strides),
+            elist_to_egglog(&self.input_shapes[1].strides),
+            elist_to_egglog(&self.input_shapes[0].contiguous().strides),
+            ilist_egglog(&[&inputs[0].1, &inputs[1].1]),
+        )
+    }
+}
+impl EgglogOp for Max {
+    fn sort(&self) -> SortDef {
+        binary_sort("EltMax")
+    }
+    fn cleanup(&self) -> bool {
+        true
+    }
+    fn n_inputs(&self) -> usize {
+        2
+    }
+    fn rewrites(&self) -> Vec<Rule> {
+        let mut r = vec![dtype_propagation_op(&self.sort())];
+        r.extend(binary_op_unroll_rules("EltMax", 4));
+        r
+    }
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        (
+            LLIROp::new::<dyn ReferenceOp>(Box::new(Self {
+                shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache).unwrap(),
+                a_strides: extract_expr_list(egraph, kind_children[1], list_cache, expr_cache)
+                    .unwrap(),
+                b_strides: extract_expr_list(egraph, kind_children[2], list_cache, expr_cache)
+                    .unwrap(),
+                ..Default::default()
+            })),
+            input_enodes,
+        )
+    }
+}
+impl ReferenceOp for Max {
+    fn execute(
+        &self,
+        inputs: Vec<&ReferenceData>,
+        dyn_map: &FxHashMap<char, usize>,
+    ) -> ReferenceData {
+        let (a, b) = (inputs[0], inputs[1]);
+        let (a_ind, b_ind) = (
+            StridedIterator::new(&self.shape, &self.a_strides, dyn_map),
+            StridedIterator::new(&self.shape, &self.b_strides, dyn_map),
+        );
+        match (a, b) {
+            (ReferenceData::F32(a), ReferenceData::F32(b)) => {
+                ReferenceData::F32(bin_fn(a_ind, a, b_ind, b, |x, y| if x > y { x } else { y }))
+            }
+            (ReferenceData::F16(a), ReferenceData::F16(b)) => {
+                ReferenceData::F16(bin_fn(a_ind, a, b_ind, b, |x, y| if x > y { x } else { y }))
+            }
+            (ReferenceData::Bf16(a), ReferenceData::Bf16(b)) => {
+                ReferenceData::Bf16(bin_fn(a_ind, a, b_ind, b, |x, y| if x > y { x } else { y }))
+            }
+            (ReferenceData::Int(a), ReferenceData::Int(b)) => {
+                ReferenceData::Int(bin_fn(a_ind, a, b_ind, b, |x, y| if x > y { x } else { y }))
+            }
+            (ReferenceData::I64(a), ReferenceData::I64(b)) => {
+                ReferenceData::I64(bin_fn(a_ind, a, b_ind, b, |x, y| if x > y { x } else { y }))
+            }
+            (ReferenceData::F64(a), ReferenceData::F64(b)) => {
+                ReferenceData::F64(bin_fn(a_ind, a, b_ind, b, |x, y| if x > y { x } else { y }))
+            }
+            _ => panic!("Max inputs must have the same dtype"),
         }
     }
 }
