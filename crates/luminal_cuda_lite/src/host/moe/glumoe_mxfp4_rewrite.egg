@@ -1,20 +1,39 @@
 ; AUTO-GENERATED (activation-free) by harness/gen_mxfp4_rule.py.
 ; Fuses the gpt-oss MXFP4 MoE subgraph into GLUMoEMXFP4 WITHOUT matching the
 ; clamped-SwiGLU activation: gate_up and down are tied by their shared raw
-; topk_idx. Reuses glumoe_expert_index (from glumoe_rewrite.egg).
+; topk_idx. Self-contained: declares & populates its own expert-index marker
+; (does NOT depend on glumoe_rewrite.egg, so it still type-checks when GLUMoE is
+; excluded from the search space, e.g. the qwen3 unfused-reference tests).
 ; Dims fixed: hidden=2880, intermediate=2880, top_k=4.
 
 (datatype*
+    (Mxfp4ExpertIndexState (MkMxfp4ExpertIndex Expression Expression IR))
     (Mxfp4UnpackState (MkMxfp4Unpack IR IR IR))
     (Mxfp4GateUpState (MkMxfp4GateUp IR IR IR IR IR))
 )
+(function mxfp4_expert_index (IR) Mxfp4ExpertIndexState :merge new)
 (function mxfp4_unpack  (IR) Mxfp4UnpackState :merge new)
 (function mxfp4_gate_up (IR) Mxfp4GateUpState :merge new)
 
 (rule
     (
-        (= ?idx_state (glumoe_expert_index ?t284))
-        (= ?idx_state (MkGLUMoEExpertIndexState ?v1125 ?v1126 ?topk_idx))
+        (= ?iota_base (Op (Iota ?io ?iota_base_range) (INil)))
+        (= ?mul_base (Op (Mul ?mul_base_shape ?mul_base_a_stride ?mul_base_b_stride ?mul_base_out_stride) (ICons ?topk_idx (ICons ?iota_base (INil)))))
+        (= ?iota_within (Op (Iota (MIter) ?iota_within_range) (INil)))
+        (= ?add_idx (Op (Add ?add_shape ?add_a_stride ?add_b_stride ?add_out_stride) (ICons ?mul_base (ICons ?iota_within (INil)))))
+    )
+    (
+        (set (mxfp4_expert_index ?add_idx)
+            (MkMxfp4ExpertIndex ?io ?iota_within_range ?topk_idx))
+    )
+    :ruleset glumoe
+    :name "mxfp4 expert index marker"
+)
+
+(rule
+    (
+        (= ?idx_state (mxfp4_expert_index ?t284))
+        (= ?idx_state (MkMxfp4ExpertIndex ?v1125 ?v1126 ?topk_idx))
         (= ?t285 (Op (Gather ?v681 ?v682 ?v683 ?v684) (ICons ?t284 (ICons ?t40 (INil)))))
         (= ?t290 (Op (Gather ?v697 ?v698 ?v699 ?v700) (ICons ?t289 (ICons ?t42 (INil)))))
         (= ?t291 (Op (Cast ?v701 (Int)) (ICons ?t285 (INil))))
