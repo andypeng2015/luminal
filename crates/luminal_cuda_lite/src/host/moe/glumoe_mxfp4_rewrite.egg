@@ -1,39 +1,37 @@
-; AUTO-GENERATED (staged) by harness/gen_mxfp4_rule.py.
-; Fuses the gpt-oss MXFP4 MoE subgraph into GLUMoEMXFP4. Reuses
-; glumoe_expert_index (from glumoe_rewrite.egg). Dims fixed: 2880/2880/4.
+; AUTO-GENERATED (activation-free) by harness/gen_mxfp4_rule.py.
+; Fuses the gpt-oss MXFP4 MoE subgraph into GLUMoEMXFP4 WITHOUT matching the
+; clamped-SwiGLU activation: gate_up and down are tied by their shared raw
+; topk_idx. Reuses glumoe_expert_index (from glumoe_rewrite.egg).
+; Dims fixed: hidden=2880, intermediate=2880, top_k=4.
 
 (datatype*
-    (Mxfp4UnpackState   (MkMxfp4Unpack IR IR IR))
-    (Mxfp4GateUpState   (MkMxfp4GateUp IR IR IR IR IR))
-    (Mxfp4ActState      (MkMxfp4Act Mxfp4GateUpState))
-    (Mxfp4DownState     (MkMxfp4Down Mxfp4GateUpState IR IR IR))
+    (Mxfp4UnpackState (MkMxfp4Unpack IR IR IR))
+    (Mxfp4GateUpState (MkMxfp4GateUp IR IR IR IR IR))
 )
-(function mxfp4_unpack  (IR) Mxfp4UnpackState  :merge new)
-(function mxfp4_gate_up (IR) Mxfp4GateUpState  :merge new)
-(function mxfp4_act     (IR) Mxfp4ActState     :merge new)
-(function mxfp4_down    (IR) Mxfp4DownState     :merge new)
+(function mxfp4_unpack  (IR) Mxfp4UnpackState :merge new)
+(function mxfp4_gate_up (IR) Mxfp4GateUpState :merge new)
 
 (rule
     (
-        (= ?gu_idx_state (glumoe_expert_index ?t272))
-        (= ?gu_idx_state (MkGLUMoEExpertIndexState ?v993 ?v994 ?topk_idx))
-        (= ?t273 (Op (Gather ?v651 ?v652 ?v653 ?v654) (ICons ?t272 (ICons ?t40 (INil)))))
-        (= ?t278 (Op (Gather ?v667 ?v668 ?v669 ?v670) (ICons ?t277 (ICons ?t42 (INil)))))
-        (= ?t279 (Op (Cast ?v671 (Int)) (ICons ?t273 (INil))))
-        (= ?t280 (Op (Gather ?v672 ?v673 ?v674 ?v675) (ICons ?t279 (ICons ?t10 (INil)))))
-        (= ?t281 (Op (Gather ?v676 ?v677 ?v678 ?v679) (ICons ?t279 (ICons ?t12 (INil)))))
-        (= ?t283 (Op (Gather ?v682 ?v683 ?v684 ?v685) (ICons ?t282 (ICons ?t280 (INil)))))
-        (= ?t285 (Op (Cast ?v688 (Bf16)) (ICons ?t284 (INil))))
-        (= ?t286 (Op (Mul ?v689 ?v690 ?v691 ?v692) (ICons ?t283 (ICons ?t285 (INil)))))
-        (= ?t288 (Op (Gather ?v695 ?v696 ?v697 ?v698) (ICons ?t287 (ICons ?t281 (INil)))))
-        (= ?t290 (Op (Cast ?v701 (Bf16)) (ICons ?t289 (INil))))
-        (= ?t291 (Op (Mul ?v702 ?v703 ?v704 ?v705) (ICons ?t288 (ICons ?t290 (INil)))))
-        (= ?t292 (Op (Add ?v706 ?v707 ?v708 ?v709) (ICons ?t286 (ICons ?t291 (INil)))))
-        (= ?t293 (Op (Cast ?v710 (Bf16)) (ICons ?t278 (INil))))
-        (= ?t294 (Op (Mul ?v711 ?v712 ?v713 ?v714) (ICons ?t292 (ICons ?t293 (INil)))))
+        (= ?idx_state (glumoe_expert_index ?t284))
+        (= ?idx_state (MkGLUMoEExpertIndexState ?v1125 ?v1126 ?topk_idx))
+        (= ?t285 (Op (Gather ?v681 ?v682 ?v683 ?v684) (ICons ?t284 (ICons ?t40 (INil)))))
+        (= ?t290 (Op (Gather ?v697 ?v698 ?v699 ?v700) (ICons ?t289 (ICons ?t42 (INil)))))
+        (= ?t291 (Op (Cast ?v701 (Int)) (ICons ?t285 (INil))))
+        (= ?t292 (Op (Gather ?v702 ?v703 ?v704 ?v705) (ICons ?t291 (ICons ?t10 (INil)))))
+        (= ?t293 (Op (Gather ?v706 ?v707 ?v708 ?v709) (ICons ?t291 (ICons ?t12 (INil)))))
+        (= ?t295 (Op (Gather ?v712 ?v713 ?v714 ?v715) (ICons ?t294 (ICons ?t292 (INil)))))
+        (= ?t297 (Op (Cast ?v718 (Bf16)) (ICons ?t296 (INil))))
+        (= ?t298 (Op (Mul ?v719 ?v720 ?v721 ?v722) (ICons ?t295 (ICons ?t297 (INil)))))
+        (= ?t300 (Op (Gather ?v725 ?v726 ?v727 ?v728) (ICons ?t299 (ICons ?t293 (INil)))))
+        (= ?t302 (Op (Cast ?v731 (Bf16)) (ICons ?t301 (INil))))
+        (= ?t303 (Op (Mul ?v732 ?v733 ?v734 ?v735) (ICons ?t300 (ICons ?t302 (INil)))))
+        (= ?t304 (Op (Add ?v736 ?v737 ?v738 ?v739) (ICons ?t298 (ICons ?t303 (INil)))))
+        (= ?t305 (Op (Cast ?v740 (Bf16)) (ICons ?t290 (INil))))
+        (= ?t306 (Op (Mul ?v741 ?v742 ?v743 ?v744) (ICons ?t304 (ICons ?t305 (INil)))))
     )
     (
-        (set (mxfp4_unpack ?t294) (MkMxfp4Unpack ?topk_idx ?t40 ?t42))
+        (set (mxfp4_unpack ?t306) (MkMxfp4Unpack ?topk_idx ?t40 ?t42))
     )
     :ruleset glumoe
     :name "mxfp4 unpack marker"
@@ -41,17 +39,17 @@
 
 (rule
     (
-        (= ?gu_unpack (mxfp4_unpack ?t294))
+        (= ?gu_unpack (mxfp4_unpack ?t306))
         (= ?gu_unpack (MkMxfp4Unpack ?topk_idx ?gu_blocks ?gu_scales))
-        (= ?t295 (Op (Cast ?v715 (Bf16)) (ICons ?t233 (INil))))
-        (= ?t296 (Op (Mul ?v716 ?v717 ?v718 ?v719) (ICons ?t295 (ICons ?t294 (INil)))))
-        (= ?t297 (Op (Sum ?v720 ?v721 ?v722 ?v723 ?v724) (ICons ?t296 (INil))))
-        (= ?t302 (Op (Gather ?v737 ?v738 ?v739 ?v740) (ICons ?t301 (ICons ?t44 (INil)))))
-        (= ?t303 (Op (Add ?v741 ?v742 ?v743 ?v744) (ICons ?t297 (ICons ?t302 (INil)))))
+        (= ?t307 (Op (Cast ?v745 (Bf16)) (ICons ?t245 (INil))))
+        (= ?t308 (Op (Mul ?v746 ?v747 ?v748 ?v749) (ICons ?t307 (ICons ?t306 (INil)))))
+        (= ?t309 (Op (Sum ?v750 ?v751 ?v752 ?v753 ?v754) (ICons ?t308 (INil))))
+        (= ?t314 (Op (Gather ?v767 ?v768 ?v769 ?v770) (ICons ?t313 (ICons ?t44 (INil)))))
+        (= ?t315 (Op (Add ?v771 ?v772 ?v773 ?v774) (ICons ?t309 (ICons ?t314 (INil)))))
     )
     (
-        (set (mxfp4_gate_up ?t303)
-            (MkMxfp4GateUp ?t233 ?topk_idx ?gu_blocks ?gu_scales ?t44))
+        (set (mxfp4_gate_up ?t315)
+            (MkMxfp4GateUp ?t245 ?topk_idx ?gu_blocks ?gu_scales ?t44))
     )
     :ruleset glumoe
     :name "mxfp4 gate_up marker"
@@ -59,73 +57,23 @@
 
 (rule
     (
-        (= ?gu_state (mxfp4_gate_up ?t303))
-        (= ?t305 (Op (Gather ?v747 ?v748 ?v749 ?v750) (ICons ?t304 (ICons ?t303 (INil)))))
-        (= ?t307 (Op (Cast ?v752 (Bf16)) (ICons ?t306 (INil))))
-        (= ?t308 (Op (Mul ?v753 ?v754 ?v755 ?v756) (ICons ?t303 (ICons ?t307 (INil)))))
-        (= ?t310 (Op (Cast ?v758 (Bf16)) (ICons ?t309 (INil))))
-        (= ?t311 (Op (EltMax ?v759 ?v760 ?v761 ?v762) (ICons ?t308 (ICons ?t310 (INil)))))
-        (= ?t313 (Op (Cast ?v764 (Bf16)) (ICons ?t312 (INil))))
-        (= ?t314 (Op (Mul ?v765 ?v766 ?v767 ?v768) (ICons ?t311 (ICons ?t313 (INil)))))
-        (= ?t316 (Op (Cast ?v770 (Bf16)) (ICons ?t315 (INil))))
-        (= ?t318 (Op (Cast ?v772 (Bf16)) (ICons ?t317 (INil))))
-        (= ?t320 (Op (Cast ?v774 (Bf16)) (ICons ?t319 (INil))))
-        (= ?t321 (Op (Mul ?v775 ?v776 ?v777 ?v778) (ICons ?t314 (ICons ?t320 (INil)))))
-        (= ?t323 (Op (Cast ?v780 (Bf16)) (ICons ?t322 (INil))))
-        (= ?t324 (Op (Mul ?v781 ?v782 ?v783 ?v784) (ICons ?t321 (ICons ?t323 (INil)))))
-        (= ?t326 (Op (Cast ?v786 (Bf16)) (ICons ?t325 (INil))))
-        (= ?t327 (Op (Mul ?v787 ?v788 ?v789 ?v790) (ICons ?t324 (ICons ?t326 (INil)))))
-        (= ?t328 (Op (Exp2 ?v791 ?v792 ?v793) (ICons ?t327 (INil))))
-        (= ?t330 (Op (Cast ?v795 (Bf16)) (ICons ?t329 (INil))))
-        (= ?t331 (Op (Add ?v796 ?v797 ?v798 ?v799) (ICons ?t328 (ICons ?t330 (INil)))))
-        (= ?t332 (Op (Recip ?v800 ?v801 ?v802) (ICons ?t331 (INil))))
-        (= ?t333 (Op (Mul ?v803 ?v804 ?v805 ?v806) (ICons ?t314 (ICons ?t332 (INil)))))
-        (= ?t335 (Op (Cast ?v808 (Bf16)) (ICons ?t334 (INil))))
-        (= ?t376 (Op (EltMax ?v910 ?v911 ?v912 ?v913) (ICons ?t375 (ICons ?t316 (INil)))))
-        (= ?t377 (Op (Mul ?v914 ?v915 ?v916 ?v917) (ICons ?t376 (ICons ?t318 (INil)))))
-        (= ?t379 (Op (Add ?v918 ?v919 ?v920 ?v921) (ICons ?t378 (ICons ?t335 (INil)))))
-        (= ?t380 (Op (Mul ?v922 ?v923 ?v924 ?v925) (ICons ?t379 (ICons ?t333 (INil)))))
+        (= ?dn_unpack (mxfp4_unpack ?t419))
+        (= ?dn_unpack (MkMxfp4Unpack ?topk_idx ?dn_blocks ?dn_scales))
+        (= ?gu_state (mxfp4_gate_up ?v1127))
+        (= ?gu_state (MkMxfp4GateUp ?t245 ?topk_idx ?gu_blocks ?gu_scales ?gu_bias))
+        (= ?t420 (Op (Mul ?v1033 ?v1034 ?v1035 ?v1036) (ICons ?t393 (ICons ?t419 (INil)))))
+        (= ?t421 (Op (Sum ?v1037 ?v1038 ?v1039 ?v1040 ?v1041) (ICons ?t420 (INil))))
+        (= ?t426 (Op (Gather ?v1054 ?v1055 ?v1056 ?v1057) (ICons ?t425 (ICons ?t50 (INil)))))
+        (= ?t427 (Op (Add ?v1058 ?v1059 ?v1060 ?v1061) (ICons ?t421 (ICons ?t426 (INil)))))
+        (= ?t428 (Op (Cast ?v1062 (F32)) (ICons ?t427 (INil))))
+        (= ?t429 (Op (Mul ?v1063 ?v1064 ?v1065 ?v1066) (ICons ?t428 (ICons ?t280 (INil)))))
+        (= ?t430 (Op (Sum ?v1067 ?v1068 ?v1069 ?v1070 ?v1071) (ICons ?t429 (INil))))
     )
     (
-        (set (mxfp4_act ?t380) (MkMxfp4Act ?gu_state))
-    )
-    :ruleset glumoe
-    :name "mxfp4 activation marker"
-)
-
-(rule
-    (
-        (= ?act_state (mxfp4_act ?t380))
-        (= ?act_state (MkMxfp4Act ?gu_state))
-        (= ?dn_unpack (mxfp4_unpack ?t361))
-        (= ?dn_unpack (MkMxfp4Unpack ?v995 ?dn_blocks ?dn_scales))
-        (= ?t366 (Op (Gather ?v897 ?v898 ?v899 ?v900) (ICons ?t365 (ICons ?t50 (INil)))))
-        (= ?t381 (Op (Mul ?v926 ?v927 ?v928 ?v929) (ICons ?t380 (ICons ?t361 (INil)))))
-        (= ?t382 (Op (Sum ?v930 ?v931 ?v932 ?v933 ?v934) (ICons ?t381 (INil))))
-        (= ?t383 (Op (Add ?v935 ?v936 ?v937 ?v938) (ICons ?t382 (ICons ?t366 (INil)))))
-    )
-    (
-        (set (mxfp4_down ?t383)
-            (MkMxfp4Down ?gu_state ?dn_blocks ?dn_scales ?t50))
-    )
-    :ruleset glumoe
-    :name "mxfp4 down marker"
-)
-
-(rule
-    (
-        (= ?dn_state (mxfp4_down ?t383))
-        (= ?dn_state (MkMxfp4Down ?gu_act_state ?dn_blocks ?dn_scales ?dn_bias))
-        (= ?gu_act_state (MkMxfp4GateUp ?t233 ?topk_idx ?gu_blocks ?gu_scales ?gu_bias))
-        (= ?t384 (Op (Cast ?v939 (F32)) (ICons ?t383 (INil))))
-        (= ?t385 (Op (Mul ?v940 ?v941 ?v942 ?v943) (ICons ?t384 (ICons ?t268 (INil)))))
-        (= ?t386 (Op (Sum ?v944 ?v945 ?v946 ?v947 ?v948) (ICons ?t385 (INil))))
-    )
-    (
-        (let ?glumoe (Op (GLUMoEMXFP4 (MNum 2880) (MNum 2880) (MNum 4)) (ICons ?t233 (ICons ?topk_idx (ICons ?t268 (ICons ?gu_blocks (ICons ?gu_scales (ICons ?gu_bias (ICons ?dn_blocks (ICons ?dn_scales (ICons ?dn_bias (INil))))))))))))
-        (union ?t386 ?glumoe)
-        (subsume (Op (Sum ?v944 ?v945 ?v946 ?v947 ?v948) (ICons ?t385 (INil))))
-        (subsume (Op (KernelSum ?v944 ?v945 ?v946 ?v947 ?v948 (F32)) (ICons ?t385 (INil))))
+        (let ?glumoe (Op (GLUMoEMXFP4 (MNum 2880) (MNum 2880) (MNum 4)) (ICons ?t245 (ICons ?topk_idx (ICons ?t280 (ICons ?gu_blocks (ICons ?gu_scales (ICons ?gu_bias (ICons ?dn_blocks (ICons ?dn_scales (ICons ?t50 (INil))))))))))))
+        (union ?t430 ?glumoe)
+        (subsume (Op (Sum ?v1067 ?v1068 ?v1069 ?v1070 ?v1071) (ICons ?t429 (INil))))
+        (subsume (Op (KernelSum ?v1067 ?v1068 ?v1069 ?v1070 ?v1071 (F32)) (ICons ?t429 (INil))))
     )
     :ruleset glumoe
     :name "mxfp4 final fusion"
