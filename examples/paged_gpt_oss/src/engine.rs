@@ -210,6 +210,17 @@ impl Engine {
         };
         let batch = build_batch(&plan.entries, self.scheduler.allocator());
 
+        // Env-gated per-step profiling (LUMINAL_ENGINE_PROFILE): break the
+        // serving step into set_data / execute / get_logits / kv-roundtrip /
+        // sample to see what dominates now that the MoE op is fused.
+        let prof = std::env::var_os("LUMINAL_ENGINE_PROFILE").is_some();
+        let mut mk = std::time::Instant::now();
+        let mut lap = |on: bool| -> f64 {
+            let d = mk.elapsed();
+            mk = std::time::Instant::now();
+            if on { d.as_secs_f64() * 1e3 } else { 0.0 }
+        };
+
         self.runtime.set_data(self.inp.input, plan.tokens.clone());
         self.runtime.set_data(self.inp.pos_ids, batch.q_pos.clone());
         self.runtime.set_data(self.inp.scatter_idx, batch.scatter_idx.clone());
@@ -218,8 +229,11 @@ impl Engine {
         self.runtime.set_data(self.inp.mask_sliding, batch.mask_sliding.clone());
         self.cx.set_dim('s', batch.total_s);
         self.cx.set_dim('c', batch.total_c);
+        let t_set = lap(prof);
         self.runtime.execute(&self.cx.dyn_map);
+        let t_exec = lap(prof);
         let all = self.runtime.get_f32(self.logits);
+        let t_logits = lap(prof);
 
         // Round-trip KV cache: updated output buffers become next step's inputs.
         for (i, (k_out, v_out)) in self.cache_outputs.iter().enumerate() {
@@ -228,12 +242,20 @@ impl Engine {
             self.runtime.set_buffer(self.kv_cache.k_caches[i], k_buf);
             self.runtime.set_buffer(self.kv_cache.v_caches[i], v_buf);
         }
+        let t_kv = lap(prof);
 
         let sampled: Vec<(SeqId, u32)> = plan
             .samples
             .iter()
             .map(|&(row, seq)| (seq, argmax(logits_row(&all, row))))
             .collect();
+        let t_sample = lap(prof);
+        if prof {
+            eprintln!(
+                "ENGINE_PROF s={} c={} set={t_set:.2} exec={t_exec:.2} logits={t_logits:.2} kv={t_kv:.2} sample={t_sample:.2}",
+                batch.total_s, batch.total_c
+            );
+        }
         let (emitted, mut finished) = self.scheduler.ingest(&sampled);
         finished.splice(0..0, rejected);
         StepOutcome {
