@@ -1127,6 +1127,15 @@ impl CudaRuntime {
             // graph nodes to the new arena, so dropping first is safe.
             bucket.arena = None;
             stream.synchronize().ok();
+            if std::env::var_os("LUMINAL_ARENA_DEBUG").is_some() {
+                let (free, total) = stream.context().mem_get_info().unwrap_or((0, 0));
+                eprintln!(
+                    "[arena] alloc {:.2} GiB | free {:.2} GiB / {:.2} GiB",
+                    allocation_bytes as f64 / (1u64 << 30) as f64,
+                    free as f64 / (1u64 << 30) as f64,
+                    total as f64 / (1u64 << 30) as f64,
+                );
+            }
             bucket.arena = Some(unsafe { stream.alloc(allocation_bytes).unwrap() });
             cuda_alloc_time += timer.elapsed();
             allocated_bytes = allocation_bytes;
@@ -1363,11 +1372,11 @@ impl CudaRuntime {
                     continue;
                 }
                 bucket.logical_buffer_bytes.insert(member.node, bytes);
-                let planned_capacity = if bucket.stabilize_intermediate_pointers {
-                    bytes.checked_next_power_of_two().unwrap_or(bytes)
-                } else {
-                    bytes
-                };
+                // Use the exact byte size — no power-of-two rounding. pow2
+                // rounding bloated the arena ~2-3x (defeating the lifetime-binned
+                // cross-layer reuse); `align_up` below handles real alignment and
+                // the monotonic capacity keeps offsets stable as shapes grow.
+                let planned_capacity = bytes;
                 let capacity_bytes = bucket
                     .logical_buffer_capacity_bytes
                     .get(&member.node)
@@ -1687,7 +1696,7 @@ impl CudaRuntime {
                     .get(&buf.node)
                     .copied()
                     .unwrap_or(0)
-                    .max(buf.bytes.checked_next_power_of_two().unwrap_or(buf.bytes));
+                    .max(buf.bytes);
                 let offset = align_up(arena_end, ARENA_ALIGNMENT);
                 bucket.logical_buffer_offsets.insert(buf.node, offset);
                 bucket.logical_buffer_bytes.insert(buf.node, buf.bytes);
@@ -1722,13 +1731,18 @@ impl CudaRuntime {
                 let old_size_matches = old_bytes
                     .get(&buf.node)
                     .is_some_and(|old_bytes| *old_bytes == buf.bytes);
+                // Place already-pinned buffers first (in old-offset order) to keep
+                // their addresses stable, then pack NEW buffers largest-first for
+                // a tight bin-pack. Previously new buffers were ordered by
+                // lifetime-start, which fragmented the arena ~3x vs the size-first
+                // pack the non-stabilize path uses.
                 (
                     old_offset.is_none(),
                     !old_size_matches,
                     old_offset.unwrap_or(usize::MAX),
-                    buf.start,
                     std::cmp::Reverse(buf.bytes),
                     std::cmp::Reverse(buf.end.saturating_sub(buf.start)),
+                    buf.start,
                     buf.node.index(),
                 )
             });
@@ -1744,11 +1758,7 @@ impl CudaRuntime {
         }
 
         for buf in placement_order {
-            let planned_capacity = if bucket.stabilize_intermediate_pointers {
-                buf.bytes.checked_next_power_of_two().unwrap_or(buf.bytes)
-            } else {
-                buf.bytes
-            };
+            let planned_capacity = buf.bytes; // no pow2 rounding (see above)
             let capacity_bytes = if bucket.stabilize_intermediate_pointers {
                 old_capacity_bytes
                     .get(&buf.node)
