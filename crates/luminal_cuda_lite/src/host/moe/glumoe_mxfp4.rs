@@ -41,7 +41,7 @@ use crate::{
     host::{DeviceBuffer, HostOp},
 };
 
-use super::{buf_ptr, read_routing, slice_ptr};
+use super::{buf_ptr, slice_ptr};
 
 const MXFP4_BLOCK: usize = 32;
 // Used only by the reference activation in the unit test (the kernel inlines
@@ -166,9 +166,20 @@ __device__ __forceinline__ float mxfp4_row_dot(
     return acc; // valid on lane 0
 }
 
-// gate_up: out[o] = sum_c W[o,c]*x[c]   (bf16 out, alpha=1, beta=0)
+// GPU-side expert routing: each kernel reads its expert index e (and routing
+// weight) from device memory and offsets the per-expert weight/scale/bias base
+// pointers itself, so the host never copies routing to the CPU (no per-layer
+// DtoH sync). `e` is clamped to [0, num_experts) to guard against an OOB read.
+__device__ __forceinline__ int clamp_expert(unsigned long long eptr, int num_experts) {
+    int e = *((const int*)eptr);
+    return e < 0 ? 0 : (e >= num_experts ? num_experts - 1 : e);
+}
+
+// gate_up: out[o] = sum_c W[e][o,c]*x[c]   (bf16 out, alpha=1, beta=0)
 extern "C" __global__ void mxfp4_gemv(
-    unsigned long long blocks_ptr, unsigned long long scales_ptr,
+    unsigned long long blocks_base, unsigned long long scales_base,
+    unsigned long long blk_stride, unsigned long long sc_stride,
+    unsigned long long expert_idx_ptr, int num_experts,
     unsigned long long x_ptr, unsigned long long out_ptr,
     int out_dim, int in_dim
 ) {
@@ -180,17 +191,22 @@ extern "C" __global__ void mxfp4_gemv(
     __syncthreads();
     int row = blockIdx.x * blockDim.y + threadIdx.y; // warp-uniform
     if (row >= out_dim) return;
-    const unsigned char* brow = (const unsigned char*)blocks_ptr + (long)row * (in_dim >> 1);
-    const unsigned char* srow = (const unsigned char*)scales_ptr + (long)row * (in_dim >> 5);
+    int e = clamp_expert(expert_idx_ptr, num_experts);
+    const unsigned char* brow =
+        (const unsigned char*)(blocks_base + (unsigned long long)e * blk_stride) + (long)row * (in_dim >> 1);
+    const unsigned char* srow =
+        (const unsigned char*)(scales_base + (unsigned long long)e * sc_stride) + (long)row * (in_dim >> 5);
     float acc = mxfp4_row_dot(brow, srow, xs, in_dim, threadIdx.x);
     if (threadIdx.x == 0) ((__nv_bfloat16*)out_ptr)[row] = __float2bfloat16(acc);
 }
 
-// down: out[o] = beta*out[o] + scale*sum_c W[o,c]*x[c]   (f32 out)
+// down: out[o] = beta*out[o] + (*weight_ptr)*sum_c W[e][o,c]*x[c]   (f32 out)
 extern "C" __global__ void mxfp4_gemv_accum(
-    unsigned long long blocks_ptr, unsigned long long scales_ptr,
+    unsigned long long blocks_base, unsigned long long scales_base,
+    unsigned long long blk_stride, unsigned long long sc_stride,
+    unsigned long long expert_idx_ptr, unsigned long long weight_ptr, int num_experts,
     unsigned long long x_ptr, unsigned long long out_ptr,
-    int out_dim, int in_dim, float scale, float beta
+    int out_dim, int in_dim, float beta
 ) {
     extern __shared__ __nv_bfloat16 xs[];
     const __nv_bfloat16* x = (const __nv_bfloat16*)x_ptr;
@@ -200,8 +216,12 @@ extern "C" __global__ void mxfp4_gemv_accum(
     __syncthreads();
     int row = blockIdx.x * blockDim.y + threadIdx.y; // warp-uniform
     if (row >= out_dim) return;
-    const unsigned char* brow = (const unsigned char*)blocks_ptr + (long)row * (in_dim >> 1);
-    const unsigned char* srow = (const unsigned char*)scales_ptr + (long)row * (in_dim >> 5);
+    int e = clamp_expert(expert_idx_ptr, num_experts);
+    float scale = *((const float*)weight_ptr);
+    const unsigned char* brow =
+        (const unsigned char*)(blocks_base + (unsigned long long)e * blk_stride) + (long)row * (in_dim >> 1);
+    const unsigned char* srow =
+        (const unsigned char*)(scales_base + (unsigned long long)e * sc_stride) + (long)row * (in_dim >> 5);
     float acc = mxfp4_row_dot(brow, srow, xs, in_dim, threadIdx.x);
     if (threadIdx.x == 0) {
         float* out = (float*)out_ptr;
@@ -212,16 +232,18 @@ extern "C" __global__ void mxfp4_gemv_accum(
 
 // gpt-oss clamped interleaved SwiGLU, with the per-expert gate_up bias folded in.
 //   gate_up: bf16 [2*intermediate], interleaved: gate = [2i], up = [2i+1]
-//   bias:    bf16 [2*intermediate], same interleaving
+//   bias_base[e*bias_stride]: bf16 [2*intermediate], same interleaving
 //   out:     bf16 [intermediate]
 extern "C" __global__ void glu_clamped_interleaved_bf16(
     unsigned long long gate_up_ptr,
-    unsigned long long bias_ptr,
+    unsigned long long bias_base, unsigned long long bias_stride,
+    unsigned long long expert_idx_ptr, int num_experts,
     unsigned long long out_ptr,
     int intermediate
 ) {
+    int e = clamp_expert(expert_idx_ptr, num_experts);
     const __nv_bfloat16* gate_up = (const __nv_bfloat16*)gate_up_ptr;
-    const __nv_bfloat16* bias = (const __nv_bfloat16*)bias_ptr;
+    const __nv_bfloat16* bias = (const __nv_bfloat16*)(bias_base + (unsigned long long)e * bias_stride);
     __nv_bfloat16* out = (__nv_bfloat16*)out_ptr;
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < intermediate) {
@@ -234,15 +256,17 @@ extern "C" __global__ void glu_clamped_interleaved_bf16(
     }
 }
 
-// out[i] += scale * bias[i]   (f32 accumulator, bf16 bias)
+// out[i] += (*weight_ptr) * bias_base[e*bias_stride][i]   (f32 accumulator, bf16 bias)
 extern "C" __global__ void accumulate_bias_scaled_f32(
     unsigned long long out_ptr,
-    unsigned long long bias_ptr,
-    int n,
-    float scale
+    unsigned long long bias_base, unsigned long long bias_stride,
+    unsigned long long expert_idx_ptr, unsigned long long weight_ptr, int num_experts,
+    int n
 ) {
+    int e = clamp_expert(expert_idx_ptr, num_experts);
+    float scale = *((const float*)weight_ptr);
     float* out = (float*)out_ptr;
-    const __nv_bfloat16* bias = (const __nv_bfloat16*)bias_ptr;
+    const __nv_bfloat16* bias = (const __nv_bfloat16*)(bias_base + (unsigned long long)e * bias_stride);
     int i = blockIdx.x * blockDim.x + threadIdx.x;
     if (i < n) out[i] += scale * __bfloat162float(bias[i]);
 }
@@ -413,15 +437,29 @@ impl HostOp for GLUMoEMXFP4 {
         let (_, f32_to_bf16_fn, mxfp4_gemv_fn, mxfp4_gemv_accum_fn, activation_fn, accum_bias_fn) =
             self.get_kernels(stream);
 
-        // Host-side top-k routing, compacted to a dense top_k stride. top-k
-        // weights are applied directly (no normalization).
-        let (topk_idx, topk_vals) =
-            read_routing(stream, topk_idx_buf, topk_vals_buf, seq, top_k, "GLUMoEMXFP4")?;
-        for &expert_idx in &topk_idx {
-            if expert_idx < 0 || expert_idx as usize >= num_experts {
-                anyhow::bail!("GLUMoEMXFP4 expert index {expert_idx} out of range");
-            }
-        }
+        // Clean non-perturbing timers (LUMINAL_MOE_PROF2): routing (host DtoH
+        // sync) vs the kernel-launch loop, no per-phase syncs added.
+        let prof2 = std::env::var_os("LUMINAL_MOE_PROF2").is_some();
+        let rt0 = std::time::Instant::now();
+
+        // GPU-side routing: pass the topk index/value BUFFERS into the kernels;
+        // each kernel reads its slot's expert index + weight from device memory
+        // (clamped to [0, num_experts)) and offsets the per-expert weights itself.
+        // No DtoH copy => no per-layer host sync. Match read_routing's indexing:
+        // the buffer row stride may exceed top_k (gating output width), so derive
+        // it from the buffer length (i32/f32 = 4 bytes) rather than assuming top_k.
+        let topk_idx_base = buf_ptr(topk_idx_buf, stream);
+        let topk_vals_base = buf_ptr(topk_vals_buf, stream);
+        let idx_stride = (topk_idx_buf.len() / 4)
+            .checked_div(seq)
+            .filter(|s| *s >= top_k)
+            .ok_or_else(|| anyhow::anyhow!("GLUMoEMXFP4 bad topk index buffer length"))?;
+        let val_stride = (topk_vals_buf.len() / 4)
+            .checked_div(seq)
+            .filter(|s| *s >= top_k)
+            .ok_or_else(|| anyhow::anyhow!("GLUMoEMXFP4 bad topk value buffer length"))?;
+        let routing_ms = if prof2 { rt0.elapsed().as_secs_f64() * 1e3 } else { 0.0 };
+        let lp0 = std::time::Instant::now();
 
         // Reused scratch (freed at end of this layer's execute). No dequantized
         // weight buffers — the fused GEMV kernels read FP4 directly.
@@ -508,11 +546,14 @@ impl HostOp for GLUMoEMXFP4 {
             }
         };
 
+        let num_experts_i32 = num_experts as i32;
         for t in 0..seq {
             let x_t_ptr = xbf16_ptr + (t * hidden * 2) as u64; // BF16
+            let out_t_ptr = output_ptr + (t * hidden * 4) as u64; // F32
             for i in 0..top_k {
-                let e = topk_idx[t * top_k + i] as usize;
-                let w = topk_vals[t * top_k + i];
+                // GPU pointers to this (t,i) slot's expert index / routing weight.
+                let eptr = topk_idx_base + ((t * idx_stride + i) * 4) as u64;
+                let wptr = topk_vals_base + ((t * val_stride + i) * 4) as u64;
                 let mut mark = std::time::Instant::now();
 
                 // a. gate_up: fused MXFP4 GEMV -> gu_out (bf16)
@@ -521,8 +562,12 @@ impl HostOp for GLUMoEMXFP4 {
                     gate_up_dim,
                     hidden,
                     &[
-                        KernelArg::U64(gu_blocks_ptr + (e * gu_blocks_stride) as u64),
-                        KernelArg::U64(gu_scales_ptr + (e * gu_scales_stride) as u64),
+                        KernelArg::U64(gu_blocks_ptr),
+                        KernelArg::U64(gu_scales_ptr),
+                        KernelArg::U64(gu_blocks_stride as u64),
+                        KernelArg::U64(gu_scales_stride as u64),
+                        KernelArg::U64(eptr),
+                        KernelArg::I32(num_experts_i32),
                         KernelArg::U64(x_t_ptr),
                         KernelArg::U64(gu_out_ptr),
                         KernelArg::I32(gate_up_dim as i32),
@@ -537,7 +582,10 @@ impl HostOp for GLUMoEMXFP4 {
                     intermediate,
                     &[
                         KernelArg::U64(gu_out_ptr),
-                        KernelArg::U64(gu_bias_ptr + (e * gu_bias_stride) as u64),
+                        KernelArg::U64(gu_bias_ptr),
+                        KernelArg::U64(gu_bias_stride as u64),
+                        KernelArg::U64(eptr),
+                        KernelArg::I32(num_experts_i32),
                         KernelArg::U64(hid_ptr),
                         KernelArg::I32(intermediate as i32),
                     ],
@@ -545,20 +593,23 @@ impl HostOp for GLUMoEMXFP4 {
                 lap(&mut t_act, &mut mark);
 
                 // c. down: fused MXFP4 GEMV with weighted f32 accumulate -> out_t
-                let out_t_ptr = output_ptr + (t * hidden * 4) as u64; // F32
                 let beta = if i == 0 { 0.0f32 } else { 1.0f32 };
                 launch_gemv(
                     mxfp4_gemv_accum_fn,
                     hidden,
                     intermediate,
                     &[
-                        KernelArg::U64(dn_blocks_ptr + (e * dn_blocks_stride) as u64),
-                        KernelArg::U64(dn_scales_ptr + (e * dn_scales_stride) as u64),
+                        KernelArg::U64(dn_blocks_ptr),
+                        KernelArg::U64(dn_scales_ptr),
+                        KernelArg::U64(dn_blocks_stride as u64),
+                        KernelArg::U64(dn_scales_stride as u64),
+                        KernelArg::U64(eptr),
+                        KernelArg::U64(wptr),
+                        KernelArg::I32(num_experts_i32),
                         KernelArg::U64(hid_ptr),
                         KernelArg::U64(out_t_ptr),
                         KernelArg::I32(hidden as i32),
                         KernelArg::I32(intermediate as i32),
-                        KernelArg::F32(w),
                         KernelArg::F32(beta),
                     ],
                 )?;
@@ -570,16 +621,27 @@ impl HostOp for GLUMoEMXFP4 {
                     hidden,
                     &[
                         KernelArg::U64(out_t_ptr),
-                        KernelArg::U64(dn_bias_ptr + (e * dn_bias_stride) as u64),
+                        KernelArg::U64(dn_bias_ptr),
+                        KernelArg::U64(dn_bias_stride as u64),
+                        KernelArg::U64(eptr),
+                        KernelArg::U64(wptr),
+                        KernelArg::I32(num_experts_i32),
                         KernelArg::I32(hidden as i32),
-                        KernelArg::F32(w),
                     ],
                 )?;
                 lap(&mut t_accum, &mut mark);
             }
         }
 
-        stream.synchronize()?;
+        // No per-layer sync: GPU-side routing removed read_routing's implicit
+        // sync, so same-stream ordering + the step-end get_f32 cover correctness,
+        // and the scratch frees stream-ordered via the async pool. Layers pipeline.
+        if prof2 {
+            eprintln!(
+                "MOE2 seq={seq} routing={routing_ms:.3} loop={:.3}",
+                lp0.elapsed().as_secs_f64() * 1e3
+            );
+        }
         if prof {
             eprintln!(
                 "MOE_PROF seq={seq} topk={top_k} mm_gu={:.2} act={:.2} mm_dn={:.2} accum={:.2}",
