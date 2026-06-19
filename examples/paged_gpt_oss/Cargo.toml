@@ -21,3 +21,9 @@ half = { version = "2.7.1", features = ["bytemuck"] }
 bytemuck = "1.24.0"
 memmap2 = "0.9.9"
 rand = "0.9.2"
+
+# Serving (OpenAI-compatible HTTP server)
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync"] }
+axum = "0.8"
+futures = "0.3"
+async-stream = "0.3"

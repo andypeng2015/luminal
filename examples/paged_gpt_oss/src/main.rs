@@ -1,12 +1,8 @@
-mod hf;
-mod model;
-mod quant;
-
-use hf::prepare_hf_model;
 use luminal::prelude::*;
 use luminal_cuda_lite::{cudarc::driver::CudaContext, runtime::CudaRuntime};
-use model::*;
-use quant::fp4_byte_luts;
+use paged_gpt_oss::hf::prepare_hf_model;
+use paged_gpt_oss::model::*;
+use paged_gpt_oss::quant::fp4_byte_luts;
 use std::{io::Write, time::Duration};
 use tokenizers::Tokenizer;
 
