@@ -174,6 +174,14 @@ impl Scheduler {
         // tokens this step (instead of one), amortizing the per-pass overhead.
         // Decode sequences feed one token and don't draw from the budget.
         let mut prefill_budget = self.cfg.max_prefill.max(1);
+        // Split the budget fairly across all prefilling sequences so they advance
+        // together. (Giving it all to the first serializes concurrent long-prompt
+        // prefills, blowing up later requests' TTFT until they time out.)
+        let mut n_prefilling = self
+            .running
+            .iter()
+            .filter(|r| r.pos < r.prompt.len())
+            .count();
 
         for i in 0..self.running.len() {
             let (id, seq, pos, prompt_len, next_token) = {
@@ -181,9 +189,17 @@ impl Scheduler {
                 (r.id, r.seq, r.pos, r.prompt.len(), r.next_token)
             };
             let prefilling = pos < prompt_len;
-            // Query tokens this sequence contributes this step.
+            // Query tokens this sequence contributes this step. Prefilling seqs
+            // share the budget evenly (>=1 while any remains); decode seqs feed 1
+            // and don't draw from the budget.
             let n = if prefilling {
-                (prompt_len - pos).min(prefill_budget)
+                let share = if prefill_budget == 0 {
+                    0
+                } else {
+                    (prefill_budget / n_prefilling.max(1)).max(1)
+                };
+                n_prefilling = n_prefilling.saturating_sub(1);
+                (prompt_len - pos).min(share)
             } else {
                 1
             };
@@ -325,5 +341,34 @@ mod tests {
         s.add_request(Request { id: 7, prompt: vec![], params: SamplingParams::default() });
         let (_plan, fin) = s.schedule();
         assert_eq!(fin, vec![Finished { id: 7, reason: FinishReason::Rejected }]);
+    }
+
+    #[test]
+    fn concurrent_prefill_splits_budget() {
+        // Two long prompts + a prefill budget of 4 => each prefilling sequence
+        // gets 2 tokens/step (the budget is split, not grabbed entirely by the
+        // first seq), so they prefill concurrently instead of serializing.
+        let mut s = Scheduler::new(64, SchedulerConfig { max_batch: 4, max_prefill: 4 });
+        s.add_request(Request { id: 1, prompt: vec![1, 2, 3, 4, 5, 6, 7, 8], params: SamplingParams { max_tokens: 3, ignore_eos: false } });
+        s.add_request(Request { id: 2, prompt: vec![9, 10, 11, 12, 13, 14, 15, 16], params: SamplingParams { max_tokens: 3, ignore_eos: false } });
+
+        // First step: BOTH sequences prefill (2 tokens each), not just one.
+        let (plan, _) = s.schedule();
+        let plan = plan.expect("a step");
+        assert_eq!(plan.entries.len(), 2, "both seqs prefill concurrently");
+        assert!(
+            plan.entries.iter().all(|(_, p)| p.len() == 2),
+            "budget 4 split across 2 seqs = 2 tokens each, got {:?}",
+            plan.entries.iter().map(|(_, p)| p.len()).collect::<Vec<_>>()
+        );
+        let sampled: Vec<(SeqId, u32)> = plan.samples.iter().map(|&(_r, seq)| (seq, 50)).collect();
+        s.ingest(&sampled);
+
+        // Both run to completion, each emitting max_tokens outputs.
+        let (emitted, finished) = drive(&mut s, |_| 50);
+        assert_eq!(emitted.iter().filter(|(id, _)| *id == 1).count(), 3, "req1 emits 3");
+        assert_eq!(emitted.iter().filter(|(id, _)| *id == 2).count(), 3, "req2 emits 3");
+        assert_eq!(finished.len(), 2);
+        assert_eq!(s.kv_used(), 0, "all slots recycled");
     }
 }
