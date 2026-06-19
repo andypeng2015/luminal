@@ -60,8 +60,10 @@ pub struct Engine {
 
 impl Engine {
     pub fn load(stream: Arc<CudaStream>, shard_paths: &[PathBuf], cfg: EngineConfig) -> Self {
-        // Uniform 1-token-per-sequence steps: total_s == #running <= max_batch.
-        let max_s = cfg.max_batch.max(1);
+        // total_s per step is at most max_batch decode tokens + one prefill chunk
+        // of up to max_prefill tokens (chunked prefill), so size the 's' bucket to
+        // cover max_batch + max_prefill.
+        let max_s = (cfg.max_batch + cfg.max_prefill).max(1);
 
         // Anti-fragmentation reserve (as in the demo): grab a contiguous block
         // while VRAM is empty and free it right before the arena is allocated,

@@ -26,8 +26,12 @@ async fn main() {
     let tokenizer = Arc::new(Tokenizer::from_file(model_dir.join("tokenizer.json")).unwrap());
 
     let cfg = EngineConfig {
-        max_batch: env_usize("MAX_BATCH", 16),
-        max_prefill: env_usize("MAX_PREFILL", 512),
+        // Defaults sized to fit gpt-oss-120b at 36 layers on an 80 GB H100:
+        // the 's' bucket spans 1..=(max_batch + max_prefill), so its arena must
+        // fit beside the ~63 GB of weights. max_batch=8 + max_prefill=64 (chunked
+        // prefill) -> s<=72, arena ~7.3 GB. Larger values may OOM at search.
+        max_batch: env_usize("MAX_BATCH", 8),
+        max_prefill: env_usize("MAX_PREFILL", 64),
         kv_capacity: env_usize("KV_CAPACITY", 4096),
         mem_cap_gib: env_usize("GPTOSS_MEM_CAP_GIB", 14),
     };

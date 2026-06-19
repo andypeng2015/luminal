@@ -78,10 +78,10 @@ pub struct StepPlan {
 }
 
 pub struct SchedulerConfig {
-    /// Max concurrent running sequences (== max total_s per step).
+    /// Max concurrent running sequences.
     pub max_batch: usize,
-    /// Unused (token-by-token prefill has no prompt-length cap); kept for API
-    /// stability with the engine config.
+    /// Chunked-prefill budget: max prompt tokens a sequence prefills per step.
+    /// `total_s` per step is bounded by `max_batch + max_prefill`.
     pub max_prefill: usize,
 }
 
@@ -170,19 +170,28 @@ impl Scheduler {
         let mut samples: Vec<(usize, SeqId)> = Vec::new();
         let mut row = 0usize;
         let mut drop_seqs: Vec<SeqId> = Vec::new();
+        // Chunked prefill: a prefilling sequence feeds up to `max_prefill` prompt
+        // tokens this step (instead of one), amortizing the per-pass overhead.
+        // Decode sequences feed one token and don't draw from the budget.
+        let mut prefill_budget = self.cfg.max_prefill.max(1);
 
         for i in 0..self.running.len() {
-            let (id, seq, pos, tok) = {
+            let (id, seq, pos, prompt_len, next_token) = {
                 let r = &self.running[i];
-                let tok = if r.pos < r.prompt.len() {
-                    r.prompt[r.pos] // still prefilling: feed the next prompt token
-                } else {
-                    r.next_token // decoding: feed the last sampled token
-                };
-                (r.id, r.seq, r.pos, tok)
+                (r.id, r.seq, r.pos, r.prompt.len(), r.next_token)
             };
-            // Allocate the slot for this step's new position.
-            if self.alloc.allocate(seq, 1).is_none() {
+            let prefilling = pos < prompt_len;
+            // Query tokens this sequence contributes this step.
+            let n = if prefilling {
+                (prompt_len - pos).min(prefill_budget)
+            } else {
+                1
+            };
+            if n == 0 {
+                continue; // prefill budget spent; this sequence waits a step
+            }
+            // Allocate this step's `n` new KV slots.
+            if self.alloc.allocate(seq, n).is_none() {
                 finished.push(Finished {
                     id,
                     reason: FinishReason::Length,
@@ -190,10 +199,20 @@ impl Scheduler {
                 drop_seqs.push(seq);
                 continue;
             }
-            entries.push((seq, vec![pos]));
-            tokens.push(tok);
-            samples.push((row, seq));
-            row += 1;
+            let positions: Vec<usize> = (pos..pos + n).collect();
+            if prefilling {
+                tokens.extend_from_slice(&self.running[i].prompt[pos..pos + n]);
+                prefill_budget -= n;
+            } else {
+                tokens.push(next_token);
+            }
+            entries.push((seq, positions));
+            // Sample only the last row of this sequence's chunk: it predicts the
+            // next token (a real output once the prompt is fully consumed).
+            samples.push((row + n - 1, seq));
+            row += n;
+            // Advance past the tokens fed this step (ingest checks the new pos).
+            self.running[i].pos += n;
         }
         for seq in drop_seqs {
             self.alloc.free(seq);
@@ -219,11 +238,10 @@ impl Scheduler {
             let Some(r) = self.running.iter_mut().find(|r| r.seq == seq) else {
                 continue;
             };
-            // `r.pos` is the position we just fed. The sampled token is a real
-            // output iff that was the last prompt token or a decode token.
-            let is_output = r.pos + 1 >= r.prompt.len().max(1);
-            r.pos += 1;
-            if !is_output {
+            // `schedule` already advanced `r.pos` past the tokens fed this step.
+            // The sampled token (last row of the chunk) is a real output once the
+            // prompt is fully consumed; earlier prefill chunks are intermediate.
+            if r.pos < r.prompt.len() {
                 continue; // prefill intermediate
             }
             r.next_token = tok as i32;
