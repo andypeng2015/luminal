@@ -709,15 +709,36 @@ pub(crate) fn run_moe_experts(
         top_k,
     } = *dims;
 
+    // Optional per-phase profiling (LUMINAL_MOE_PROFILE): sync after each phase
+    // and accumulate GPU time per category, printed once per layer call.
+    let prof = std::env::var_os("LUMINAL_MOE_PROFILE").is_some();
+    let (mut t_dq_gu, mut t_mm_gu, mut t_act, mut t_dq_dn, mut t_mm_dn, mut t_accum) = (
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+        std::time::Duration::ZERO,
+    );
+    let lap = |acc: &mut std::time::Duration, mark: &mut std::time::Instant| {
+        if prof {
+            let _ = stream.synchronize();
+            *acc += mark.elapsed();
+            *mark = std::time::Instant::now();
+        }
+    };
+
     for t in 0..seq {
         let x_t_ptr = x_bf16_ptr + (t * hidden * 2) as u64; // BF16
 
         for i in 0..top_k {
             let expert_idx = topk_idx[t * top_k + i] as usize;
             let weight = expert_weights[t * top_k + i];
+            let mut mark = std::time::Instant::now();
 
             // a. Gate+Up matmul (BF16 in, BF16 out)
             let gu_w_ptr = gate_up_weight(expert_idx)?;
+            lap(&mut t_dq_gu, &mut mark);
             cublas_matmul(
                 stream,
                 cublaslt,
@@ -738,12 +759,15 @@ pub(crate) fn run_moe_experts(
                 1.0f32,
                 0.0f32,
             )?;
+            lap(&mut t_mm_gu, &mut mark);
 
             // b. Gated activation (BF16 → BF16)
             activation(expert_idx, gate_up_out_ptr, hidden_tmp_ptr)?;
+            lap(&mut t_act, &mut mark);
 
             // c. Down matmul (BF16 in → F32 out) with fused weighted accumulate
             let dn_w_ptr = down_weight(expert_idx)?;
+            lap(&mut t_dq_dn, &mut mark);
             let out_t_ptr = output_ptr + (t * hidden * 4) as u64; // F32
             let beta = if i == 0 { 0.0f32 } else { 1.0f32 };
             cublas_matmul_mixed(
@@ -765,12 +789,26 @@ pub(crate) fn run_moe_experts(
                 beta,
             )?;
 
+            lap(&mut t_mm_dn, &mut mark);
+
             // d. Per-expert down epilogue (e.g. weighted bias accumulate)
             down_epilogue(t, expert_idx, weight, out_t_ptr)?;
+            lap(&mut t_accum, &mut mark);
         }
     }
 
     stream.synchronize()?;
+    if prof {
+        eprintln!(
+            "MOE_PROF seq={seq} topk={top_k} dq_gu={:.2} mm_gu={:.2} act={:.2} dq_dn={:.2} mm_dn={:.2} accum={:.2}",
+            t_dq_gu.as_secs_f64() * 1e3,
+            t_mm_gu.as_secs_f64() * 1e3,
+            t_act.as_secs_f64() * 1e3,
+            t_dq_dn.as_secs_f64() * 1e3,
+            t_mm_dn.as_secs_f64() * 1e3,
+            t_accum.as_secs_f64() * 1e3,
+        );
+    }
     Ok(())
 }
 
