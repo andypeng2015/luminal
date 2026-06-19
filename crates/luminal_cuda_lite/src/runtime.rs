@@ -2864,7 +2864,7 @@ impl Runtime for CudaRuntime {
         }
         consume_time += timer.elapsed();
 
-        if profile_runtime {
+        if profile_runtime || std::env::var_os("LUMINAL_EXEC_BREAKDOWN").is_some() {
             let runtime_total = runtime_profile_start.elapsed();
             let launch_total = graph_launch_time + host_op_time + sync_time;
             eprintln!(
