@@ -58,8 +58,8 @@ pub struct GLUMoEMXFP4 {
     intermediate: Expression,
     /// Number of experts summed per token (top_k).
     output_k: Expression,
-    /// (module, f32_to_bf16, mxfp4_gemv, mxfp4_gemv_accum,
-    ///  glu_clamped_interleaved_bf16, accumulate_bias_scaled_f32)
+    /// (module, f32_to_bf16, mxfp4_gemv_batched, mxfp4_down_batched,
+    ///  glu_batched, moe_reduce) — all batched over (token,expert) pairs.
     module: OnceLock<(
         Arc<CudaModule>,
         CudaFunction,
@@ -166,119 +166,121 @@ __device__ __forceinline__ float mxfp4_row_dot(
     return acc; // valid on lane 0
 }
 
-// GPU-side expert routing: each kernel reads its expert index e (and routing
-// weight) from device memory and offsets the per-expert weight/scale/bias base
-// pointers itself, so the host never copies routing to the CPU (no per-layer
-// DtoH sync). `e` is clamped to [0, num_experts) to guard against an OOB read.
-__device__ __forceinline__ int clamp_expert(unsigned long long eptr, int num_experts) {
-    int e = *((const int*)eptr);
+// Batched MoE over ALL (token,expert) pairs per layer: each kernel is launched
+// ONCE (grid covers every pair) instead of once per pair, so the CPU issues ~4
+// launches/layer instead of 4*seq*top_k. Routing is read on-GPU: for pair p the
+// token is t=p/top_k, slot i=p%top_k, and the expert index (clamped to
+// [0,num_experts)) + routing weight come from the topk buffers.
+__device__ __forceinline__ int pair_expert(
+    unsigned long long topk_idx_base, int p, int top_k, int idx_stride, int num_experts
+) {
+    int t = p / top_k, i = p - t * top_k;
+    int e = ((const int*)topk_idx_base)[(long)t * idx_stride + i];
     return e < 0 ? 0 : (e >= num_experts ? num_experts - 1 : e);
 }
 
-// gate_up: out[o] = sum_c W[e][o,c]*x[c]   (bf16 out, alpha=1, beta=0)
-extern "C" __global__ void mxfp4_gemv(
+// Batched gate_up GEMV. grid=(rows/warps, num_pairs). gu_out[p,o]=W[e_p]@x[t_p].
+extern "C" __global__ void mxfp4_gemv_batched(
     unsigned long long blocks_base, unsigned long long scales_base,
     unsigned long long blk_stride, unsigned long long sc_stride,
-    unsigned long long expert_idx_ptr, int num_experts,
-    unsigned long long x_ptr, unsigned long long out_ptr,
+    unsigned long long topk_idx_base, int top_k, int idx_stride, int num_experts,
+    unsigned long long x_base, unsigned long long out_base,
     int out_dim, int in_dim
 ) {
     extern __shared__ __nv_bfloat16 xs[];
-    const __nv_bfloat16* x = (const __nv_bfloat16*)x_ptr;
-    int tid = threadIdx.y * 32 + threadIdx.x;
-    int nthreads = blockDim.x * blockDim.y;
-    for (int i = tid; i < in_dim; i += nthreads) xs[i] = x[i];
+    int p = blockIdx.y;
+    int t = p / top_k;
+    int e = pair_expert(topk_idx_base, p, top_k, idx_stride, num_experts);
+    const __nv_bfloat16* x = (const __nv_bfloat16*)(x_base + (unsigned long long)t * in_dim * 2);
+    int tid = threadIdx.y * 32 + threadIdx.x, nthreads = blockDim.x * blockDim.y;
+    for (int c = tid; c < in_dim; c += nthreads) xs[c] = x[c];
     __syncthreads();
-    int row = blockIdx.x * blockDim.y + threadIdx.y; // warp-uniform
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= out_dim) return;
-    int e = clamp_expert(expert_idx_ptr, num_experts);
-    const unsigned char* brow =
-        (const unsigned char*)(blocks_base + (unsigned long long)e * blk_stride) + (long)row * (in_dim >> 1);
-    const unsigned char* srow =
-        (const unsigned char*)(scales_base + (unsigned long long)e * sc_stride) + (long)row * (in_dim >> 5);
+    const unsigned char* brow = (const unsigned char*)(blocks_base + (unsigned long long)e * blk_stride) + (long)row * (in_dim >> 1);
+    const unsigned char* srow = (const unsigned char*)(scales_base + (unsigned long long)e * sc_stride) + (long)row * (in_dim >> 5);
     float acc = mxfp4_row_dot(brow, srow, xs, in_dim, threadIdx.x);
-    if (threadIdx.x == 0) ((__nv_bfloat16*)out_ptr)[row] = __float2bfloat16(acc);
+    if (threadIdx.x == 0) ((__nv_bfloat16*)out_base)[(long)p * out_dim + row] = __float2bfloat16(acc);
 }
 
-// down: out[o] = beta*out[o] + (*weight_ptr)*sum_c W[e][o,c]*x[c]   (f32 out)
-extern "C" __global__ void mxfp4_gemv_accum(
+// Batched clamped interleaved SwiGLU + per-expert gate_up bias. One thread per
+// (pair, j). hid[p,j] = act(gu[p,2j]+bias[2j], gu[p,2j+1]+bias[2j+1]).
+extern "C" __global__ void glu_batched(
+    unsigned long long gu_base,
+    unsigned long long bias_base, unsigned long long bias_stride,
+    unsigned long long topk_idx_base, int top_k, int idx_stride, int num_experts,
+    unsigned long long out_base, int intermediate, int num_pairs
+) {
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)num_pairs * intermediate) return;
+    int p = idx / intermediate, j = idx - (long)p * intermediate;
+    int e = pair_expert(topk_idx_base, p, top_k, idx_stride, num_experts);
+    const __nv_bfloat16* gu = (const __nv_bfloat16*)(gu_base + (unsigned long long)p * (2 * intermediate) * 2);
+    const __nv_bfloat16* bias = (const __nv_bfloat16*)(bias_base + (unsigned long long)e * bias_stride);
+    float gate = __bfloat162float(gu[2*j])   + __bfloat162float(bias[2*j]);
+    float up   = __bfloat162float(gu[2*j+1]) + __bfloat162float(bias[2*j+1]);
+    gate = fminf(gate, 7.0f);
+    up   = fminf(fmaxf(up, -7.0f), 7.0f);
+    float glu = gate / (1.0f + expf(-1.702f * gate));
+    ((__nv_bfloat16*)out_base)[(long)p * intermediate + j] = __float2bfloat16((up + 1.0f) * glu);
+}
+
+// Batched down GEMV (raw W@hid, no weight/bias). grid=(rows/warps, num_pairs).
+// dn_out[p,o] f32 (full precision; the reduce applies weight+bias).
+extern "C" __global__ void mxfp4_down_batched(
     unsigned long long blocks_base, unsigned long long scales_base,
     unsigned long long blk_stride, unsigned long long sc_stride,
-    unsigned long long expert_idx_ptr, unsigned long long weight_ptr, int num_experts,
-    unsigned long long x_ptr, unsigned long long out_ptr,
-    int out_dim, int in_dim, float beta
+    unsigned long long topk_idx_base, int top_k, int idx_stride, int num_experts,
+    unsigned long long hid_base, unsigned long long out_base,
+    int out_dim, int in_dim
 ) {
     extern __shared__ __nv_bfloat16 xs[];
-    const __nv_bfloat16* x = (const __nv_bfloat16*)x_ptr;
-    int tid = threadIdx.y * 32 + threadIdx.x;
-    int nthreads = blockDim.x * blockDim.y;
-    for (int i = tid; i < in_dim; i += nthreads) xs[i] = x[i];
+    int p = blockIdx.y;
+    int e = pair_expert(topk_idx_base, p, top_k, idx_stride, num_experts);
+    const __nv_bfloat16* x = (const __nv_bfloat16*)(hid_base + (unsigned long long)p * in_dim * 2);
+    int tid = threadIdx.y * 32 + threadIdx.x, nthreads = blockDim.x * blockDim.y;
+    for (int c = tid; c < in_dim; c += nthreads) xs[c] = x[c];
     __syncthreads();
-    int row = blockIdx.x * blockDim.y + threadIdx.y; // warp-uniform
+    int row = blockIdx.x * blockDim.y + threadIdx.y;
     if (row >= out_dim) return;
-    int e = clamp_expert(expert_idx_ptr, num_experts);
-    float scale = *((const float*)weight_ptr);
-    const unsigned char* brow =
-        (const unsigned char*)(blocks_base + (unsigned long long)e * blk_stride) + (long)row * (in_dim >> 1);
-    const unsigned char* srow =
-        (const unsigned char*)(scales_base + (unsigned long long)e * sc_stride) + (long)row * (in_dim >> 5);
+    const unsigned char* brow = (const unsigned char*)(blocks_base + (unsigned long long)e * blk_stride) + (long)row * (in_dim >> 1);
+    const unsigned char* srow = (const unsigned char*)(scales_base + (unsigned long long)e * sc_stride) + (long)row * (in_dim >> 5);
     float acc = mxfp4_row_dot(brow, srow, xs, in_dim, threadIdx.x);
-    if (threadIdx.x == 0) {
-        float* out = (float*)out_ptr;
-        float prev = (beta == 0.f) ? 0.f : out[row]; // beta=0: don't read uninit
-        out[row] = beta * prev + scale * acc;
-    }
+    if (threadIdx.x == 0) ((float*)out_base)[(long)p * out_dim + row] = acc;
 }
 
-// gpt-oss clamped interleaved SwiGLU, with the per-expert gate_up bias folded in.
-//   gate_up: bf16 [2*intermediate], interleaved: gate = [2i], up = [2i+1]
-//   bias_base[e*bias_stride]: bf16 [2*intermediate], same interleaving
-//   out:     bf16 [intermediate]
-extern "C" __global__ void glu_clamped_interleaved_bf16(
-    unsigned long long gate_up_ptr,
-    unsigned long long bias_base, unsigned long long bias_stride,
-    unsigned long long expert_idx_ptr, int num_experts,
-    unsigned long long out_ptr,
-    int intermediate
+// Deterministic weighted reduce over the top_k experts (fixed order, no atomics):
+// out[t,r] = sum_i topk_w[t,i] * (dn_out[t*top_k+i, r] + dn_bias[e_i, r]).
+extern "C" __global__ void moe_reduce(
+    unsigned long long dn_out_base,
+    unsigned long long dn_bias_base, unsigned long long dn_bias_stride,
+    unsigned long long topk_idx_base, unsigned long long topk_vals_base,
+    int top_k, int idx_stride, int val_stride, int num_experts,
+    unsigned long long out_base, int seq, int hidden
 ) {
-    int e = clamp_expert(expert_idx_ptr, num_experts);
-    const __nv_bfloat16* gate_up = (const __nv_bfloat16*)gate_up_ptr;
-    const __nv_bfloat16* bias = (const __nv_bfloat16*)(bias_base + (unsigned long long)e * bias_stride);
-    __nv_bfloat16* out = (__nv_bfloat16*)out_ptr;
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < intermediate) {
-        float gate = __bfloat162float(gate_up[2*i])   + __bfloat162float(bias[2*i]);
-        float up   = __bfloat162float(gate_up[2*i+1]) + __bfloat162float(bias[2*i+1]);
-        gate = fminf(gate, 7.0f);                       // clamp(max=limit)
-        up   = fminf(fmaxf(up, -7.0f), 7.0f);           // clamp(-limit, limit)
-        float glu = gate / (1.0f + expf(-1.702f * gate));
-        out[i] = __float2bfloat16((up + 1.0f) * glu);
+    long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
+    if (idx >= (long)seq * hidden) return;
+    int t = idx / hidden, r = idx - (long)t * hidden;
+    float sum = 0.f;
+    for (int i = 0; i < top_k; i++) {
+        int e = ((const int*)topk_idx_base)[(long)t * idx_stride + i];
+        e = e < 0 ? 0 : (e >= num_experts ? num_experts - 1 : e);
+        float w = ((const float*)topk_vals_base)[(long)t * val_stride + i];
+        float dn = ((const float*)dn_out_base)[(long)(t * top_k + i) * hidden + r];
+        const __nv_bfloat16* bias = (const __nv_bfloat16*)(dn_bias_base + (unsigned long long)e * dn_bias_stride);
+        sum += w * (dn + __bfloat162float(bias[r]));
     }
-}
-
-// out[i] += (*weight_ptr) * bias_base[e*bias_stride][i]   (f32 accumulator, bf16 bias)
-extern "C" __global__ void accumulate_bias_scaled_f32(
-    unsigned long long out_ptr,
-    unsigned long long bias_base, unsigned long long bias_stride,
-    unsigned long long expert_idx_ptr, unsigned long long weight_ptr, int num_experts,
-    int n
-) {
-    int e = clamp_expert(expert_idx_ptr, num_experts);
-    float scale = *((const float*)weight_ptr);
-    float* out = (float*)out_ptr;
-    const __nv_bfloat16* bias = (const __nv_bfloat16*)(bias_base + (unsigned long long)e * bias_stride);
-    int i = blockIdx.x * blockDim.x + threadIdx.x;
-    if (i < n) out[i] += scale * __bfloat162float(bias[i]);
+    ((float*)out_base)[idx] = sum;
 }
 "#;
             let ptx = compile_module_image_for_current_device(stream.context(), src).unwrap();
             let module = stream.context().load_module(ptx).unwrap();
             let f32_to_bf16 = module.load_function("f32_to_bf16").unwrap();
-            let gemv = module.load_function("mxfp4_gemv").unwrap();
-            let gemv_accum = module.load_function("mxfp4_gemv_accum").unwrap();
-            let activation = module.load_function("glu_clamped_interleaved_bf16").unwrap();
-            let accum_bias = module.load_function("accumulate_bias_scaled_f32").unwrap();
-            (module, f32_to_bf16, gemv, gemv_accum, activation, accum_bias)
+            let gemv = module.load_function("mxfp4_gemv_batched").unwrap();
+            let down = module.load_function("mxfp4_down_batched").unwrap();
+            let activation = module.load_function("glu_batched").unwrap();
+            let reduce = module.load_function("moe_reduce").unwrap();
+            (module, f32_to_bf16, gemv, down, activation, reduce)
         })
     }
 }
@@ -434,8 +436,7 @@ impl HostOp for GLUMoEMXFP4 {
         let dn_bias_ptr = buf_ptr(dn_bias_buf, stream);
         let output_ptr = buf_ptr(output_buf, stream);
 
-        let (_, f32_to_bf16_fn, mxfp4_gemv_fn, mxfp4_gemv_accum_fn, activation_fn, accum_bias_fn) =
-            self.get_kernels(stream);
+        let (_, f32_to_bf16_fn, gemv_fn, down_fn, act_fn, reduce_fn) = self.get_kernels(stream);
 
         // Clean non-perturbing timers (LUMINAL_MOE_PROF2): routing (host DtoH
         // sync) vs the kernel-launch loop, no per-phase syncs added.
@@ -461,14 +462,18 @@ impl HostOp for GLUMoEMXFP4 {
         let routing_ms = if prof2 { rt0.elapsed().as_secs_f64() * 1e3 } else { 0.0 };
         let lp0 = std::time::Instant::now();
 
-        // Reused scratch (freed at end of this layer's execute). No dequantized
-        // weight buffers — the fused GEMV kernels read FP4 directly.
+        // One launch per kernel over ALL (token,expert) pairs this step.
+        let num_pairs = seq * top_k;
+        // Reused scratch (freed at end of execute): per-pair gate_up / hidden /
+        // down buffers. No dequantized weights (fused GEMVs read FP4 directly).
         let x_bf16 = unsafe { stream.alloc::<u8>(seq * hidden * 2)? };
-        let gu_out = unsafe { stream.alloc::<u8>(gate_up_dim * 2)? };
-        let hid = unsafe { stream.alloc::<u8>(intermediate * 2)? };
+        let gu_out = unsafe { stream.alloc::<u8>(num_pairs * gate_up_dim * 2)? };
+        let hid = unsafe { stream.alloc::<u8>(num_pairs * intermediate * 2)? };
+        let dn_out = unsafe { stream.alloc::<u8>(num_pairs * hidden * 4)? };
         let xbf16_ptr = slice_ptr(&x_bf16, stream);
         let gu_out_ptr = slice_ptr(&gu_out, stream);
         let hid_ptr = slice_ptr(&hid, stream);
+        let dn_out_ptr = slice_ptr(&dn_out, stream);
 
         let launch = |f: &CudaFunction, n: usize, args: &[KernelArg]| -> anyhow::Result<()> {
             let blocks = (n as u32).div_ceil(256);
@@ -490,11 +495,13 @@ impl HostOp for GLUMoEMXFP4 {
             Ok(())
         };
 
-        // Fused MXFP4 GEMV launch: one warp per output row, x staged in shared.
+        // Batched MXFP4 GEMV launch: one warp per output row (grid.x), one grid.y
+        // per (token,expert) pair; x staged in shared per block.
         const GEMV_WARPS: u32 = 8;
         let launch_gemv = |f: &CudaFunction,
                            out_dim: usize,
                            in_dim: usize,
+                           pairs: usize,
                            args: &[KernelArg]|
          -> anyhow::Result<()> {
             let blocks = (out_dim as u32).div_ceil(GEMV_WARPS);
@@ -508,7 +515,7 @@ impl HostOp for GLUMoEMXFP4 {
             }
             unsafe {
                 b.launch(LaunchConfig {
-                    grid_dim: (blocks, 1, 1),
+                    grid_dim: (blocks, pairs as u32, 1),
                     block_dim: (32, GEMV_WARPS, 1),
                     shared_mem_bytes: (in_dim * 2) as u32,
                 })?;
@@ -527,128 +534,102 @@ impl HostOp for GLUMoEMXFP4 {
             ],
         )?;
 
-        // Per-(token, expert): fused gate_up GEMV -> clamped interleaved SwiGLU
-        // -> fused down GEMV with weighted f32 accumulate -> weighted bias add.
-        // The fused GEMVs decode MXFP4 on the fly (no bf16 weight
-        // materialization); dequant was ~86% of the old MoE cost.
-        let prof = std::env::var_os("LUMINAL_MOE_PROFILE").is_some();
-        let (mut t_mm_gu, mut t_act, mut t_mm_dn, mut t_accum) = (
-            std::time::Duration::ZERO,
-            std::time::Duration::ZERO,
-            std::time::Duration::ZERO,
-            std::time::Duration::ZERO,
-        );
-        let lap = |acc: &mut std::time::Duration, mark: &mut std::time::Instant| {
-            if prof {
-                let _ = stream.synchronize();
-                *acc += mark.elapsed();
-                *mark = std::time::Instant::now();
-            }
-        };
-
+        // ONE launch per kernel over ALL (token,expert) pairs — was 4*seq*top_k
+        // launches/layer; profiling showed that CPU launch issue dominated a
+        // batched step (75% at s=8). Routing is read on-GPU from the topk buffers.
         let num_experts_i32 = num_experts as i32;
-        for t in 0..seq {
-            let x_t_ptr = xbf16_ptr + (t * hidden * 2) as u64; // BF16
-            let out_t_ptr = output_ptr + (t * hidden * 4) as u64; // F32
-            for i in 0..top_k {
-                // GPU pointers to this (t,i) slot's expert index / routing weight.
-                let eptr = topk_idx_base + ((t * idx_stride + i) * 4) as u64;
-                let wptr = topk_vals_base + ((t * val_stride + i) * 4) as u64;
-                let mut mark = std::time::Instant::now();
+        let top_k_i32 = top_k as i32;
+        let idx_stride_i32 = idx_stride as i32;
+        let val_stride_i32 = val_stride as i32;
 
-                // a. gate_up: fused MXFP4 GEMV -> gu_out (bf16)
-                launch_gemv(
-                    mxfp4_gemv_fn,
-                    gate_up_dim,
-                    hidden,
-                    &[
-                        KernelArg::U64(gu_blocks_ptr),
-                        KernelArg::U64(gu_scales_ptr),
-                        KernelArg::U64(gu_blocks_stride as u64),
-                        KernelArg::U64(gu_scales_stride as u64),
-                        KernelArg::U64(eptr),
-                        KernelArg::I32(num_experts_i32),
-                        KernelArg::U64(x_t_ptr),
-                        KernelArg::U64(gu_out_ptr),
-                        KernelArg::I32(gate_up_dim as i32),
-                        KernelArg::I32(hidden as i32),
-                    ],
-                )?;
-                lap(&mut t_mm_gu, &mut mark);
+        // gate_up GEMV over all pairs -> gu_out [num_pairs, gate_up_dim] (bf16)
+        launch_gemv(
+            gemv_fn,
+            gate_up_dim,
+            hidden,
+            num_pairs,
+            &[
+                KernelArg::U64(gu_blocks_ptr),
+                KernelArg::U64(gu_scales_ptr),
+                KernelArg::U64(gu_blocks_stride as u64),
+                KernelArg::U64(gu_scales_stride as u64),
+                KernelArg::U64(topk_idx_base),
+                KernelArg::I32(top_k_i32),
+                KernelArg::I32(idx_stride_i32),
+                KernelArg::I32(num_experts_i32),
+                KernelArg::U64(xbf16_ptr),
+                KernelArg::U64(gu_out_ptr),
+                KernelArg::I32(gate_up_dim as i32),
+                KernelArg::I32(hidden as i32),
+            ],
+        )?;
 
-                // b. clamped interleaved SwiGLU + gate_up bias -> hid (bf16)
-                launch(
-                    activation_fn,
-                    intermediate,
-                    &[
-                        KernelArg::U64(gu_out_ptr),
-                        KernelArg::U64(gu_bias_ptr),
-                        KernelArg::U64(gu_bias_stride as u64),
-                        KernelArg::U64(eptr),
-                        KernelArg::I32(num_experts_i32),
-                        KernelArg::U64(hid_ptr),
-                        KernelArg::I32(intermediate as i32),
-                    ],
-                )?;
-                lap(&mut t_act, &mut mark);
+        // clamped interleaved SwiGLU + gate_up bias over all pairs -> hid (bf16)
+        launch(
+            act_fn,
+            num_pairs * intermediate,
+            &[
+                KernelArg::U64(gu_out_ptr),
+                KernelArg::U64(gu_bias_ptr),
+                KernelArg::U64(gu_bias_stride as u64),
+                KernelArg::U64(topk_idx_base),
+                KernelArg::I32(top_k_i32),
+                KernelArg::I32(idx_stride_i32),
+                KernelArg::I32(num_experts_i32),
+                KernelArg::U64(hid_ptr),
+                KernelArg::I32(intermediate as i32),
+                KernelArg::I32(num_pairs as i32),
+            ],
+        )?;
 
-                // c. down: fused MXFP4 GEMV with weighted f32 accumulate -> out_t
-                let beta = if i == 0 { 0.0f32 } else { 1.0f32 };
-                launch_gemv(
-                    mxfp4_gemv_accum_fn,
-                    hidden,
-                    intermediate,
-                    &[
-                        KernelArg::U64(dn_blocks_ptr),
-                        KernelArg::U64(dn_scales_ptr),
-                        KernelArg::U64(dn_blocks_stride as u64),
-                        KernelArg::U64(dn_scales_stride as u64),
-                        KernelArg::U64(eptr),
-                        KernelArg::U64(wptr),
-                        KernelArg::I32(num_experts_i32),
-                        KernelArg::U64(hid_ptr),
-                        KernelArg::U64(out_t_ptr),
-                        KernelArg::I32(hidden as i32),
-                        KernelArg::I32(intermediate as i32),
-                        KernelArg::F32(beta),
-                    ],
-                )?;
-                lap(&mut t_mm_dn, &mut mark);
+        // down GEMV (raw W@hid) over all pairs -> dn_out [num_pairs, hidden] (f32)
+        launch_gemv(
+            down_fn,
+            hidden,
+            intermediate,
+            num_pairs,
+            &[
+                KernelArg::U64(dn_blocks_ptr),
+                KernelArg::U64(dn_scales_ptr),
+                KernelArg::U64(dn_blocks_stride as u64),
+                KernelArg::U64(dn_scales_stride as u64),
+                KernelArg::U64(topk_idx_base),
+                KernelArg::I32(top_k_i32),
+                KernelArg::I32(idx_stride_i32),
+                KernelArg::I32(num_experts_i32),
+                KernelArg::U64(hid_ptr),
+                KernelArg::U64(dn_out_ptr),
+                KernelArg::I32(hidden as i32),
+                KernelArg::I32(intermediate as i32),
+            ],
+        )?;
 
-                // d. weighted down bias accumulate
-                launch(
-                    accum_bias_fn,
-                    hidden,
-                    &[
-                        KernelArg::U64(out_t_ptr),
-                        KernelArg::U64(dn_bias_ptr),
-                        KernelArg::U64(dn_bias_stride as u64),
-                        KernelArg::U64(eptr),
-                        KernelArg::U64(wptr),
-                        KernelArg::I32(num_experts_i32),
-                        KernelArg::I32(hidden as i32),
-                    ],
-                )?;
-                lap(&mut t_accum, &mut mark);
-            }
-        }
+        // deterministic weighted reduce over top_k experts -> output [seq, hidden]
+        launch(
+            reduce_fn,
+            seq * hidden,
+            &[
+                KernelArg::U64(dn_out_ptr),
+                KernelArg::U64(dn_bias_ptr),
+                KernelArg::U64(dn_bias_stride as u64),
+                KernelArg::U64(topk_idx_base),
+                KernelArg::U64(topk_vals_base),
+                KernelArg::I32(top_k_i32),
+                KernelArg::I32(idx_stride_i32),
+                KernelArg::I32(val_stride_i32),
+                KernelArg::I32(num_experts_i32),
+                KernelArg::U64(output_ptr),
+                KernelArg::I32(seq as i32),
+                KernelArg::I32(hidden as i32),
+            ],
+        )?;
 
-        // No per-layer sync: GPU-side routing removed read_routing's implicit
-        // sync, so same-stream ordering + the step-end get_f32 cover correctness,
-        // and the scratch frees stream-ordered via the async pool. Layers pipeline.
+        // No per-layer sync: same-stream ordering + the step-end get_f32 cover
+        // correctness; scratch frees stream-ordered via the async pool.
         if prof2 {
             eprintln!(
-                "MOE2 seq={seq} routing={routing_ms:.3} loop={:.3}",
+                "MOE2 seq={seq} pairs={num_pairs} routing={routing_ms:.3} loop={:.3}",
                 lp0.elapsed().as_secs_f64() * 1e3
-            );
-        }
-        if prof {
-            eprintln!(
-                "MOE_PROF seq={seq} topk={top_k} mm_gu={:.2} act={:.2} mm_dn={:.2} accum={:.2}",
-                t_mm_gu.as_secs_f64() * 1e3,
-                t_act.as_secs_f64() * 1e3,
-                t_mm_dn.as_secs_f64() * 1e3,
-                t_accum.as_secs_f64() * 1e3,
             );
         }
 
