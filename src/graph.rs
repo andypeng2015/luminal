@@ -1633,6 +1633,36 @@ impl Graph {
                 .is_some_and(|timeout| elapsed >= timeout)
         };
 
+        // LUMINAL_SEARCH_DEBUG=<marker>: per-candidate fate tracing. Every
+        // candidate logs whether its extracted LLIR contains an op whose Debug
+        // repr matches <marker> (e.g. "FlashInferSink") and how it fared
+        // (filter reject / timeout / nan / panic / measured). Cheap and
+        // backend-agnostic; invaluable for diagnosing why a host-op island is
+        // never selected.
+        let search_debug_marker = std::env::var("LUMINAL_SEARCH_DEBUG")
+            .ok()
+            .filter(|s| !s.is_empty());
+        let debug_marker_count =
+            |g: &LLIRGraph, marker: &Option<String>| -> Option<usize> {
+                marker.as_ref().map(|m| {
+                    g.node_weights()
+                        .filter(|op| format!("{op:?}").contains(m.as_str()))
+                        .count()
+                })
+            };
+        macro_rules! search_debug {
+            ($kind:expr, $count:expr, $($fate:tt)*) => {
+                if search_debug_marker.is_some() {
+                    eprintln!(
+                        "SEARCHDBG kind={} island={} fate={}",
+                        $kind,
+                        $count.map(|c: usize| c.to_string()).unwrap_or_else(|| "?".into()),
+                        format!($($fate)*)
+                    );
+                }
+            };
+        }
+
         // Find a viable initial genome. Runtime-filtered candidates are dry
         // failures, not searched graphs: they are never profiled and do not
         // count toward the graph search limit.
@@ -1676,6 +1706,7 @@ impl Graph {
                     graph
                 }));
                 let Ok(graph) = graph_result else {
+                    search_debug!("initial", None::<usize>, "extract-panic");
                     invalid_attempts += 1;
                     if invalid_attempts > max_invalid_attempts {
                         panic!(
@@ -1701,6 +1732,12 @@ impl Graph {
                     CandidateFilterResult::reject_with_display("candidate compile panicked")
                 });
                 if !filter_result.accepted {
+                    search_debug!(
+                        "initial",
+                        debug_marker_count(&graph, &search_debug_marker),
+                        "filter-reject: {}",
+                        filter_result.display.as_deref().unwrap_or("(no reason)")
+                    );
                     filter_fails += 1;
                     last_filter_rejection = filter_result.display;
                     // Rejections are otherwise silent until the 10k-fail
@@ -1758,9 +1795,19 @@ impl Graph {
 
                 match result {
                     Ok((metric, disp, false, false, false)) => {
+                        search_debug!(
+                            "initial",
+                            debug_marker_count(&graph, &search_debug_marker),
+                            "measured: {disp}"
+                        );
                         break (genome, R::aggregate_profile_metrics(&[metric]), disp, 1);
                     }
                     Ok((_, _, has_nan, timed_out, invalid_profile)) => {
+                        search_debug!(
+                            "initial",
+                            debug_marker_count(&graph, &search_debug_marker),
+                            "invalid: nan={has_nan} timeout={timed_out} invalid_profile={invalid_profile}"
+                        );
                         if timed_out {
                             n_timed_out += 1;
                         } else if has_nan {
@@ -1771,6 +1818,11 @@ impl Graph {
                         invalid_attempts += 1;
                     }
                     Err(_) => {
+                        search_debug!(
+                            "initial",
+                            debug_marker_count(&graph, &search_debug_marker),
+                            "profile-panic"
+                        );
                         n_panicked += 1;
                         invalid_attempts += 1;
                     }
@@ -1854,6 +1906,7 @@ impl Graph {
                     llir_graph
                 }));
                 let Ok(llir_graph) = graph_result else {
+                    search_debug!("offspring", None::<usize>, "extract-panic");
                     if search_log {
                         for _ in 1..n_bar_lines {
                             print!("\x1b[1A");
@@ -1878,6 +1931,12 @@ impl Graph {
                     CandidateFilterResult::reject_with_display("candidate compile panicked")
                 });
                 if !filter_result.accepted {
+                    search_debug!(
+                        "offspring",
+                        debug_marker_count(&llir_graph, &search_debug_marker),
+                        "filter-reject: {}",
+                        filter_result.display.as_deref().unwrap_or("(no reason)")
+                    );
                     continue;
                 }
                 let filter_display = filter_result.display;
@@ -1920,12 +1979,15 @@ impl Graph {
                     )
                 }));
 
+                let dbg_island = debug_marker_count(&llir_graph, &search_debug_marker);
                 let (new_metric, display_metric) = match profile_result {
                     Ok((metric, display, false, false, false)) => {
                         generation_found_non_timeout = true;
+                        search_debug!("offspring", dbg_island, "measured: {display}");
                         (R::aggregate_profile_metrics(&[metric]), display)
                     }
                     Ok((_, _, _, true, _)) | Err(_) => {
+                        search_debug!("offspring", dbg_island, "timeout-or-panic");
                         // Timed out or panicked — redraw bars and skip.
                         if search_log {
                             for _ in 1..n_bar_lines {
@@ -1939,6 +2001,7 @@ impl Graph {
                     }
                     Ok((_, _, true, false, _)) => {
                         generation_found_non_timeout = true;
+                        search_debug!("offspring", dbg_island, "nan");
                         // Completed profiling but produced NaNs — redraw bars and skip.
                         if search_log {
                             for _ in 1..n_bar_lines {
@@ -1951,6 +2014,7 @@ impl Graph {
                         continue;
                     }
                     Ok((_, _, false, false, true)) => {
+                        search_debug!("offspring", dbg_island, "invalid-profile");
                         // Backend rejected this candidate during load/profile.
                         if search_log {
                             for _ in 1..n_bar_lines {
@@ -1984,6 +2048,7 @@ impl Graph {
 
                 let new_best = best_metric.gt(&new_metric);
                 if new_best {
+                    search_debug!("offspring", dbg_island, "NEW-BEST: {display_metric}");
                     best_metric = new_metric;
                     best_genome = genome.clone();
                 }

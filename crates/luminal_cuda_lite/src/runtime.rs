@@ -2436,16 +2436,53 @@ impl CudaRuntime {
     ) -> (Duration, String) {
         self.profiling = true;
         let profile_start = std::time::Instant::now();
+        // Warmup execute (untimed): the first execution after loading a
+        // candidate pays one-time host-side setup — CUDA-graph capture of
+        // every kernel island (~seconds for ~1k-kernel graphs), buffer
+        // materialization, pointer tables. That cost is per-compile at
+        // serving time, not per-step, and it is nearly identical for every
+        // candidate, so folding it into the trial mean drowns the actual
+        // per-step execution differences the search exists to rank (measured:
+        // all candidates of a large MoE model profile at ~1.24s ≈ capture/3
+        // regardless of content, making selection noise). Timed trials below
+        // measure steady state. The timeout still bounds warmup + trials.
+        //
+        // NOTE: with host-op kernel modules cached process-wide (the actual
+        // fix for the 1.2s/candidate NVRTC recompile that once randomized
+        // selection), this warmup is defense-in-depth: it keeps residual
+        // first-execute costs (CUDA-graph build ~4ms, host-op plan setup) and
+        // any FUTURE expensive lazy initialization out of the fitness metric.
+        // Measured: selection works without it once modules are cached, but
+        // one untimed execute per candidate is cheap insurance.
+        let search_debug = std::env::var_os("LUMINAL_SEARCH_DEBUG").is_some();
+        if search_debug {
+            eprintln!("PROFDBG warmup-begin");
+        }
+        let warmup_start = std::time::Instant::now();
+        self.execute(dyn_map);
+        if search_debug {
+            eprintln!("PROFDBG warmup-end took={:?}", warmup_start.elapsed());
+        }
         let mut durations = Vec::with_capacity(trials.max(1));
-        for _ in 0..trials.max(1) {
+        for trial in 0..trials.max(1) {
+            if durations.is_empty() && timeout.is_some_and(|t| profile_start.elapsed() >= t) {
+                // Warmup alone blew the budget: record one timed trial anyway
+                // so the caller gets a (huge) metric and times the candidate
+                // out, preserving the old behavior for pathological graphs.
+            } else if timeout.is_some_and(|t| profile_start.elapsed() >= t) {
+                break;
+            }
             let start = std::time::Instant::now();
             self.execute(dyn_map);
             durations.push(start.elapsed());
-            if timeout.is_some_and(|timeout| profile_start.elapsed() >= timeout) {
-                break;
+            if search_debug {
+                eprintln!("PROFDBG trial={} took={:?}", trial, start.elapsed());
             }
         }
         self.profiling = false;
+        if std::env::var_os("LUMINAL_SEARCH_DEBUG").is_some() {
+            eprintln!("PROFDBG trials={durations:?}");
+        }
         let duration = durations.iter().sum::<std::time::Duration>() / durations.len() as u32;
 
         let duration_str = format_duration_precise(&duration);
@@ -2766,6 +2803,9 @@ impl Runtime for CudaRuntime {
 
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
+        // Scope for per-step host-op caches (e.g. FlashInfer sink attention's
+        // shared indptr readback): each runtime execution is one epoch.
+        crate::host::flashinfer::sink::bump_exec_epoch();
         let profile_runtime = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
         let runtime_profile_start = std::time::Instant::now();
         let mut bucket_dispatch_time = Duration::ZERO;

@@ -1138,6 +1138,13 @@ impl CudaGraphOp {
             let timer = Instant::now();
             self.build_graph(&mut state, stream, buffers, dyn_map)?;
             profile.build_graph += timer.elapsed();
+            if std::env::var_os("LUMINAL_SEARCH_DEBUG").is_some() {
+                eprintln!(
+                    "GRAPHBUILD kernels={} took={:?}",
+                    state.kernels.len(),
+                    timer.elapsed()
+                );
+            }
         }
 
         // Collect current buffer pointers
