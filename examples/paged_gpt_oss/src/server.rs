@@ -19,7 +19,7 @@ use axum::{
     extract::State,
     response::{
         IntoResponse, Response,
-        sse::{Event, KeepAlive, Sse},
+        sse::{Event, Sse},
     },
     routing::{get, post},
 };
@@ -285,7 +285,13 @@ fn stream_completion(
         yield Ok(Event::default().data(usage.to_string()));
         yield Ok(Event::default().data("[DONE]"));
     };
-    Sse::new(stream).keep_alive(KeepAlive::default())
+    // NOTE: no SSE keep-alive. axum's default keep-alive injects a `:` comment
+    // line every 15s of silence, but the InferenceX/vLLM benchmark client parses
+    // every non-empty SSE line as `data: <json>` and chokes on comment lines. At
+    // concurrency >=2, first-token latency can exceed 15s (shared chunked
+    // prefill), so the heartbeat fires before the first token and fails the
+    // request. Dropping keep-alive keeps the stream benchmark-compatible.
+    Sse::new(stream)
 }
 
 async fn full_completion(

@@ -28,10 +28,13 @@ async fn main() {
     let cfg = EngineConfig {
         // Defaults sized to fit gpt-oss-120b at 36 layers on an 80 GB H100:
         // the 's' bucket spans 1..=(max_batch + max_prefill), so its arena must
-        // fit beside the ~63 GB of weights. max_batch=8 + max_prefill=64 (chunked
-        // prefill) -> s<=72, arena ~7.3 GB. Larger values may OOM at search.
+        // fit beside the ~63 GB of weights (max_prefill=256 -> s<=264, search
+        // EST ~2.9 GiB). 256 measured best for TTFT with the grouped-GEMM MoE:
+        // bigger chunks amortize the per-step MoE cost, but the dense-masked
+        // attention term grows with chunk size (total ~ S^2/2 + S*B/2), so 512
+        // is net slower. Larger values may also OOM at search.
         max_batch: env_usize("MAX_BATCH", 8),
-        max_prefill: env_usize("MAX_PREFILL", 64),
+        max_prefill: env_usize("MAX_PREFILL", 256),
         kv_capacity: env_usize("KV_CAPACITY", 4096),
         mem_cap_gib: env_usize("GPTOSS_MEM_CAP_GIB", 14),
     };

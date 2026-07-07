@@ -1,12 +1,13 @@
 //! gpt-oss-120b model graph with **paged** attention.
 //!
-//! Identical to `examples/gpt_oss` except the KV cache is a flat slot pool
-//! `(num_slots, KV_DIM)` shared across sequences (paged attention, like
+//! Identical to `examples/gpt_oss` except the KV cache is a flat bf16 slot
+//! pool `(num_slots, KV_DIM)` shared across sequences (paged attention, like
 //! `examples/paged_llama`) instead of a dense `(N_KV_HEADS, max_seq, HEAD_DIM)`
 //! per-sequence cache. New KV is written to slots with [`scatter_rows`] and the
 //! attention context is read with [`gather_rows`]; the causal / sliding-window
-//! mask is precomputed on the host and passed in (one full + one sliding mask),
-//! which also gives cross-sequence isolation for batched decoding.
+//! mask is built IN-GRAPH from per-request `qo_indptr`/`kv_indptr` boundaries
+//! (the FlashInfer indptr spelling), which also gives cross-sequence isolation
+//! for batched decoding.
 //!
 //! gpt-oss specifics are preserved: MXFP4 MoE, attention sinks, alternating
 //! sliding-window / full attention, YaRN RoPE, biases.
@@ -49,7 +50,7 @@ pub const SWIGLU_ALPHA: f32 = 1.702;
 /// Number of rotary frequency pairs.
 pub const ROPE_DIM: usize = HEAD_DIM / 2; // 32
 
-/// Flat paged KV cache: one `(num_slots, KV_DIM)` slot pool per layer.
+/// Flat paged KV cache: one bf16 `(num_slots, KV_DIM)` slot pool per layer.
 pub struct PagedKVCache {
     pub k_caches: Vec<GraphTensor>,
     pub v_caches: Vec<GraphTensor>,
@@ -60,8 +61,14 @@ impl PagedKVCache {
         let mut k_caches = Vec::with_capacity(layers());
         let mut v_caches = Vec::with_capacity(layers());
         for l in 0..layers() {
-            k_caches.push(cx.named_tensor(format!("kv_cache.{l}.k"), (num_slots, KV_DIM)));
-            v_caches.push(cx.named_tensor(format!("kv_cache.{l}.v"), (num_slots, KV_DIM)));
+            k_caches.push(
+                cx.named_tensor(format!("kv_cache.{l}.k"), (num_slots, KV_DIM))
+                    .as_dtype(DType::Bf16),
+            );
+            v_caches.push(
+                cx.named_tensor(format!("kv_cache.{l}.v"), (num_slots, KV_DIM))
+                    .as_dtype(DType::Bf16),
+            );
         }
         Self { k_caches, v_caches }
     }
@@ -81,11 +88,11 @@ pub struct GptOss {
 /// Per-step paging inputs threaded through every layer.
 #[derive(Clone, Copy)]
 pub struct PagingInputs {
-    pub pos_ids: GraphTensor,      // (s,) Int — absolute positions for RoPE
-    pub scatter_idx: GraphTensor,  // (s,) Int — slots to write new KV
-    pub gather_idx: GraphTensor,   // (c,) Int — slots to read for context
-    pub mask_full: GraphTensor,    // (s, c) F32 — additive causal mask
-    pub mask_sliding: GraphTensor, // (s, c) F32 — additive causal + window mask
+    pub pos_ids: GraphTensor,     // (s,) Int — absolute positions for RoPE
+    pub scatter_idx: GraphTensor, // (s,) Int — slots to write new KV
+    pub gather_idx: GraphTensor,  // (c,) Int — slots to read for context
+    pub qo_indptr: GraphTensor,   // (r,) Int — cumulative query counts per request
+    pub kv_indptr: GraphTensor,   // (r,) Int — cumulative context lengths per request
 }
 
 impl GptOss {
@@ -206,22 +213,20 @@ impl GptOssLayer {
         let q_rope = rope(q, paging.pos_ids, inv_freq, mscale, N_HEADS);
         let k_rope = rope(k, paging.pos_ids, inv_freq, mscale, N_KV_HEADS);
 
-        // Even layers use the sliding-window mask, odd layers the full mask.
-        let mask = if self.layer_idx.is_multiple_of(2) {
-            paging.mask_sliding
-        } else {
-            paging.mask_full
-        };
+        // Even layers use sliding-window attention, odd layers full attention.
+        let window = self
+            .layer_idx
+            .is_multiple_of(2)
+            .then_some(SLIDING_WINDOW);
         let (attn_out, k_cache_out, v_cache_out) = paged_attention(
             q_rope,
             k_rope,
             v,
-            self.sinks.cast(DType::F32),
-            mask,
+            self.sinks,
+            paging,
             k_cache_in,
             v_cache_in,
-            paging.scatter_idx,
-            paging.gather_idx,
+            window,
         );
         x += self.o_proj.forward(attn_out);
 
@@ -403,60 +408,131 @@ fn rope(
         .merge_dims(1, 2)
 }
 
-/// Paged attention for one layer: scatter new KV into slots, gather the context,
-/// GQA attention with a precomputed additive mask and attention sinks.
+/// Map an indptr vector `(r,)` to a per-row request index over `n` rows: row
+/// `i` belongs to request `j` iff `indptr[j] <= i < indptr[j+1]`. Exact HLIR
+/// spelling from `luminal_cuda_lite`'s FlashInfer tests
+/// (`test_indptr_to_request_idx`) so the ops stay rule-matchable.
+fn indptr_to_request_idx(indptr: GraphTensor, n: Expression) -> GraphTensor {
+    let graph = indptr.graph();
+    let r = indptr.dims1();
+    let indices = graph.arange(n).expand_dim(1, r);
+    let indptr_2d = indptr.expand_dim(0, n);
+    let ge = indptr_2d.le(indices).cast(DType::Int);
+    ge.sum(1).cast(DType::Int) - 1
+}
+
+/// Build the additive `(s, c)` attention mask in-graph from the per-request
+/// indptrs (FlashInfer `test_compute_attn_mask` spelling): a query attends a
+/// context slot iff same request && causal (`c_local_pos <= q_abs_pos`), and —
+/// for sliding-window layers — the slot is within the window
+/// (`q_abs_pos - c_local_pos < W`, spelled gemma-style as
+/// `c_local_pos < q_pos - (W-1)` blocked, so `W-1` shows as a plain constant).
+/// Allowed → 0, blocked → -1e10 (or -2e10 when both terms block).
+fn compute_attn_mask(
+    q_pos: GraphTensor,
+    qo_indptr: GraphTensor,
+    kv_indptr: GraphTensor,
+    c: Expression,
+    window: Option<usize>,
+) -> GraphTensor {
+    let graph = q_pos.graph();
+    let s = q_pos.dims1();
+    let q_request = indptr_to_request_idx(qo_indptr, s);
+    let c_request = indptr_to_request_idx(kv_indptr, c);
+    let c_arange = graph.arange(c);
+    let c_kv_start = kv_indptr.gather(c_request);
+    let c_local_pos = c_arange - c_kv_start;
+    let q_req_2d = q_request.expand_dim(1, c);
+    let c_req_2d = c_request.expand_dim(0, s);
+    let same = q_req_2d.eq(c_req_2d);
+    let c_pos_2d = c_local_pos.expand_dim(0, s);
+    let qp_2d = q_pos.expand_dim(1, c);
+    let causal = c_pos_2d.le(qp_2d);
+    let allowed = same.cast(DType::F32) * causal.cast(DType::F32);
+    let mask = allowed * 1e10 - 1e10;
+    if let Some(w) = window {
+        // Sliding window: block context positions older than q_pos - (W-1)
+        // (gemma spelling; the "W-1" constant is FlashInfer's window_left).
+        let q_f = q_pos.cast(DType::F32);
+        let win_lo = q_f - (w - 1) as f32;
+        let c_local_f = c_local_pos.cast(DType::F32);
+        let too_old = c_local_f.expand_dim(0, s).lt(win_lo.expand_dim(1, c));
+        mask + too_old.cast(DType::F32) * -1e10
+    } else {
+        mask
+    }
+}
+
+/// Paged attention for one layer: scatter new KV into the bf16 slot pools,
+/// gather the context, GQA attention with an in-graph indptr-derived mask and
+/// attention sinks. Mirrors the qwen3_moe HLIR spelling (bf16 chain, `* 1.0`
+/// contiguous-materialization anchors) so the FlashInfer rewrites can match;
+/// the HLIR chain remains the correct fallback.
 ///
-/// - `q_rope` (s, Q_DIM), `k_rope`/`v` (s, KV_DIM)
-/// - `mask` (s, c): additive (0 attend, -1e30 mask), already encoding causal +
-///   (for even layers) sliding window + cross-sequence isolation.
-/// - `k_cache`/`v_cache` (num_slots, KV_DIM); `scatter_idx` (s,), `gather_idx` (c,)
+/// - `q_rope` (s, Q_DIM) F32, `k_rope`/`v` (s, KV_DIM) F32 — cast to bf16 here
+/// - `sinks` (N_HEADS,) bf16 (raw, no F32 cast)
+/// - `k_cache`/`v_cache` (num_slots, KV_DIM) bf16
+/// - `window`: `Some(W)` for sliding-window layers, `None` for full attention
 #[allow(clippy::too_many_arguments)]
 fn paged_attention(
     q_rope: GraphTensor,
     k_rope: GraphTensor,
     v: GraphTensor,
-    sinks: GraphTensor, // [N_HEADS] F32
-    mask: GraphTensor,  // [s, c] F32 additive
+    sinks: GraphTensor, // [N_HEADS] bf16
+    paging: PagingInputs,
     k_cache: GraphTensor,
     v_cache: GraphTensor,
-    scatter_idx: GraphTensor,
-    gather_idx: GraphTensor,
+    window: Option<usize>,
 ) -> (GraphTensor, GraphTensor, GraphTensor) {
     let s = q_rope.dims()[0];
-    let ctx = gather_idx.dims()[0];
+    let ctx = paging.gather_idx.dims()[0];
 
-    // Write the new tokens' KV into their slots, then read the full context.
-    let k_cache_out = scatter_rows(k_rope, scatter_idx, k_cache, KV_DIM);
-    let v_cache_out = scatter_rows(v, scatter_idx, v_cache, KV_DIM);
-    let k = gather_rows(k_cache_out, gather_idx, KV_DIM); // [ctx, KV_DIM]
-    let v_ctx = gather_rows(v_cache_out, gather_idx, KV_DIM); // [ctx, KV_DIM]
+    // Write the new tokens' KV into their slots (bf16), then read the context.
+    let k_cache_out = scatter_rows(
+        k_rope.cast(DType::Bf16),
+        paging.scatter_idx,
+        k_cache,
+        KV_DIM,
+    );
+    let v_cache_out = scatter_rows(v.cast(DType::Bf16), paging.scatter_idx, v_cache, KV_DIM);
+    let k = gather_rows(k_cache_out, paging.gather_idx, KV_DIM); // [ctx, KV_DIM] bf16
+    let v_ctx = gather_rows(v_cache_out, paging.gather_idx, KV_DIM); // [ctx, KV_DIM] bf16
 
-    // Reshape to heads + GQA expand.
-    let k_3d = k
+    // Reshape to heads + GQA broadcast (qwen3_moe spelling): `* 1.0` forces
+    // contiguous materialization — the FlashInfer rules anchor on Mul(x, 1.0).
+    let q = (q_rope.cast(DType::Bf16) * 1.0)
         .split_dims(1, HEAD_DIM)
-        .transpose(0, 1) // [N_KV_HEADS, ctx, HEAD_DIM]
-        .expand_dim(1, KV_GROUPS)
-        .merge_dims(0, 1); // [N_HEADS, ctx, HEAD_DIM]
-    let v_3d = v_ctx
-        .split_dims(1, HEAD_DIM)
-        .transpose(0, 1)
-        .expand_dim(1, KV_GROUPS)
-        .merge_dims(0, 1);
-    let q = q_rope.split_dims(1, HEAD_DIM).transpose(0, 1); // [N_HEADS, s, HEAD_DIM]
+        .transpose(0, 1); // [N_HEADS, s, HEAD_DIM]
+    let k = k.split_dims(1, HEAD_DIM).permute((1, 2, 0)); // [N_KV_HEADS, HEAD_DIM, ctx]
+    let v_3d = v_ctx.split_dims(1, HEAD_DIM).transpose(0, 1); // [N_KV_HEADS, ctx, HEAD_DIM]
+    let k = k.expand_dim(1, KV_GROUPS).merge_dims(0, 1) * 1.0; // [N_HEADS, HEAD_DIM, ctx]
+    let v_3d = v_3d.expand_dim(1, KV_GROUPS).merge_dims(0, 1) * 1.0; // [N_HEADS, ctx, HEAD_DIM]
 
-    let scores = q.matmul(k_3d.transpose(1, 2)) / (HEAD_DIM as f32).sqrt(); // [N_HEADS, s, ctx]
-    let masked = scores + mask.expand_dim(0, N_HEADS);
+    let scores = q.matmul(k) / (HEAD_DIM as f32).sqrt(); // [N_HEADS, s, ctx] bf16
+
+    // Additive mask built in-graph from the indptrs (same-request isolation +
+    // causal + optional sliding window), cast to the scores dtype.
+    let mask = compute_attn_mask(
+        paging.pos_ids,
+        paging.qo_indptr,
+        paging.kv_indptr,
+        ctx,
+        window,
+    );
+    let masked = scores + mask.cast(DType::Bf16).expand_dim(0, N_HEADS);
 
     // Sink-augmented softmax: the per-head learned logit enters the denominator
-    // only (it never contributes to the V matmul).
-    let sink = sinks.expand_dim(1, s); // [N_HEADS, s]
-    let row_max = masked.max(2).maximum(sink); // [N_HEADS, s]
+    // only (it never contributes to the V matmul). Simplified spelling — the
+    // softmax is shift-invariant, so skipping `.maximum(sink)` in the row max
+    // gives identical results while keeping the max/exp/sum chain canonical.
+    let row_max = masked.max(2); // [N_HEADS, s]
     let num = (masked - row_max.expand_dim(2, ctx)).exp(); // [N_HEADS, s, ctx]
-    let denom = num.sum(2) + (sink - row_max).exp(); // [N_HEADS, s]
+    let sink_term = (sinks.expand_dim(1, s) - row_max).exp(); // [N_HEADS, s]
+    let denom = num.sum(2) + sink_term; // [N_HEADS, s]
     let attn = num / denom.expand_dim(2, ctx);
 
-    let out = attn.matmul(v_3d).transpose(0, 1).merge_dims(1, 2); // [s, Q_DIM]
-    (out, k_cache_out, v_cache_out)
+    let out = attn.matmul(v_3d).transpose(0, 1).merge_dims(1, 2); // [s, Q_DIM] bf16
+    (out.cast(DType::F32), k_cache_out, v_cache_out)
 }
 
 /// Host-side YaRN inv_freq + attention scaling, matching HF

@@ -59,16 +59,17 @@ impl PageTable {
     }
 }
 
-/// Per-batch host tensors: scatter/gather slot indices, query positions, and the
-/// two additive masks (full causal, and causal+sliding-window). Slots for a
-/// sequence are allocated in position order, so a context slot's index within
-/// its sequence equals that token's absolute position.
+/// Per-batch host tensors: scatter/gather slot indices, query positions, and
+/// the per-request `qo_indptr`/`kv_indptr` boundary vectors (the model builds
+/// its causal / sliding-window mask in-graph from these). Slots for a sequence
+/// are allocated in position order, so a context slot's index within its
+/// sequence equals that token's absolute position.
 struct Batch {
     scatter_idx: Vec<i32>,
     gather_idx: Vec<i32>,
     q_pos: Vec<i32>,
-    mask_full: Vec<f32>,
-    mask_sliding: Vec<f32>,
+    qo_indptr: Vec<i32>,
+    kv_indptr: Vec<i32>,
     total_s: usize,
     total_c: usize,
 }
@@ -76,54 +77,35 @@ struct Batch {
 fn build_batch(entries: &[(usize, Vec<usize>)], page_table: &PageTable) -> Batch {
     let total_s: usize = entries.iter().map(|(_, pos)| pos.len()).sum();
 
+    // Request boundaries: kv_indptr over gathered context rows, qo_indptr over
+    // query rows — the model derives the attention mask from these in-graph.
     let mut gather_idx: Vec<i32> = vec![];
-    let mut ctx_ranges: Vec<(usize, usize)> = vec![];
+    let mut kv_indptr: Vec<i32> = vec![0];
     for (seq_id, _) in entries {
-        let start = gather_idx.len();
         let slots = page_table.context_slots(*seq_id);
         gather_idx.extend(slots.iter().map(|&s| s as i32));
-        ctx_ranges.push((start, slots.len()));
+        kv_indptr.push(gather_idx.len() as i32);
     }
     let total_c = gather_idx.len();
 
     let mut scatter_idx: Vec<i32> = vec![];
     let mut q_pos: Vec<i32> = vec![];
+    let mut qo_indptr: Vec<i32> = vec![0];
     for (seq_id, positions) in entries {
         let ctx_len = page_table.context_len(*seq_id);
         let n_new = positions.len();
         let slots = page_table.context_slots(*seq_id);
         scatter_idx.extend(slots[ctx_len - n_new..].iter().map(|&s| s as i32));
         q_pos.extend(positions.iter().map(|&p| p as i32));
-    }
-
-    // Masks default to -1e30 (blocked); a query attends only within its own
-    // sequence's context range (cross-sequence isolation), causally, and — for
-    // the sliding mask — within the window.
-    let mut mask_full = vec![-1e30f32; total_s * total_c];
-    let mut mask_sliding = vec![-1e30f32; total_s * total_c];
-    let mut q_offset = 0;
-    for (entry_idx, (_, positions)) in entries.iter().enumerate() {
-        let (ctx_start, ctx_len) = ctx_ranges[entry_idx];
-        for (qi, &abs_pos) in positions.iter().enumerate() {
-            for ci in 0..ctx_len {
-                if ci <= abs_pos {
-                    let idx = (q_offset + qi) * total_c + (ctx_start + ci);
-                    mask_full[idx] = 0.0;
-                    if abs_pos - ci < SLIDING_WINDOW {
-                        mask_sliding[idx] = 0.0;
-                    }
-                }
-            }
-        }
-        q_offset += positions.len();
+        qo_indptr.push(q_pos.len() as i32);
     }
 
     Batch {
         scatter_idx,
         gather_idx,
         q_pos,
-        mask_full,
-        mask_sliding,
+        qo_indptr,
+        kv_indptr,
         total_s,
         total_c,
     }
@@ -146,8 +128,8 @@ struct Inputs {
     pos_ids: GraphTensor,
     scatter_idx: GraphTensor,
     gather_idx: GraphTensor,
-    mask_full: GraphTensor,
-    mask_sliding: GraphTensor,
+    qo_indptr: GraphTensor,
+    kv_indptr: GraphTensor,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -165,10 +147,11 @@ fn run(
     runtime.set_data(inp.pos_ids, batch.q_pos.clone());
     runtime.set_data(inp.scatter_idx, batch.scatter_idx.clone());
     runtime.set_data(inp.gather_idx, batch.gather_idx.clone());
-    runtime.set_data(inp.mask_full, batch.mask_full.clone());
-    runtime.set_data(inp.mask_sliding, batch.mask_sliding.clone());
+    runtime.set_data(inp.qo_indptr, batch.qo_indptr.clone());
+    runtime.set_data(inp.kv_indptr, batch.kv_indptr.clone());
     cx.set_dim('s', batch.total_s);
     cx.set_dim('c', batch.total_c);
+    cx.set_dim('r', batch.qo_indptr.len());
     runtime.execute(&cx.dyn_map);
     let all = runtime.get_f32(logits);
     // Round-trip KV cache: feed updated buffers back as inputs for the next step.
@@ -244,8 +227,8 @@ fn main() {
         pos_ids: cx.named_tensor("pos_ids", 's').as_dtype(DType::Int),
         scatter_idx: cx.named_tensor("scatter_idx", 's').as_dtype(DType::Int),
         gather_idx: cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int),
-        mask_full: cx.named_tensor("mask_full", ('s', 'c')),
-        mask_sliding: cx.named_tensor("mask_sliding", ('s', 'c')),
+        qo_indptr: cx.named_tensor("qo_indptr", 'r').as_dtype(DType::Int),
+        kv_indptr: cx.named_tensor("kv_indptr", 'r').as_dtype(DType::Int),
     };
     let kv_cache = PagedKVCache::new(&mut cx, num_slots);
     let model = GptOss::init(&mut cx, mscale);
@@ -255,8 +238,8 @@ fn main() {
         pos_ids: inp.pos_ids,
         scatter_idx: inp.scatter_idx,
         gather_idx: inp.gather_idx,
-        mask_full: inp.mask_full,
-        mask_sliding: inp.mask_sliding,
+        qo_indptr: inp.qo_indptr,
+        kv_indptr: inp.kv_indptr,
     };
     let (logits, cache_outputs) = model.forward(inp.input, paging, &kv_cache);
     let logits = logits.output();
@@ -277,7 +260,15 @@ fn main() {
     } else {
         &[DimBucket::new(1, 1)]
     };
-    let build_options = CompileOptions::default().dim_buckets('s', buckets);
+    // 'r' = indptr length = number of sequences in the step + 1 (1 or 2 seqs).
+    let r_buckets: &[DimBucket] = if batch_demo {
+        &[DimBucket::new(2, 2), DimBucket::new(3, 3)]
+    } else {
+        &[DimBucket::new(2, 2)]
+    };
+    let build_options = CompileOptions::default()
+        .dim_buckets('s', buckets)
+        .dim_buckets('r', r_buckets);
     println!("Building E-Graph...");
     cx.build_search_space::<CudaRuntime>(build_options);
 
@@ -290,7 +281,7 @@ fn main() {
         rt.set_data(lut_lo_id, lut_lo_vals.clone());
         rt.set_data(lut_hi_id, lut_hi_vals.clone());
     };
-    let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<f32>();
+    let cache_bytes = num_slots * KV_DIM * std::mem::size_of::<half::bf16>();
     let zero_cache = |rt: &mut CudaRuntime| {
         for i in 0..kv_cache.k_caches.len() {
             rt.set_zeros(kv_cache.k_caches[i], cache_bytes);
@@ -318,12 +309,14 @@ fn main() {
     let (ss, sc) = (if batch_demo { 2 } else { 1 }, env_usize("COMPILE_C", 64));
     cx.set_dim('s', ss);
     cx.set_dim('c', sc);
+    cx.set_dim('r', 2);
     runtime.set_data(inp.input, vec![1i32; ss]);
     runtime.set_data(inp.pos_ids, vec![0i32; ss]);
     runtime.set_data(inp.scatter_idx, (0..ss as i32).collect::<Vec<_>>());
     runtime.set_data(inp.gather_idx, (0..sc as i32).collect::<Vec<_>>());
-    runtime.set_data(inp.mask_full, vec![0.0f32; ss * sc]);
-    runtime.set_data(inp.mask_sliding, vec![0.0f32; ss * sc]);
+    // Single-sequence dummy: one request spanning all queries / all context.
+    runtime.set_data(inp.qo_indptr, vec![0i32, ss as i32]);
+    runtime.set_data(inp.kv_indptr, vec![0i32, sc as i32]);
     set_consts(&mut runtime);
     // Free the reserved contiguous block right before the arena is allocated
     // (during search) so the arena reuses this clean hole instead of OOMing in
@@ -426,8 +419,9 @@ fn main() {
         );
 
         // ═══ Phase 4: supersequence decode (A + B together, s=2) ═══
-        // Both sequences decode in one batched step from the shared slot pool; the
-        // precomputed masks keep each query attending only to its own sequence.
+        // Both sequences decode in one batched step from the shared slot pool;
+        // the in-graph indptr-derived mask keeps each query attending only to
+        // its own sequence.
         println!("\n══ Phase 4: supersequence decode A+B ══");
         let mut text_a = String::new();
         let mut text_b = String::new();

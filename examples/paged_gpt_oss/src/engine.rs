@@ -35,8 +35,8 @@ struct Inputs {
     pos_ids: GraphTensor,
     scatter_idx: GraphTensor,
     gather_idx: GraphTensor,
-    mask_full: GraphTensor,
-    mask_sliding: GraphTensor,
+    qo_indptr: GraphTensor,
+    kv_indptr: GraphTensor,
 }
 
 pub struct StepOutcome {
@@ -89,8 +89,8 @@ impl Engine {
             pos_ids: cx.named_tensor("pos_ids", 's').as_dtype(DType::Int),
             scatter_idx: cx.named_tensor("scatter_idx", 's').as_dtype(DType::Int),
             gather_idx: cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int),
-            mask_full: cx.named_tensor("mask_full", ('s', 'c')),
-            mask_sliding: cx.named_tensor("mask_sliding", ('s', 'c')),
+            qo_indptr: cx.named_tensor("qo_indptr", 'r').as_dtype(DType::Int),
+            kv_indptr: cx.named_tensor("kv_indptr", 'r').as_dtype(DType::Int),
         };
         let kv_cache = PagedKVCache::new(&mut cx, cfg.kv_capacity);
         let model = GptOss::init(&mut cx, mscale);
@@ -100,8 +100,8 @@ impl Engine {
             pos_ids: inp.pos_ids,
             scatter_idx: inp.scatter_idx,
             gather_idx: inp.gather_idx,
-            mask_full: inp.mask_full,
-            mask_sliding: inp.mask_sliding,
+            qo_indptr: inp.qo_indptr,
+            kv_indptr: inp.kv_indptr,
         };
         let (logits, cache_outputs) = model.forward(inp.input, paging, &kv_cache);
         let logits = logits.output();
@@ -126,6 +126,15 @@ impl Engine {
             .dim_buckets(
                 'c',
                 &[DimBucket::new(1, cfg.kv_capacity).representative(cfg.kv_capacity)],
+            )
+            // 'r' = indptr length = number of requests in the step + 1.
+            // Representative 2 (one sequence) so the search-profile dummies can
+            // be a consistent single-sequence batch (candidates are profiled at
+            // the representative dims; the FlashInfer sink op validates its
+            // indptr contents against s/c and rejects garbage).
+            .dim_buckets(
+                'r',
+                &[DimBucket::new(2, cfg.max_batch + 2).representative(2)],
             );
         println!("[engine] building search space (max_s={max_s}, kv={})...", cfg.kv_capacity);
         cx.build_search_space::<CudaRuntime>(build_options);
@@ -137,7 +146,7 @@ impl Engine {
             rt.set_data(lut_lo_id, lut_lo_vals.clone());
             rt.set_data(lut_hi_id, lut_hi_vals.clone());
         };
-        let cache_bytes = cfg.kv_capacity * KV_DIM * std::mem::size_of::<f32>();
+        let cache_bytes = cfg.kv_capacity * KV_DIM * std::mem::size_of::<half::bf16>();
         let zero_cache = |rt: &mut CudaRuntime| {
             for i in 0..kv_cache.k_caches.len() {
                 rt.set_zeros(kv_cache.k_caches[i], cache_bytes);
@@ -152,25 +161,75 @@ impl Engine {
             runtime.load_safetensors(&cx, p.to_str().unwrap());
         }
 
-        // Valid dummy inputs for the search profile (s=1 decode shape, c=64 so
-        // the initial arena covers short contexts without an immediate re-plan).
-        let (s0, c0) = (1usize, 64.min(cfg.kv_capacity));
+        // Search-profile dummy inputs. Candidates are profiled at the bucket
+        // REPRESENTATIVE dims (s=max_s, c=kv_capacity, r=2), so the dummy data
+        // must be sized and consistent AT THOSE DIMS: one sequence with a
+        // kv_capacity-token context whose last max_s tokens are the queries.
+        // Undersized dummies feed the FlashInfer sink island garbage indptrs
+        // during profiling (the op validates and errors), silently discarding
+        // every island candidate — while the dense chain happily reads junk.
+        // (This is how llama/qwen dummies work too: sized at representatives.)
+        let (s0, c0) = (max_s, cfg.kv_capacity);
         cx.set_dim('s', s0);
         cx.set_dim('c', c0);
+        cx.set_dim('r', 2);
         runtime.set_data(inp.input, vec![1i32; s0]);
-        runtime.set_data(inp.pos_ids, vec![0i32; s0]);
-        runtime.set_data(inp.scatter_idx, (0..s0 as i32).collect::<Vec<_>>());
+        runtime.set_data(
+            inp.pos_ids,
+            ((c0 - s0) as i32..c0 as i32).collect::<Vec<_>>(),
+        );
+        runtime.set_data(
+            inp.scatter_idx,
+            ((c0 - s0) as i32..c0 as i32).collect::<Vec<_>>(),
+        );
         runtime.set_data(inp.gather_idx, (0..c0 as i32).collect::<Vec<_>>());
-        runtime.set_data(inp.mask_full, vec![0.0f32; s0 * c0]);
-        runtime.set_data(inp.mask_sliding, vec![0.0f32; s0 * c0]);
+        runtime.set_data(inp.qo_indptr, vec![0i32, s0 as i32]);
+        runtime.set_data(inp.kv_indptr, vec![0i32, c0 as i32]);
         set_consts(&mut runtime);
         // Release the reserved hole right before search allocates the arena.
         drop(arena_reserve.take());
         stream.synchronize().ok();
         println!("[engine] searching...");
-        runtime = cx.search(runtime, CompileOptions::default().search_graph_limit(1));
+        // Candidate-graph budget. Selecting a host-op island (FlashInfer sink
+        // attention) is a probabilistic single-eclass flip the GA must sample;
+        // the working examples budget hundreds of candidates for exactly this
+        // (llama 500, qwen3_moe 200, gemma 500). With 1, the search never
+        // explores beyond the initial random genome. Default timeouts (1s/5s)
+        // are kept, as in every working example: slow masked-dense candidates
+        // time out (still consuming budget) while island candidates measure
+        // fast and win on merit.
+        let search_graphs = std::env::var("SEARCH_GRAPHS")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(200);
+        // keep_best=4 (llama parity): a wider parent pool lets partial island
+        // adoptions survive generations and accumulate flips across instances.
+        // 100 graphs converges reliably now that candidate profiling measures
+        // steady-state execution (warmup excludes one-time CUDA-graph capture,
+        // which used to drown the fitness signal and made selection random).
+        runtime = cx.search(
+            runtime,
+            CompileOptions::default()
+                .search_graph_limit(search_graphs)
+                .keep_best(4),
+        );
         set_consts(&mut runtime);
         zero_cache(&mut runtime);
+
+        // Report what the search actually selected (host-op composition).
+        {
+            let mut counts: std::collections::BTreeMap<&'static str, usize> =
+                std::collections::BTreeMap::new();
+            for op in runtime.host_ops() {
+                *counts.entry(op.stats_name().unwrap_or("kernel-graph")).or_default() += 1;
+            }
+            let summary = counts
+                .iter()
+                .map(|(k, v)| format!("{k}x{v}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("[engine] selected host ops: {summary}");
+        }
 
         let scheduler = Scheduler::new(
             cfg.kv_capacity,
@@ -227,10 +286,11 @@ impl Engine {
         self.runtime.set_data(self.inp.pos_ids, batch.q_pos.clone());
         self.runtime.set_data(self.inp.scatter_idx, batch.scatter_idx.clone());
         self.runtime.set_data(self.inp.gather_idx, batch.gather_idx.clone());
-        self.runtime.set_data(self.inp.mask_full, batch.mask_full.clone());
-        self.runtime.set_data(self.inp.mask_sliding, batch.mask_sliding.clone());
+        self.runtime.set_data(self.inp.qo_indptr, batch.qo_indptr.clone());
+        self.runtime.set_data(self.inp.kv_indptr, batch.kv_indptr.clone());
         self.cx.set_dim('s', batch.total_s);
         self.cx.set_dim('c', batch.total_c);
+        self.cx.set_dim('r', batch.qo_indptr.len());
         let t_set = lap(prof);
         self.runtime.execute(&self.cx.dyn_map);
         let t_exec = lap(prof);
