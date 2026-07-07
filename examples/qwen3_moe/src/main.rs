@@ -86,7 +86,11 @@ fn main() {
         )
         .dim_buckets(
             'c',
-            &[DimBucket::new(1, max_seq_len).representative(search_s)],
+            // Profile candidates at a serving-realistic context, not the tiny
+            // prefill chunk: candidates are measured at this representative,
+            // and attention-strategy tradeoffs (masked-dense vs FlashInfer)
+            // invert between c=16 and real decode contexts.
+            &[DimBucket::new(1, max_seq_len).representative(512.min(max_seq_len))],
         );
 
     println!("Building E-Graph...");
