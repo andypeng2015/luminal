@@ -2038,3 +2038,776 @@ fn dump_llama_swiglu_chain_egglog() {
     let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
     println!("{program}");
 }
+
+// ═══════════════════════════════════════════════════════════════════════
+// FlashInferSinkAttention (gpt-oss sinks, multi-seq, bf16 prefill kernels)
+// ═══════════════════════════════════════════════════════════════════════
+
+fn f32_to_bf16_bits(v: f32) -> u16 {
+    let bits = v.to_bits();
+    let rounded = bits.wrapping_add(0x7FFF + ((bits >> 16) & 1));
+    (rounded >> 16) as u16
+}
+
+fn bf16_bits_to_f32(b: u16) -> f32 {
+    f32::from_bits((b as u32) << 16)
+}
+
+fn bf16_round(v: f32) -> f32 {
+    bf16_bits_to_f32(f32_to_bf16_bits(v))
+}
+
+/// CPU reference of gpt-oss sink attention over a paged multi-sequence
+/// batch (mirrors examples/paged_gpt_oss semantics: causal within sequence,
+/// optional sliding window `q_pos - kv_pos <= window_left`, per-head sink
+/// logit added to the softmax denominator, sink NOT sm_scale-scaled).
+#[allow(clippy::too_many_arguments)]
+fn sink_reference(
+    q: &[f32],         // (total_q, heads, dim), bf16-rounded values
+    k_pool: &[f32],    // (slots, kv_dim)
+    v_pool: &[f32],    // (slots, kv_dim)
+    kv_indices: &[i32],
+    qo_indptr: &[i32],
+    kv_indptr: &[i32],
+    sinks: &[f32],     // (heads,)
+    heads: usize,
+    kv_heads: usize,
+    dim: usize,
+    window_left: i32,
+) -> Vec<f32> {
+    let total_q = *qo_indptr.last().unwrap() as usize;
+    let group = heads / kv_heads;
+    let sm_scale = 1.0 / (dim as f32).sqrt();
+    let mut out = vec![0.0f32; total_q * heads * dim];
+    for b in 0..qo_indptr.len() - 1 {
+        let (q0, q1) = (qo_indptr[b] as usize, qo_indptr[b + 1] as usize);
+        let (k0, k1) = (kv_indptr[b] as usize, kv_indptr[b + 1] as usize);
+        let (qo_len, kv_len) = (q1 - q0, k1 - k0);
+        for qi in 0..qo_len {
+            let row = q0 + qi;
+            // absolute position of this query within its sequence
+            let q_pos = kv_len - qo_len + qi;
+            for h in 0..heads {
+                let kvh = h / group;
+                let qv = &q[(row * heads + h) * dim..(row * heads + h + 1) * dim];
+                let mut scores = Vec::with_capacity(kv_len);
+                for j in 0..kv_len {
+                    let visible = j <= q_pos
+                        && (window_left < 0 || q_pos - j <= window_left as usize);
+                    if !visible {
+                        scores.push(f32::NEG_INFINITY);
+                        continue;
+                    }
+                    let slot = kv_indices[k0 + j] as usize;
+                    let kv = &k_pool[slot * kv_heads * dim + kvh * dim..][..dim];
+                    let dot: f32 = qv.iter().zip(kv).map(|(a, b)| a * b).sum();
+                    scores.push(dot * sm_scale);
+                }
+                let m = scores
+                    .iter()
+                    .fold(sinks[h], |a, &b| a.max(b));
+                let exps: Vec<f32> = scores.iter().map(|&s| (s - m).exp()).collect();
+                let denom: f32 = exps.iter().sum::<f32>() + (sinks[h] - m).exp();
+                for j in 0..kv_len {
+                    if exps[j] == 0.0 {
+                        continue;
+                    }
+                    let w = exps[j] / denom;
+                    let slot = kv_indices[k0 + j] as usize;
+                    let vv = &v_pool[slot * kv_heads * dim + kvh * dim..][..dim];
+                    for d in 0..dim {
+                        out[(row * heads + h) * dim + d] += w * vv[d];
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Drive FlashInferSinkAttention::execute directly (bf16 buffers).
+#[allow(clippy::too_many_arguments)]
+fn run_flashinfer_sink(
+    stream: &Arc<CudaStream>,
+    q: &[f32],
+    k_pool: &[f32],
+    v_pool: &[f32],
+    kv_indices: &[i32],
+    qo_indptr: &[i32],
+    kv_indptr: &[i32],
+    sinks: &[f32],
+    heads: usize,
+    kv_heads: usize,
+    dim: usize,
+    window_left: i64,
+) -> Vec<f32> {
+    use crate::host::flashinfer::sink::FlashInferSinkAttention;
+    // Direct execute() calls bypass CudaRuntime::execute, so bump the step
+    // epoch manually — the async pool can hand back identical device pointers
+    // across cases, which would otherwise hit a stale indptr-readback cache.
+    crate::host::flashinfer::sink::bump_exec_epoch();
+    let total_q = *qo_indptr.last().unwrap() as usize;
+    let c = kv_indices.len();
+    let to_bf16 = |v: &[f32]| -> Vec<u16> { v.iter().map(|&x| f32_to_bf16_bits(x)).collect() };
+
+    let q_buf = copy_to_dev(stream, &to_bf16(q));
+    let k_buf = copy_to_dev(stream, &to_bf16(k_pool));
+    let v_buf = copy_to_dev(stream, &to_bf16(v_pool));
+    let idx_buf = copy_to_dev(stream, kv_indices);
+    let qo_buf = copy_to_dev(stream, qo_indptr);
+    let kv_buf = copy_to_dev(stream, kv_indptr);
+    let sink_buf = copy_to_dev(stream, &to_bf16(sinks));
+    let out_buf = alloc_dev(stream, total_q * heads * dim * 2);
+
+    let fi = FlashInferSinkAttention {
+        num_qo_heads: heads,
+        num_kv_heads: kv_heads,
+        head_dim: dim,
+        page_size: 1,
+        batch_dim: Expression::from('s'),
+        dtype: luminal::dtype::DType::Bf16,
+        sm_scale: 0.0,
+        window_left,
+    };
+
+    let nodes: Vec<NodeIndex> = (0..8).map(NodeIndex::new).collect();
+    let mut buffers = FxHashMap::default();
+    let ptrs: Vec<u64> = [
+        (&q_buf, q.len() * 2),
+        (&k_buf, k_pool.len() * 2),
+        (&v_buf, v_pool.len() * 2),
+        (&idx_buf, kv_indices.len() * 4),
+        (&qo_buf, qo_indptr.len() * 4),
+        (&kv_buf, kv_indptr.len() * 4),
+        (&sink_buf, sinks.len() * 2),
+        (&out_buf, total_q * heads * dim * 2),
+    ]
+    .iter()
+    .enumerate()
+    .map(|(i, (buf, len))| {
+        let p = buf.device_ptr(stream).0;
+        buffers.insert(nodes[i], DeviceBuffer::new(p, *len));
+        p
+    })
+    .collect();
+    let out_ptr = ptrs[7];
+
+    let inputs = &nodes[..7];
+    let mut dyn_map = FxHashMap::default();
+    dyn_map.insert('s', total_q);
+    dyn_map.insert('c', c);
+    dyn_map.insert('r', qo_indptr.len());
+
+    fi.execute(stream, nodes[7], inputs, &buffers, &dyn_map)
+        .expect("FlashInferSinkAttention execute failed");
+    stream.synchronize().unwrap();
+
+    let mut out_bytes = vec![0u8; total_q * heads * dim * 2];
+    unsafe {
+        cudarc::driver::result::memcpy_dtoh_async(&mut out_bytes, out_ptr, stream.cu_stream())
+            .unwrap();
+    }
+    stream.synchronize().unwrap();
+    let raw: Vec<f32> = out_bytes
+        .chunks_exact(2)
+        .map(|b| bf16_bits_to_f32(u16::from_le_bytes([b[0], b[1]])))
+        .collect();
+    // (heads, batch, dim) -> (batch, heads, dim); identity at total_q == 1.
+    transpose_hbd_to_bhd(&raw, heads, total_q, dim)
+}
+
+struct SinkLcg(u32);
+impl SinkLcg {
+    fn next_f32(&mut self) -> f32 {
+        self.0 = self.0.wrapping_mul(1664525).wrapping_add(1013904223);
+        ((self.0 >> 8) as f32 / (1u32 << 24) as f32) * 2.0 - 1.0
+    }
+}
+
+fn assert_sink_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
+    assert_eq!(got.len(), want.len(), "{label}: length mismatch");
+    let mut max_abs = 0.0f32;
+    let mut worst = 0usize;
+    for (i, (&g, &w)) in got.iter().zip(want).enumerate() {
+        let d = (g - w).abs();
+        if d > max_abs {
+            max_abs = d;
+            worst = i;
+        }
+    }
+    println!("{label}: max_abs={max_abs:.5} (idx {worst}: got {} want {})", got[worst], want[worst]);
+    assert!(max_abs < tol, "{label}: max abs diff {max_abs} exceeds {tol}");
+}
+
+/// Sink math + multi-sequence indptrs + window off-by-one + decode-as-prefill,
+/// all against the CPU reference of gpt-oss sink-attention semantics.
+#[test]
+fn flashinfer_sink_matches_reference() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        eprintln!("GPU lacks FlashInfer support; skipping");
+        return;
+    }
+    let (heads, kv_heads, dim) = (8usize, 2usize, 64usize);
+    let mut rng = SinkLcg(42);
+
+    // (label, qo lens, kv lens, window_left)
+    let cases: Vec<(&str, Vec<i32>, Vec<i32>, i64)> = vec![
+        ("decode b1", vec![1], vec![64], -1),
+        ("decode b2", vec![1, 1], vec![40, 200], -1),
+        ("mixed b3", vec![1, 5, 2], vec![33, 64, 17], -1),
+        ("prefill 64", vec![64], vec![64], -1),
+        // window boundary sweep: q_pos - kv_pos <= 127 visible
+        ("win c127", vec![1], vec![127], 127),
+        ("win c128", vec![1], vec![128], 127),
+        ("win c129", vec![1], vec![129], 127),
+        ("win c200", vec![1], vec![200], 127),
+        ("win prefill", vec![48], vec![160], 127),
+        ("win mixed b2", vec![3, 1], vec![140, 130], 127),
+    ];
+
+    for (label, qo_lens, kv_lens, window_left) in cases {
+        let mut qo_indptr = vec![0i32];
+        let mut kv_indptr = vec![0i32];
+        for (&q, &k) in qo_lens.iter().zip(&kv_lens) {
+            assert!(q <= k);
+            qo_indptr.push(qo_indptr.last().unwrap() + q);
+            kv_indptr.push(kv_indptr.last().unwrap() + k);
+        }
+        let total_q = *qo_indptr.last().unwrap() as usize;
+        let c = *kv_indptr.last().unwrap() as usize;
+        // Slot pool larger than c, with shuffled (non-contiguous) slot ids.
+        let slots = c + 17;
+        let mut kv_indices: Vec<i32> = (0..c as i32).map(|i| (i * 7 + 3) % slots as i32).collect();
+        kv_indices.sort_unstable();
+        kv_indices.dedup();
+        while kv_indices.len() < c {
+            let cand = (rng.next_f32().abs() * slots as f32) as i32 % slots as i32;
+            if !kv_indices.contains(&cand) {
+                kv_indices.push(cand);
+            }
+        }
+        let q: Vec<f32> = (0..total_q * heads * dim).map(|_| bf16_round(rng.next_f32())).collect();
+        let k_pool: Vec<f32> = (0..slots * kv_heads * dim).map(|_| bf16_round(rng.next_f32())).collect();
+        let v_pool: Vec<f32> = (0..slots * kv_heads * dim).map(|_| bf16_round(rng.next_f32())).collect();
+        let sinks: Vec<f32> = (0..heads).map(|_| bf16_round(rng.next_f32() * 2.0)).collect();
+
+        let want = sink_reference(
+            &q, &k_pool, &v_pool, &kv_indices, &qo_indptr, &kv_indptr, &sinks,
+            heads, kv_heads, dim, window_left as i32,
+        );
+        let got = run_flashinfer_sink(
+            &stream, &q, &k_pool, &v_pool, &kv_indices, &qo_indptr, &kv_indptr, &sinks,
+            heads, kv_heads, dim, window_left,
+        );
+        assert_sink_close(&got, &want, 2e-2, label);
+    }
+}
+
+/// Interleave two cached plan flavors (full + sliding) repeatedly: each plan
+/// owns a private int workspace, so runs must not clobber each other.
+#[test]
+fn flashinfer_sink_two_plans_interleaved() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        eprintln!("GPU lacks FlashInfer support; skipping");
+        return;
+    }
+    let (heads, kv_heads, dim) = (8usize, 2usize, 64usize);
+    let mut rng = SinkLcg(7);
+    let qo_indptr = vec![0i32, 2, 3];
+    let kv_indptr = vec![0i32, 150, 290];
+    let total_q = 3usize;
+    let c = 290usize;
+    let slots = c;
+    let kv_indices: Vec<i32> = (0..c as i32).collect();
+    let q: Vec<f32> = (0..total_q * heads * dim).map(|_| bf16_round(rng.next_f32())).collect();
+    let k_pool: Vec<f32> = (0..slots * kv_heads * dim).map(|_| bf16_round(rng.next_f32())).collect();
+    let v_pool: Vec<f32> = (0..slots * kv_heads * dim).map(|_| bf16_round(rng.next_f32())).collect();
+    let sinks: Vec<f32> = (0..heads).map(|_| bf16_round(rng.next_f32())).collect();
+
+    let want_full = sink_reference(
+        &q, &k_pool, &v_pool, &kv_indices, &qo_indptr, &kv_indptr, &sinks,
+        heads, kv_heads, dim, -1,
+    );
+    let want_win = sink_reference(
+        &q, &k_pool, &v_pool, &kv_indices, &qo_indptr, &kv_indptr, &sinks,
+        heads, kv_heads, dim, 127,
+    );
+    // Interleave 4x; both plans stay cached after the first round.
+    for round in 0..4 {
+        let got_full = run_flashinfer_sink(
+            &stream, &q, &k_pool, &v_pool, &kv_indices, &qo_indptr, &kv_indptr, &sinks,
+            heads, kv_heads, dim, -1,
+        );
+        let got_win = run_flashinfer_sink(
+            &stream, &q, &k_pool, &v_pool, &kv_indices, &qo_indptr, &kv_indptr, &sinks,
+            heads, kv_heads, dim, 127,
+        );
+        assert_sink_close(&got_full, &want_full, 2e-2, &format!("interleave full r{round}"));
+        assert_sink_close(&got_win, &want_win, 2e-2, &format!("interleave win r{round}"));
+    }
+}
+
+// ─── Sink attention egglog rule firing (no GPU) ──────────────────────────
+//
+// These build the gpt-oss paged-attention island (bf16, indptr mask, sink
+// denominator) and check the FlashInferSinkAttention rule fires.
+
+/// Indptr-derived attention mask with an optional sliding-window term.
+/// Mirrors `examples/paged_gpt_oss::compute_attn_mask` exactly.
+fn test_compute_attn_mask_windowed(
+    graph: &mut Graph,
+    q_pos: GraphTensor,
+    qo_indptr: GraphTensor,
+    kv_indptr: GraphTensor,
+    c: Expression,
+    window: Option<usize>,
+) -> GraphTensor {
+    let s = q_pos.dims1();
+    let q_request = test_indptr_to_request_idx(graph, qo_indptr, s);
+    let c_request = test_indptr_to_request_idx(graph, kv_indptr, c);
+    let c_arange = graph.arange(c);
+    let c_kv_start = kv_indptr.gather(c_request);
+    let c_local_pos = c_arange - c_kv_start;
+    let q_req_2d = q_request.expand_dim(1, c);
+    let c_req_2d = c_request.expand_dim(0, s);
+    let same = q_req_2d.eq(c_req_2d);
+    let c_pos_2d = c_local_pos.expand_dim(0, s);
+    let qp_2d = q_pos.expand_dim(1, c);
+    let causal = c_pos_2d.le(qp_2d);
+    let allowed = same.cast(DType::F32) * causal.cast(DType::F32);
+    let mask = allowed * 1e10 - 1e10;
+    if let Some(w) = window {
+        let q_f = q_pos.cast(DType::F32);
+        let win_lo = q_f - (w - 1) as f32;
+        let c_local_f = c_local_pos.cast(DType::F32);
+        let too_old = c_local_f.expand_dim(0, s).lt(win_lo.expand_dim(1, c));
+        mask + too_old.cast(DType::F32) * -1e10
+    } else {
+        mask
+    }
+}
+
+/// Build the gpt-oss sink paged-attention island at test dims. bf16 chain,
+/// indptr-derived mask (optionally windowed), sink-augmented softmax
+/// denominator. Mirrors `examples/paged_gpt_oss::paged_attention`.
+fn build_sink_paged_attention_graph(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    window: Option<usize>,
+) -> (Graph, PagedAttnHandles, GraphTensor) {
+    build_sink_paged_attention_graph_inner(n_heads, n_kv_heads, head_dim, window, true)
+}
+
+fn build_sink_paged_attention_graph_inner(
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    window: Option<usize>,
+    with_sink: bool,
+) -> (Graph, PagedAttnHandles, GraphTensor) {
+    let kv_groups = n_heads / n_kv_heads;
+    let kv_dim = n_kv_heads * head_dim;
+    let hidden = n_heads * head_dim;
+
+    let mut cx = Graph::default();
+
+    let q_rope = cx.named_tensor("q_rope", ('s', hidden)).as_dtype(DType::Bf16);
+    let k_rope = cx.named_tensor("k_rope", ('s', kv_dim)).as_dtype(DType::Bf16);
+    let v_new = cx.named_tensor("v_new", ('s', kv_dim)).as_dtype(DType::Bf16);
+    let k_cache = cx
+        .named_tensor("k_cache", (2048, kv_dim))
+        .as_dtype(DType::Bf16)
+        .persist();
+    let v_cache = cx
+        .named_tensor("v_cache", (2048, kv_dim))
+        .as_dtype(DType::Bf16)
+        .persist();
+    let sinks = cx
+        .named_tensor("sinks", n_heads)
+        .as_dtype(DType::Bf16)
+        .persist();
+    let scatter_idx = cx.named_tensor("scatter_idx", 's').as_dtype(DType::Int);
+    let gather_idx = cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int);
+    let q_pos = cx.named_tensor("q_pos", 's').as_dtype(DType::Int);
+    let qo_indptr = cx.named_tensor("qo_indptr", 'r').as_dtype(DType::Int);
+    let kv_indptr = cx.named_tensor("kv_indptr", 'r').as_dtype(DType::Int);
+
+    let k_cache_out = scatter_rows(k_rope, scatter_idx, k_cache, kv_dim);
+    let v_cache_out = scatter_rows(v_new, scatter_idx, v_cache, kv_dim);
+    let k = gather_rows(k_cache_out, gather_idx, kv_dim);
+    let v_ctx = gather_rows(v_cache_out, gather_idx, kv_dim);
+
+    let c: Expression = 'c'.into();
+    let attn_mask = test_compute_attn_mask_windowed(&mut cx, q_pos, qo_indptr, kv_indptr, c, window);
+
+    let q = (q_rope * 1.0).split_dims(1, head_dim).transpose(0, 1);
+    let k = k.split_dims(1, head_dim).permute((1, 2, 0));
+    let v_ctx = v_ctx.split_dims(1, head_dim).transpose(0, 1);
+    let k = k.expand_dim(1, kv_groups).merge_dims(0, 1) * 1.0;
+    let v_ctx = v_ctx.expand_dim(1, kv_groups).merge_dims(0, 1) * 1.0;
+
+    let scores = q.matmul(k) / (head_dim as f32).sqrt();
+    let masked = scores + attn_mask.cast(DType::Bf16).expand_dim(0, n_heads);
+
+    // Sink-augmented softmax: the per-head learned logit enters the denominator.
+    let s = q_rope.dims()[0];
+    let row_max = masked.max(2); // [n_heads, s]
+    let num = (masked - row_max.expand_dim(2, c)).exp(); // [n_heads, s, c]
+    let denom = if with_sink {
+        let sink_term = (sinks.expand_dim(1, s) - row_max).exp(); // [n_heads, s]
+        num.sum(2) + sink_term // [n_heads, s]
+    } else {
+        num.sum(2) // plain softmax denominator (no sink term)
+    };
+    let attn = num / denom.expand_dim(2, c);
+
+    let out = attn.matmul(v_ctx).transpose(0, 1).merge_dims(1, 2);
+    let attn_out = out.cast(DType::F32).output();
+    k_cache_out.output();
+    v_cache_out.output();
+
+    (
+        cx,
+        PagedAttnHandles {
+            attn_out,
+            q_rope,
+            k_rope,
+            v_new,
+            k_cache,
+            v_cache,
+            scatter_idx,
+            gather_idx,
+            q_pos,
+            qo_indptr,
+            kv_indptr,
+        },
+        sinks,
+    )
+}
+
+/// One gpt-oss sink-attention island added to an existing graph, sharing the
+/// per-step paging inputs across layers (mirrors the alternating-window body of
+/// `examples/paged_gpt_oss`). Returns the layer output.
+#[allow(clippy::too_many_arguments)]
+fn add_sink_attention_island(
+    cx: &mut Graph,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    layer: usize,
+    window: Option<usize>,
+    scatter_idx: GraphTensor,
+    gather_idx: GraphTensor,
+    q_pos: GraphTensor,
+    qo_indptr: GraphTensor,
+    kv_indptr: GraphTensor,
+) -> GraphTensor {
+    let kv_groups = n_heads / n_kv_heads;
+    let kv_dim = n_kv_heads * head_dim;
+    let hidden = n_heads * head_dim;
+
+    let q_rope = cx
+        .named_tensor(format!("q_rope{layer}"), ('s', hidden))
+        .as_dtype(DType::Bf16);
+    let k_rope = cx
+        .named_tensor(format!("k_rope{layer}"), ('s', kv_dim))
+        .as_dtype(DType::Bf16);
+    let v_new = cx
+        .named_tensor(format!("v_new{layer}"), ('s', kv_dim))
+        .as_dtype(DType::Bf16);
+    let k_cache = cx
+        .named_tensor(format!("k_cache{layer}"), (2048, kv_dim))
+        .as_dtype(DType::Bf16)
+        .persist();
+    let v_cache = cx
+        .named_tensor(format!("v_cache{layer}"), (2048, kv_dim))
+        .as_dtype(DType::Bf16)
+        .persist();
+    let sinks = cx
+        .named_tensor(format!("sinks{layer}"), n_heads)
+        .as_dtype(DType::Bf16)
+        .persist();
+
+    let k_cache_out = scatter_rows(k_rope, scatter_idx, k_cache, kv_dim);
+    let v_cache_out = scatter_rows(v_new, scatter_idx, v_cache, kv_dim);
+    let k = gather_rows(k_cache_out, gather_idx, kv_dim);
+    let v_ctx = gather_rows(v_cache_out, gather_idx, kv_dim);
+
+    let c: Expression = 'c'.into();
+    let attn_mask = test_compute_attn_mask_windowed(cx, q_pos, qo_indptr, kv_indptr, c, window);
+
+    let q = (q_rope * 1.0).split_dims(1, head_dim).transpose(0, 1);
+    let k = k.split_dims(1, head_dim).permute((1, 2, 0));
+    let v_ctx = v_ctx.split_dims(1, head_dim).transpose(0, 1);
+    let k = k.expand_dim(1, kv_groups).merge_dims(0, 1) * 1.0;
+    let v_ctx = v_ctx.expand_dim(1, kv_groups).merge_dims(0, 1) * 1.0;
+
+    let scores = q.matmul(k) / (head_dim as f32).sqrt();
+    let masked = scores + attn_mask.cast(DType::Bf16).expand_dim(0, n_heads);
+
+    let s = q_rope.dims()[0];
+    let row_max = masked.max(2);
+    let num = (masked - row_max.expand_dim(2, c)).exp();
+    let sink_term = (sinks.expand_dim(1, s) - row_max).exp();
+    let denom = num.sum(2) + sink_term;
+    let attn = num / denom.expand_dim(2, c);
+
+    let out = attn.matmul(v_ctx).transpose(0, 1).merge_dims(1, 2);
+    k_cache_out.output();
+    v_cache_out.output();
+    out
+}
+
+/// One saturation, everything the sink rule-firing tests need: whether a sink
+/// e-node exists, whether the plain FlashInferAttention rule fired, and the
+/// count of sink e-nodes per `window_left` flavor (-1 full, 127 sliding).
+struct SinkReport {
+    has_sink: bool,
+    has_plain: bool,
+    n_window_127: usize,
+    n_window_neg1: usize,
+}
+
+fn sink_saturation_report(cx: &Graph) -> SinkReport {
+    let (program, root) = hlir_to_egglog(cx);
+    let mut ops = <CudaRuntime as luminal::op::Runtime>::Ops::into_vec();
+    ops.extend(<luminal::hlir::HLIROps as IntoEgglogOp>::into_vec());
+    let egraph = run_egglog(&program, &root, &ops, false).expect("egglog failed");
+
+    let has_sink = egraph
+        .enodes
+        .values()
+        .any(|(label, _)| label == "FlashInferSinkAttention");
+    let has_plain = egraph
+        .enodes
+        .values()
+        .any(|(label, _)| label == "FlashInferAttention");
+
+    // The op-kind e-node is (FlashInferSinkAttention <8 kind-child eclasses>);
+    // its last child is the window_left F64 literal eclass.
+    let count_window = |window_left: i64| -> usize {
+        egraph
+            .enodes
+            .values()
+            .filter(|(label, children)| {
+                label == "FlashInferSinkAttention"
+                    && children.last().is_some_and(|wl_class| {
+                        egraph.eclasses[wl_class].1.iter().any(|n| {
+                            egraph.enodes[n]
+                                .0
+                                .replace('"', "")
+                                .parse::<f64>()
+                                .map(|v| v.round() as i64 == window_left)
+                                .unwrap_or(false)
+                        })
+                    })
+            })
+            .count()
+    };
+
+    SinkReport {
+        has_sink,
+        has_plain,
+        n_window_127: count_window(127),
+        n_window_neg1: count_window(-1),
+    }
+}
+
+/// Saturate egglog and report whether a FlashInferSinkAttention e-node exists,
+/// plus (as a proxy list) whether the plain FlashInferAttention rule fired.
+fn saturate_and_has_sink(cx: &Graph) -> (bool, Vec<String>) {
+    let report = sink_saturation_report(cx);
+    let mut labels = Vec::new();
+    if report.has_plain {
+        labels.push("FlashInferAttention".to_string());
+    }
+    (report.has_sink, labels)
+}
+
+#[test]
+#[ignore = "debug instrument: dump gpt-oss sink paged attention egglog"]
+fn flashinfer_sink_dump_egglog() {
+    let window = std::env::var("SINK_WINDOW").ok().map(|_| 128usize);
+    let (cx, _, _) = build_sink_paged_attention_graph(N_HEADS, N_KV_HEADS, HEAD_DIM, window);
+    let (program, root) = hlir_to_egglog(&cx);
+    eprintln!("==== EGGLOG PROGRAM (root={root}) ====");
+    for (i, line) in program.lines().enumerate() {
+        eprintln!("{:5}: {line}", i + 1);
+    }
+    eprintln!("==== END ({} lines) ====", program.lines().count());
+}
+
+#[test]
+fn flashinfer_sink_rule_fires_on_full_attention() {
+    let (cx, _, _) = build_sink_paged_attention_graph(N_HEADS, N_KV_HEADS, HEAD_DIM, None);
+    let (has_sink, plain) = saturate_and_has_sink(&cx);
+    assert!(
+        has_sink,
+        "FlashInferSinkAttention was NOT found for gpt-oss full-attention sink island"
+    );
+    // The plain FlashInferAttention rules require Recip(Sum) directly, which
+    // the sink denominator Recip(Add(Sum, sink)) does not match.
+    assert!(
+        plain.is_empty(),
+        "plain FlashInferAttention should NOT fire on the sink graph (got {plain:?})"
+    );
+}
+
+#[test]
+fn flashinfer_sink_rule_fires_on_sliding_window() {
+    // Sliding-window layer: mask carries the W-1 (=127) window term.
+    let (cx, _, _) = build_sink_paged_attention_graph(N_HEADS, N_KV_HEADS, HEAD_DIM, Some(128));
+    let (has_sink, plain) = saturate_and_has_sink(&cx);
+    assert!(
+        has_sink,
+        "FlashInferSinkAttention was NOT found for gpt-oss sliding-window sink island"
+    );
+    assert!(
+        plain.is_empty(),
+        "plain FlashInferAttention should NOT fire on the sink graph (got {plain:?})"
+    );
+}
+
+#[test]
+fn flashinfer_sink_rule_does_not_fire_without_sink_term() {
+    // Same bf16 indptr-masked paged attention but a STANDARD softmax
+    // denominator (no sink term): the sink rules must not fire.
+    let (cx, _, _) =
+        build_sink_paged_attention_graph_inner(N_HEADS, N_KV_HEADS, HEAD_DIM, None, false);
+    let (has_sink, _) = saturate_and_has_sink(&cx);
+    assert!(
+        !has_sink,
+        "FlashInferSinkAttention must NOT fire on a plain (sink-free) softmax"
+    );
+}
+
+/// Model-level check: a 2-layer gpt-oss body alternates sliding-window (even
+/// layers) and full (odd layers) attention, sharing the per-step paging inputs.
+/// BOTH sink rules must fire in a single saturation (and the shared inputs must
+/// not cause the rolled-body cross-product blowup).
+#[test]
+fn flashinfer_sink_rule_fires_on_two_layer_body() {
+    let mut cx = Graph::default();
+    let scatter_idx = cx.named_tensor("scatter_idx", 's').as_dtype(DType::Int);
+    let gather_idx = cx.named_tensor("gather_idx", 'c').as_dtype(DType::Int);
+    let q_pos = cx.named_tensor("q_pos", 's').as_dtype(DType::Int);
+    let qo_indptr = cx.named_tensor("qo_indptr", 'r').as_dtype(DType::Int);
+    let kv_indptr = cx.named_tensor("kv_indptr", 'r').as_dtype(DType::Int);
+
+    for layer in 0usize..2 {
+        // Even layers sliding-window (W=128), odd layers full — as in the model.
+        let window = layer.is_multiple_of(2).then_some(128);
+        let out = add_sink_attention_island(
+            &mut cx, N_HEADS, N_KV_HEADS, HEAD_DIM, layer, window, scatter_idx, gather_idx, q_pos,
+            qo_indptr, kv_indptr,
+        );
+        out.cast(DType::F32).output();
+    }
+
+    let report = sink_saturation_report(&cx);
+    assert!(
+        report.has_sink,
+        "FlashInferSinkAttention must fire on the 2-layer body"
+    );
+    assert!(
+        !report.has_plain,
+        "plain FlashInferAttention should NOT fire on the sink body"
+    );
+    // Both flavors must be extracted: the sliding rule (window_left 127) on the
+    // even layer and the full rule (window_left -1) on the odd layer.
+    assert!(
+        report.n_window_127 >= 1,
+        "expected the sliding-window sink rule (window_left=127) to fire on layer 0"
+    );
+    assert!(
+        report.n_window_neg1 >= 1,
+        "expected the full-attention sink rule (window_left=-1) to fire on layer 1"
+    );
+}
+
+/// The sink island must be reachable by the search's genome walk AND survive
+/// extraction to LLIR (exercises find_indptrs recovery for the sink rule —
+/// the fires-tests only assert the sort appears in the egraph).
+#[test]
+fn flashinfer_sink_extraction_reachable_from_search_space() {
+    if !crate::tests::utilities::gpu_supports_flashinfer() {
+        return;
+    }
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+
+    let (mut cx, _h, _out) =
+        build_sink_paged_attention_graph(N_HEADS, N_KV_HEADS, HEAD_DIM, Some(127));
+    cx.set_dim('s', 2usize);
+    cx.set_dim('c', 16usize);
+    cx.set_dim('r', 2usize);
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+
+    let egraph = cx
+        .egraph()
+        .expect("egraph missing after build_search_space");
+    let ops = cx
+        .egglog_ops()
+        .expect("egglog_ops missing after build_search_space");
+
+    let mut rng = StdRng::seed_from_u64(0x5117);
+    let mut prev: FxHashSet<u64> = FxHashSet::default();
+    let initial = luminal::egglog_utils::random_initial_choice(egraph, &mut rng);
+    prev.insert(luminal::egglog_utils::hash_choice_set(&initial));
+    let mut base = initial;
+
+    let mut found = false;
+    let mut panics = 0usize;
+    'outer: for _ in 0..50 {
+        let offspring =
+            luminal::egglog_utils::extract_generation(egraph, &base, 10, 2, &mut prev, &mut rng);
+        if offspring.is_empty() {
+            break;
+        }
+        for genome in offspring {
+            if luminal::egglog_utils::validate_choice_set(egraph, &genome, ops).is_err() {
+                continue;
+            }
+            let mut list_cache = FxHashMap::default();
+            let mut expr_cache = FxHashMap::default();
+            let panicked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                luminal::egglog_utils::egglog_to_llir(
+                    egraph,
+                    genome.clone(),
+                    ops,
+                    &cx.custom_ops,
+                    &mut list_cache,
+                    &mut expr_cache,
+                    None,
+                )
+            }));
+            let Ok(llir_graph) = panicked else {
+                panics += 1;
+                continue;
+            };
+
+            let has_fi = llir_graph.node_indices().any(|n| {
+                llir_graph[n]
+                    .to_dialect::<dyn HostOp>()
+                    .and_then(|op| op.stats_name())
+                    == Some("FlashInferSinkAttention")
+            });
+            if has_fi {
+                found = true;
+                break 'outer;
+            }
+            base = genome;
+        }
+    }
+    assert!(
+        found,
+        "FlashInferSinkAttention extraction not reachable after 50 generations ({panics} extraction panics — a panic here means find_indptrs or extract() rejects the sink rule's bindings)"
+    );
+}

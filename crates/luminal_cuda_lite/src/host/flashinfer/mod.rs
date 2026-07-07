@@ -1,5 +1,6 @@
 pub mod find_indptrs;
 pub mod jit;
+pub mod sink;
 
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -174,8 +175,8 @@ unsafe impl Sync for PreparedFlashInferDecode {}
 unsafe impl Send for FlashInferAttention {}
 unsafe impl Sync for FlashInferAttention {}
 
-const FLOAT_WORKSPACE_SIZE: usize = 128 * 1024 * 1024; // 128 MiB
-const INT_WORKSPACE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
+pub(crate) const FLOAT_WORKSPACE_SIZE: usize = 128 * 1024 * 1024; // 128 MiB
+pub(crate) const INT_WORKSPACE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
 
 static PAGE_LOCKED_WORKSPACE: OnceLock<PageLockedPtr> = OnceLock::new();
 
@@ -880,7 +881,7 @@ impl HostOp for FlashInferAttention {
 /// binary. Resolve it via `dlopen`/`dlsym` so we don't need a build script or
 /// a `#[link]` directive — keeping the crate buildable without any nvcc-side
 /// dependencies.
-fn flashinfer_workspaces(
+pub(crate) fn flashinfer_workspaces(
     stream: &Arc<CudaStream>,
 ) -> (&'static CudaSlice<u8>, u64, &'static CudaSlice<u8>, u64) {
     static FLOAT_WORKSPACE: OnceLock<CudaSlice<u8>> = OnceLock::new();
@@ -895,7 +896,22 @@ fn flashinfer_workspaces(
     (float_ws, float_ptr, int_ws, int_ptr)
 }
 
-fn bytes_to_i32_vec(bytes: Vec<u8>) -> Vec<i32> {
+/// Lazily allocate (once) and return the shared page-locked host workspace
+/// used by FlashInfer plan calls. Callers must serialize plan calls.
+pub(crate) fn page_locked_workspace() -> *mut u8 {
+    PAGE_LOCKED_WORKSPACE
+        .get_or_init(|| unsafe {
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let status = libc::posix_memalign(&mut ptr, 4096, INT_WORKSPACE_SIZE);
+            assert_eq!(status, 0, "Failed to allocate page-locked workspace");
+            let cuda_status = cuda_pin_memory(ptr, INT_WORKSPACE_SIZE);
+            assert_eq!(cuda_status, 0, "Failed to pin memory");
+            PageLockedPtr(ptr as *mut u8)
+        })
+        .0
+}
+
+pub(crate) fn bytes_to_i32_vec(bytes: Vec<u8>) -> Vec<i32> {
     let len = bytes.len() / std::mem::size_of::<i32>();
     let mut bytes = std::mem::ManuallyDrop::new(bytes);
     unsafe { Vec::from_raw_parts(bytes.as_mut_ptr() as *mut i32, len, len) }

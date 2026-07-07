@@ -46,6 +46,14 @@
 (relation fi_scaled_offset_mask (IR))
 (relation fi_direct_causal_mask (IR IR))
 
+; gpt-oss sink-attention facts (see sink.rs). The indptr-mask facts bind the
+; two indptr Input enodes recovered from the in-graph mask chain (they become
+; runtime inputs 4/5 of FlashInferSinkAttention); the sink-denom fact binds the
+; row-max eclass (shared with the main softmax) and the sinks Input.
+(relation fi_indptr_mask (IR IR IR))
+(relation fi_indptr_window_mask (IR IR IR f64))
+(relation fi_sink_denom (IR IR IR))
+
 ; A constant-valued eclass regardless of dtype: either a plain HLIR Constant
 ; (f32 graphs) or a folded dtype-typed KernelConstant (the frontend emits
 ; `constant(v).cast(dt)` for non-f32 scalars, and the kernel_lower fold rule
@@ -1041,4 +1049,368 @@
     )
     :ruleset kernel_fuse_late2
     :name "FlashInfer gemma sliding triu-gather attention"
+)
+
+; ── gpt-oss sink attention (sink.rs) ──
+;
+; Same paged-attention skeleton as the causal variants, but:
+;   - the additive mask is built in-graph from qo/kv indptrs (fi_indptr_mask /
+;     fi_indptr_window_mask bind the two indptr Input enodes → runtime inputs
+;     4/5), then cast to the bf16 score dtype before the mask Add;
+;   - the softmax denominator carries a per-head learned sink logit
+;     (fi_sink_denom). The island rules share ?smax (row max) with the sink
+;     chain so the whole premise graph is one connected chain, and emit
+;     FlashInferSinkAttention (8 proof inputs incl. sinks + mask).
+
+(rule
+    (
+        ; denom = sum(exp(masked - row_max)) + exp(sinks - row_max), so the
+        ; softmax reciprocal's input is Add(Sum(exp2 ...), sink_exp). Binds the
+        ; shared row-max eclass ?smax and the sinks Input.
+        (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sdenom (INil))))
+        (= ?sdenom (Op (Add ?sd_shape ?sd_a ?sd_b ?sd_o)
+            (ICons ?sexpsum (ICons ?sink_exp (INil)))))
+        (= ?sexpsum (Op (Sum ?ss_shape (MVar "c") ?ss_in ?ss_iter ?ss_out)
+            (ICons ?sexp (INil))))
+        (= ?sink_exp (Op (Exp2 ?sx_shape ?sx_in ?sx_out) (ICons ?sink_sc (INil))))
+        (= ?sink_sc (Op (Mul ?ssc_shape ?ssc_a ?ssc_b ?ssc_o)
+            (ICons ?sink_shifted (ICons ?sink_log2e (INil)))))
+        (const_like ?sink_log2e 1.442695)
+        (= ?sink_shifted (Op (Add ?ssh_shape ?ssh_a ?ssh_b ?ssh_o)
+            (ICons ?sinks (ICons ?sink_negmax (INil)))))
+        (= ?sink_negmax (Op (Mul ?snm_shape ?snm_a ?snm_b ?snm_o)
+            (ICons ?smax (ICons ?sink_negone (INil)))))
+    )
+    (
+        (fi_sink_denom ?srecip ?smax ?sinks)
+    )
+    :ruleset kernel_fuse_late_pre
+    :name "FlashInfer sink denom fact"
+)
+
+(rule
+    (
+        ; Full (no-window) indptr mask: Add(Mul(allowed, 1e10), -1e10), where
+        ; allowed = same_request(cast) * causal(cast). Walk the same-request
+        ; branch down to the two indptr Inputs (query request idx and context
+        ; request idx), which become FlashInferSinkAttention inputs 4/5.
+        (= ?mask (Op (Add ?m_shape ?m_a ?m_b ?m_o)
+            (ICons ?scaled_allowed (ICons ?neg_off (INil)))))
+        (= ?scaled_allowed (Op (Mul ?sa_shape ?sa_a ?sa_b ?sa_o)
+            (ICons ?allowed (ICons ?big (INil)))))
+        (const_like ?big ?bigv) (> ?bigv 9999999999.0) (< ?bigv 10000000001.0)
+        (= ?neg_off (Op (Mul ?no_shape ?no_a ?no_b ?no_o)
+            (ICons ?big2 (ICons ?negone_off (INil)))))
+        (const_like ?big2 ?big2v) (> ?big2v 9999999999.0) (< ?big2v 10000000001.0)
+
+        (= ?allowed (Op (Mul ?al_shape ?al_a ?al_b ?al_o)
+            (ICons ?same_f (ICons ?causal_f (INil)))))
+        (= ?same_f (Op (Cast ?smf_sz (F32)) (ICons ?same_bool (INil))))
+        (= ?same_bool (Op (Cast ?smb_sz (Bool)) (ICons ?eq_expr (INil))))
+        (= ?eq_expr (Op (Add ?eq_shape ?eq_a ?eq_b ?eq_o)
+            (ICons ?neg_ne (ICons ?one_eq (INil)))))
+        (const_like ?one_eq 1.000000)
+        (= ?neg_ne (Op (Mul ?nne_shape ?nne_a ?nne_b ?nne_o)
+            (ICons ?ne_expr (ICons ?negone_eq (INil)))))
+        (= ?ne_expr (Op (Add ?ne_shape ?ne_a ?ne_b ?ne_o)
+            (ICons ?lt_qc_f (ICons ?lt_cq_f (INil)))))
+        (= ?lt_qc_f (Op (Cast ?lqc_sz (F32)) (ICons ?lt_qc (INil))))
+        (= ?lt_qc (Op (LessThan ?lqc2_sz ?lqc_a ?lqc_b ?lqc_o)
+            (ICons ?q_request (ICons ?c_request (INil)))))
+
+        ; q_request = sum(arange(s)[:,None] >= qo_indptr) - 1 (spelled le/sum).
+        (= ?q_request (Op (Add ?qr_shape ?qr_a ?qr_b ?qr_o)
+            (ICons ?q_sum (ICons ?q_off (INil)))))
+        (= ?q_sum (Op (Sum ?qsm_shape (MVar "r") ?qsm_in ?qsm_iter ?qsm_out)
+            (ICons ?q_sum_in (INil))))
+        (= ?q_sum_in (Op (Cast ?qsi_sz (Int)) (ICons ?q_le_bool (INil))))
+        (= ?q_le_bool (Op (Cast ?qlb_sz (Bool)) (ICons ?q_le_add (INil))))
+        (= ?q_le_add (Op (Add ?qla_shape ?qla_a ?qla_b ?qla_o)
+            (ICons ?q_neg_gt (ICons ?one_q (INil)))))
+        (const_like ?one_q 1.000000)
+        (= ?q_neg_gt (Op (Mul ?qng_shape ?qng_a ?qng_b ?qng_o)
+            (ICons ?q_gt_f (ICons ?negone_q (INil)))))
+        (= ?q_gt_f (Op (Cast ?qgf_sz (F32)) (ICons ?q_lt (INil))))
+        (= ?q_lt (Op (LessThan ?qlt_sz ?qlt_a ?qlt_b ?qlt_o)
+            (ICons ?q_arange (ICons ?qo_indptr (INil)))))
+        (= ?q_arange (Op (Iota (MIter) (MVar "s")) (INil)))
+        (= ?qo_indptr (Input ?qo_node ?qo_label ?qo_dt))
+
+        ; c_request = sum(arange(c)[:,None] >= kv_indptr) - 1.
+        (= ?c_request (Op (Add ?cr_shape ?cr_a ?cr_b ?cr_o)
+            (ICons ?c_sum (ICons ?c_off (INil)))))
+        (= ?c_sum (Op (Sum ?csm_shape (MVar "r") ?csm_in ?csm_iter ?csm_out)
+            (ICons ?c_sum_in (INil))))
+        (= ?c_sum_in (Op (Cast ?csi_sz (Int)) (ICons ?c_le_bool (INil))))
+        (= ?c_le_bool (Op (Cast ?clb_sz (Bool)) (ICons ?c_le_add (INil))))
+        (= ?c_le_add (Op (Add ?cla_shape ?cla_a ?cla_b ?cla_o)
+            (ICons ?c_neg_gt (ICons ?one_c (INil)))))
+        (const_like ?one_c 1.000000)
+        (= ?c_neg_gt (Op (Mul ?cng_shape ?cng_a ?cng_b ?cng_o)
+            (ICons ?c_gt_f (ICons ?negone_c (INil)))))
+        (= ?c_gt_f (Op (Cast ?cgf_sz (F32)) (ICons ?c_lt (INil))))
+        (= ?c_lt (Op (LessThan ?clt_sz ?clt_a ?clt_b ?clt_o)
+            (ICons ?c_arange (ICons ?kv_indptr (INil)))))
+        (= ?c_arange (Op (Iota (MIter) (MVar "c")) (INil)))
+        (= ?kv_indptr (Input ?kv_node ?kv_label ?kv_dt))
+    )
+    (
+        (fi_indptr_mask ?mask ?qo_indptr ?kv_indptr)
+    )
+    :ruleset kernel_fuse_late_pre
+    :name "FlashInfer indptr mask fact"
+)
+
+(rule
+    (
+        ; Sliding-window layers add a window term to the full indptr mask:
+        ;   mask + (c_local < q_pos - (W-1)).cast * -1e10
+        ; Reuses fi_indptr_mask for the inner mask and binds W-1 (window_left).
+        (= ?wmask (Op (Add ?w_shape ?w_a ?w_b ?w_o)
+            (ICons ?mask (ICons ?wterm (INil)))))
+        (fi_indptr_mask ?mask ?qo_indptr ?kv_indptr)
+        (= ?wterm (Op (Mul ?wt_shape ?wt_a ?wt_b ?wt_o)
+            (ICons ?too_old_f (ICons ?w_negbig (INil)))))
+        (const_like ?w_negbig ?w_negbigv)
+        (< ?w_negbigv -9999999999.0) (> ?w_negbigv -10000000001.0)
+        (= ?too_old_f (Op (Cast ?tof_sz (F32)) (ICons ?too_old_bool (INil))))
+        (= ?too_old_bool (Op (LessThan ?tob_sz ?tob_a ?tob_b ?tob_o)
+            (ICons ?c_local_f (ICons ?win_lo (INil)))))
+        (= ?win_lo (Op (Add ?wl_shape ?wl_a ?wl_b ?wl_o)
+            (ICons ?q_f (ICons ?neg_window (INil)))))
+        (= ?neg_window (Op (Mul ?nw_shape ?nw_a ?nw_b ?nw_o)
+            (ICons ?w_const (ICons ?w_negone (INil)))))
+        (const_like ?w_const ?window_val)
+        (const_like ?w_negone -1.000000)
+    )
+    (
+        (fi_indptr_window_mask ?wmask ?qo_indptr ?kv_indptr ?window_val)
+    )
+    ; kernel_fuse_late (not late_pre): consumes fi_indptr_mask, which is
+    ; produced in the single late_pre pass, so this must run afterwards.
+    :ruleset kernel_fuse_late
+    :name "FlashInfer indptr window mask fact"
+)
+
+(rule
+    (
+        ; gpt-oss full-attention layer: bf16 prefill, indptr mask, sink denom.
+        (flashinfer_prefill_dt ?dt)
+
+        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+            (ICons ?masked (INil))))
+        (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
+            (ICons ?smax (ICons ?nm_negone (INil)))))
+        (= ?shifted (Op (Add ?sh_shape ?sh_a ?sh_b ?sh_o)
+            (ICons ?masked (ICons ?negmax (INil)))))
+        (= ?sc (Op (Mul ?sc_shape ?sc_a ?sc_b ?sc_o)
+            (ICons ?shifted (ICons ?sc_log2e (INil)))))
+        (const_like ?sc_log2e 1.442695)
+        (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
+        ; sink denominator (shares ?smax with the Max above → connected chain).
+        (fi_sink_denom ?srecip ?smax ?sinks)
+        (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
+            (ICons ?sexp (ICons ?srecip (INil)))))
+
+        (= ?mul2 (Op (Mul
+            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            ?mul2_a_strides
+            ?mul2_b_strides
+            ?mul2_out_strides)
+            (ICons ?soft (ICons ?v_gqa (INil)))))
+
+        (= ?output (Op (Sum
+            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+            (MVar "c")
+            ?out_in_strides
+            (MIter)
+            ?out_out_strides)
+            (ICons ?mul2 (INil))))
+
+        (const_like ?v_gqa_const 1.000000)
+        (= ?v_gqa (Op (Mul
+            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            ?v_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?v_gqa_out_strides)
+            (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
+
+        (= ?v_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            ?v_gather_strides
+            (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+            ?v_src_strides)
+            (ICons ?k_idx (ICons ?v_cache (INil)))))
+
+        (= ?mul1 (Op (Mul
+            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            ?mul1_a_strides
+            ?mul1_b_strides
+            ?mul1_out_strides)
+            (ICons ?q (ICons ?k_gqa (INil)))))
+
+        (= ?qk (Op (Sum
+            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?hdim5
+            ?qk_in_strides
+            (MIter)
+            ?qk_out_strides)
+            (ICons ?mul1 (INil))))
+
+        (= ?masked (Op (Add
+            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?mask_add_a_strides
+            (ECons (MNum 0) ?mask_rest_strides)
+            ?mask_add_out_strides)
+            (ICons ?scaled_qk (ICons ?mask_cast (INil)))))
+        (= ?scaled_qk (Op (Mul ?sq_shape ?sq_a ?sq_b ?sq_o)
+            (ICons ?qk (ICons ?sq_scale (INil)))))
+        (const_like ?sq_scale ?sq_scale_val)
+
+        ; f32 indptr mask cast to the bf16 score dtype before the mask Add.
+        (= ?mask_cast (Op (Cast ?mask_cast_sz ?mask_cast_dt) (ICons ?mask (INil))))
+        (fi_indptr_mask ?mask ?qo_indptr ?kv_indptr)
+
+        (const_like ?k_gqa_const 1.000000)
+        (= ?k_gqa (Op (Mul
+            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            ?k_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?k_gqa_out_strides)
+            (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
+
+        (= ?k_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            ?k_gather_strides
+            (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+            ?k_src_strides)
+            (ICons ?k_idx (ICons ?k_cache (INil)))))
+
+        (= ?dt (dtype ?q))
+        (= ?dt (dtype ?k_cache))
+        (= ?dt (dtype ?v_cache))
+        (flashinfer_cache_pair ?k_cache ?v_cache)
+        (flashinfer_head_dim_ok ?hdim)
+    )
+    (
+        (let ?fi (Op (FlashInferSinkAttention
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val -1.0)
+            (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx
+              (ICons ?qo_indptr (ICons ?kv_indptr (ICons ?sinks (ICons ?mask (INil)))))))))))
+        (union ?output ?fi)
+        (set (dtype ?fi) ?dt)
+    )
+    :ruleset kernel_fuse_late2
+    :name "FlashInfer sink indptr attention full"
+)
+
+(rule
+    (
+        ; gpt-oss sliding-window layer: same as full but a windowed indptr mask;
+        ; window_left (W-1) carried onto the op.
+        (flashinfer_prefill_dt ?dt)
+
+        (= ?smax (Op (Max ?smax_shape (MVar "c") ?smax_in ?smax_iter ?smax_out)
+            (ICons ?masked (INil))))
+        (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
+            (ICons ?smax (ICons ?nm_negone (INil)))))
+        (= ?shifted (Op (Add ?sh_shape ?sh_a ?sh_b ?sh_o)
+            (ICons ?masked (ICons ?negmax (INil)))))
+        (= ?sc (Op (Mul ?sc_shape ?sc_a ?sc_b ?sc_o)
+            (ICons ?shifted (ICons ?sc_log2e (INil)))))
+        (const_like ?sc_log2e 1.442695)
+        (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
+        (fi_sink_denom ?srecip ?smax ?sinks)
+        (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
+            (ICons ?sexp (ICons ?srecip (INil)))))
+
+        (= ?mul2 (Op (Mul
+            (ECons ?nheads (ECons (MVar "s") (ECons ?hdim (ECons (MVar "c") (ENil)))))
+            ?mul2_a_strides
+            ?mul2_b_strides
+            ?mul2_out_strides)
+            (ICons ?soft (ICons ?v_gqa (INil)))))
+
+        (= ?output (Op (Sum
+            (ECons ?nheads2 (ECons (MVar "s") (ECons ?hdim2 (ENil))))
+            (MVar "c")
+            ?out_in_strides
+            (MIter)
+            ?out_out_strides)
+            (ICons ?mul2 (INil))))
+
+        (const_like ?v_gqa_const 1.000000)
+        (= ?v_gqa (Op (Mul
+            (ECons ?nheads3 (ECons (MVar "c") (ECons ?hdim3 (ENil))))
+            ?v_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?v_gqa_out_strides)
+            (ICons ?v_gathered (ICons ?v_gqa_const (INil)))))
+
+        (= ?v_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim (ENil)))
+            ?v_gather_strides
+            (ECons ?num_slots_v (ECons ?kvdim2 (ENil)))
+            ?v_src_strides)
+            (ICons ?k_idx (ICons ?v_cache (INil)))))
+
+        (= ?mul1 (Op (Mul
+            (ECons ?nheads4 (ECons (MVar "s") (ECons (MVar "c") (ECons ?hdim4 (ENil)))))
+            ?mul1_a_strides
+            ?mul1_b_strides
+            ?mul1_out_strides)
+            (ICons ?q (ICons ?k_gqa (INil)))))
+
+        (= ?qk (Op (Sum
+            (ECons ?nheads5 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?hdim5
+            ?qk_in_strides
+            (MIter)
+            ?qk_out_strides)
+            (ICons ?mul1 (INil))))
+
+        (= ?masked (Op (Add
+            (ECons ?nheads8 (ECons (MVar "s") (ECons (MVar "c") (ENil))))
+            ?mask_add_a_strides
+            (ECons (MNum 0) ?mask_rest_strides)
+            ?mask_add_out_strides)
+            (ICons ?scaled_qk (ICons ?mask_cast (INil)))))
+        (= ?scaled_qk (Op (Mul ?sq_shape ?sq_a ?sq_b ?sq_o)
+            (ICons ?qk (ICons ?sq_scale (INil)))))
+        (const_like ?sq_scale ?sq_scale_val)
+
+        (= ?mask_cast (Op (Cast ?mask_cast_sz ?mask_cast_dt) (ICons ?mask (INil))))
+        (fi_indptr_window_mask ?mask ?qo_indptr ?kv_indptr ?window_left)
+
+        (const_like ?k_gqa_const 1.000000)
+        (= ?k_gqa (Op (Mul
+            (ECons ?nheads6 (ECons ?hdim6 (ECons (MVar "c") (ENil))))
+            ?k_gqa_a_strides
+            (ECons (MNum 0) (ECons (MNum 0) (ECons (MNum 0) (ENil))))
+            ?k_gqa_out_strides)
+            (ICons ?k_gathered (ICons ?k_gqa_const (INil)))))
+
+        (= ?k_gathered (Op (Gather
+            (ECons (MVar "c") (ECons ?kvdim3 (ENil)))
+            ?k_gather_strides
+            (ECons ?num_slots_k (ECons ?kvdim4 (ENil)))
+            ?k_src_strides)
+            (ICons ?k_idx (ICons ?k_cache (INil)))))
+
+        (= ?dt (dtype ?q))
+        (= ?dt (dtype ?k_cache))
+        (= ?dt (dtype ?v_cache))
+        (flashinfer_cache_pair ?k_cache ?v_cache)
+        (flashinfer_head_dim_ok ?hdim)
+    )
+    (
+        (let ?fi (Op (FlashInferSinkAttention
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MNum 1) (MVar "s") ?dt ?sq_scale_val ?window_left)
+            (ICons ?q (ICons ?k_cache (ICons ?v_cache (ICons ?k_idx
+              (ICons ?qo_indptr (ICons ?kv_indptr (ICons ?sinks (ICons ?mask (INil)))))))))))
+        (union ?output ?fi)
+        (set (dtype ?fi) ?dt)
+    )
+    :ruleset kernel_fuse_late2
+    :name "FlashInfer sink indptr sliding attention"
 )
