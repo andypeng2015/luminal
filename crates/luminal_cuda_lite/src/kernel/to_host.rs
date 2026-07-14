@@ -2467,11 +2467,7 @@ pub fn kernel_to_host(
                             .is_some_and(|flashinfer| {
                                 let incoming =
                                     llir_graph.edges_directed(*n, Direction::Incoming).count();
-                                // 4 = derived causal decode; 6 = explicit
-                                // indptrs; 7 = explicit indptrs + sinks.
-                                incoming == flashinfer.graph_inputs()
-                                    || incoming == 6
-                                    || incoming == 7
+                                incoming == flashinfer.graph_inputs() || incoming == 6
                             })
                 })
         })

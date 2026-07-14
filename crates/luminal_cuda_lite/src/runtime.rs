@@ -2387,7 +2387,7 @@ fn host_data_inputs(
         // They must remain in exec_graph, but they are not data pointers.
         .filter(|e| !is_schedule_only_host_source(llir_graph, e.source()))
         .map(|e| e.source())
-        .take(host_op.runtime_input_cap())
+        .take(host_op.n_inputs())
         .collect_vec()
 }
 
@@ -2780,9 +2780,6 @@ impl Runtime for CudaRuntime {
 
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
-        // Scope for per-step host-op caches (e.g. FlashInfer's shared indptr
-        // readback): each runtime execution is one epoch.
-        crate::host::flashinfer::bump_exec_epoch();
         let profile_runtime = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
         let runtime_profile_start = std::time::Instant::now();
         let mut bucket_dispatch_time = Duration::ZERO;

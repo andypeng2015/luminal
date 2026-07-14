@@ -175,35 +175,6 @@ pub type PrefillRunFn = unsafe extern "C" fn(
     stream: *mut c_void,
 ) -> i32;
 
-/// Sink-variant prefill run: as [`PrefillRunFn`] plus the per-qo-head `sink`
-/// logits buffer (same dtype as Q/K/V), inserted before `output`.
-pub type PrefillSinkRunFn = unsafe extern "C" fn(
-    float_workspace: *mut c_void,
-    float_ws_size: usize,
-    int_workspace: *mut c_void,
-    plan_info_vec: *mut i64,
-    plan_info_len: i32,
-    q: *mut c_void,
-    k_cache: *mut c_void,
-    v_cache: *mut c_void,
-    qo_indptr: *mut i32,
-    kv_indptr: *mut i32,
-    kv_indices: *mut i32,
-    kv_last_page_len: *mut i32,
-    sink: *mut c_void,
-    output: *mut c_void,
-    total_num_rows: i32,
-    batch_size: i32,
-    num_qo_heads: i32,
-    num_kv_heads: i32,
-    page_size: i32,
-    head_dim: i32,
-    dtype: i32,
-    sm_scale: f32,
-    window_left: i32,
-    stream: *mut c_void,
-) -> i32;
-
 // ── Embedded CUDA sources ──
 
 const WRAPPER_CU: &str = include_str!("wrapper.cu");
@@ -221,7 +192,6 @@ pub struct FlashInferLib {
     pub transpose_output: TransposeOutputFn,
     pub prefill_plan: PrefillPlanFn,
     pub prefill_run: PrefillRunFn,
-    pub prefill_sink_run: PrefillSinkRunFn,
 }
 
 // SAFETY: The library handle and function pointers are valid for the lifetime
@@ -278,8 +248,6 @@ impl FlashInferLib {
             unsafe { *lib.get::<PrefillPlanFn>(b"flashinfer_batch_prefill_plan\0")? };
         let prefill_run: PrefillRunFn =
             unsafe { *lib.get::<PrefillRunFn>(b"flashinfer_batch_prefill_run\0")? };
-        let prefill_sink_run: PrefillSinkRunFn =
-            unsafe { *lib.get::<PrefillSinkRunFn>(b"flashinfer_batch_prefill_sink_run\0")? };
         Ok(Self {
             _lib: lib,
             plan,
@@ -289,7 +257,6 @@ impl FlashInferLib {
             transpose_output,
             prefill_plan,
             prefill_run,
-            prefill_sink_run,
         })
     }
 }

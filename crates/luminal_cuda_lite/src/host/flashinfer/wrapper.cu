@@ -83,56 +83,6 @@ using DecodeParamsT = BatchDecodeParams<T, T, T, IdType>;
 template <typename T>
 using PrefillParamsT = BatchPrefillPagedParams<T, T, T, IdType>;
 
-// ── Attention-sink variant (gpt-oss) ─────────────────────────────────────
-// Per-head learned sink logit folded into the softmax denominator: the sink
-// competes with the (already sm_scale-scaled) scores for probability mass but
-// never multiplies V. Adapted from upstream flashinfer's AttentionSink FA2
-// variant (flashinfer/jit/attention/variants.py); the only change is that
-// `sink` is stored in the QKV dtype (bf16/f16 weight passed raw) and cast to
-// float per read. The window check lives in LogitsMask at runtime, so ONE
-// variant serves both full (window_left = -1) and sliding-window layers — no
-// extra .so per window flavor.
-template <typename T>
-struct SinkPrefillParams : BatchPrefillPagedParams<T, T, T, IdType> {
-  T* sink;  // [num_qo_heads]
-};
-
-struct AttentionSink : AttentionVariantBase {
-  static constexpr bool use_softmax = true;
-
-  uint32_t window_left, qo_len, kv_len;
-  float sm_scale_log2;
-
-  template <typename Params>
-  __device__ __host__ AttentionSink(const Params& params, uint32_t batch_idx,
-                                    uint8_t* smem_ptr) {
-    qo_len = params.get_qo_len(batch_idx);
-    kv_len = params.get_kv_len(batch_idx);
-    window_left = (params.window_left >= 0) ? params.window_left : kv_len;
-    sm_scale_log2 = params.sm_scale * math::log2e;
-  }
-
-  REGISTER_LOGITS_MASK(params, batch_idx, qo_idx, kv_idx, qo_head_idx, kv_head_idx, {
-    return (kv_idx + qo_len + window_left >= kv_len + qo_idx);
-  })
-
-  REGISTER_M_D_UPDATE(params, kv_tile_idx, qo_head_idx, m, d, scale, {
-    float log_sink = (kv_tile_idx == 0 && qo_head_idx < params.num_qo_heads)
-                         ? (float)params.sink[qo_head_idx] * math::log2e
-                         : -math::inf;
-    float m_new = (log_sink > m) ? log_sink : m;
-    scale = math::ptx_exp2(m - m_new);
-    float d_new = math::ptx_exp2(log_sink - m_new) + d * scale;
-    m = m_new;
-    d = d_new;
-  })
-
-  REGISTER_OUTPUT_TRANSFORM(params, output, batch_idx, qo_idx, qo_head_idx, m, d, scale, {
-    float d_rcp = (m != -math::inf) ? math::ptx_rcp(d) : 0.f;
-    return output * scale * d_rcp;
-  });
-};
-
 // Forward declarations
 namespace flashinfer {
 template <uint32_t HEAD_DIM, PosEncodingMode POS_ENCODING_MODE, typename AttentionVariant,
@@ -181,23 +131,6 @@ LUMINAL_INSTANTIATE_PREFILL(__nv_bfloat16, 64)
 LUMINAL_INSTANTIATE_PREFILL(__nv_bfloat16, 128)
 
 #undef LUMINAL_INSTANTIATE_PREFILL
-
-// Sink-variant prefill instantiations (serves both prefill and decode-as-
-// prefill for gpt-oss; CTA_TILE_Q=16 covers qo_len=1 decode batches).
-#define LUMINAL_INSTANTIATE_SINK_PREFILL(T, CTA_TILE_Q)                                      \
-  template cudaError_t flashinfer::BatchPrefillWithPagedKVCacheDispatched<                   \
-      CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, false, MaskMode::kCausal,           \
-      AttentionSink, SinkPrefillParams<T>>(SinkPrefillParams<T> params, T* tmp_v,            \
-                                           float* tmp_s, bool enable_pdl, cudaStream_t stream);
-
-LUMINAL_INSTANTIATE_SINK_PREFILL(half, 16)
-LUMINAL_INSTANTIATE_SINK_PREFILL(half, 64)
-LUMINAL_INSTANTIATE_SINK_PREFILL(half, 128)
-LUMINAL_INSTANTIATE_SINK_PREFILL(__nv_bfloat16, 16)
-LUMINAL_INSTANTIATE_SINK_PREFILL(__nv_bfloat16, 64)
-LUMINAL_INSTANTIATE_SINK_PREFILL(__nv_bfloat16, 128)
-
-#undef LUMINAL_INSTANTIATE_SINK_PREFILL
 
 __global__ void prepare_decode_metadata_kernel(
     const int32_t* current_c_ptr,
@@ -485,113 +418,6 @@ static int batch_prefill_run_t(
     return (int)status;
 }
 
-// Sink-variant clone of batch_prefill_run_t: SinkPrefillParams + AttentionSink.
-// The plan is variant-agnostic (Rust reuses flashinfer_batch_prefill_plan).
-template <typename T>
-static int batch_prefill_sink_run_t(
-    void* float_workspace,
-    void* int_workspace,
-    int64_t* plan_info_vec, int plan_info_len,
-    T* q,
-    T* k_cache,
-    T* v_cache,
-    int32_t* qo_indptr,
-    int32_t* kv_indptr,
-    int32_t* kv_indices,
-    int32_t* kv_last_page_len,
-    T* sink,
-    T* output,
-    int batch_size,
-    int num_qo_heads, int num_kv_heads, int page_size,
-    float sm_scale, int window_left,
-    cudaStream_t stream)
-{
-    using Params = SinkPrefillParams<T>;
-
-    PrefillPlanInfo plan_info;
-    plan_info.FromVector(std::vector<int64_t>(plan_info_vec, plan_info_vec + plan_info_len));
-
-    paged_kv_t<T, IdType> paged_kv(
-        (uint32_t)num_kv_heads,
-        (uint32_t)page_size,
-        HEAD_DIM,
-        (uint32_t)batch_size,
-        QKVLayout::kNHD,
-        k_cache,
-        v_cache,
-        kv_indices,
-        kv_indptr,
-        kv_last_page_len);
-
-    Params params;
-    params.q = q;
-    params.paged_kv = paged_kv;
-    params.maybe_custom_mask = nullptr;
-    params.q_indptr = qo_indptr;
-    params.maybe_mask_indptr = nullptr;
-    params.maybe_q_rope_offset = nullptr;
-    params.o = output;
-    params.lse = nullptr;
-    params.maybe_alibi_slopes = nullptr;
-    params.group_size = uint_fastdiv((uint32_t)(num_qo_heads / num_kv_heads));
-    params.num_qo_heads = (uint32_t)num_qo_heads;
-    params.q_stride_n = num_qo_heads * HEAD_DIM;
-    params.q_stride_h = HEAD_DIM;
-    params.window_left = window_left;
-    params.logits_soft_cap = 0.0f;
-    params.sm_scale = sm_scale;
-    params.rope_rcp_scale = 1.0f;
-    params.rope_rcp_theta = 1.0f;
-    params.maybe_prefix_len_ptr = nullptr;
-    params.maybe_token_pos_in_items_ptr = nullptr;
-    params.token_pos_in_items_len = 0;
-    params.maybe_max_item_len_ptr = nullptr;
-    params.sink = sink;
-
-    params.request_indices =
-        GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.request_indices_offset);
-    params.qo_tile_indices =
-        GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.qo_tile_indices_offset);
-    params.kv_tile_indices =
-        GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_tile_indices_offset);
-    params.o_indptr = GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.o_indptr_offset);
-    params.kv_chunk_size_ptr =
-        GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.kv_chunk_size_ptr_offset);
-    params.merge_indptr = nullptr;
-    params.block_valid_mask = nullptr;
-    params.total_num_rows = nullptr;
-    params.max_total_num_rows = (uint32_t)plan_info.total_num_rows;
-    params.padded_batch_size = (uint32_t)plan_info.padded_batch_size;
-    params.partition_kv = false;
-
-    T* tmp_v = nullptr;
-    float* tmp_s = nullptr;
-    if (plan_info.split_kv) {
-        params.merge_indptr =
-            GetPtrFromBaseOffset<IdType>(int_workspace, plan_info.merge_indptr_offset);
-        tmp_v = GetPtrFromBaseOffset<T>(float_workspace, plan_info.v_offset);
-        tmp_s = GetPtrFromBaseOffset<float>(float_workspace, plan_info.s_offset);
-        if (plan_info.enable_cuda_graph) {
-            params.block_valid_mask =
-                GetPtrFromBaseOffset<bool>(int_workspace, plan_info.block_valid_mask_offset);
-        }
-    }
-    if (plan_info.enable_cuda_graph) {
-        params.total_num_rows =
-            GetPtrFromBaseOffset<uint32_t>(int_workspace, plan_info.total_num_rows_offset);
-    }
-
-    cudaError_t status = cudaSuccess;
-    DISPATCH_CTA_TILE_Q(plan_info.cta_tile_q, CTA_TILE_Q, {
-        status = flashinfer::BatchPrefillWithPagedKVCacheDispatched<
-            CTA_TILE_Q, HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE,
-            /*use_fp16_qk_reduction=*/false, MaskMode::kCausal, AttentionSink, Params>(
-            params, tmp_v, tmp_s, /*enable_pdl=*/false, stream);
-    });
-
-    return (int)status;
-}
-
 extern "C" {
 
 int flashinfer_batch_decode_plan(
@@ -801,54 +627,6 @@ int flashinfer_batch_prefill_run(
                 qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
                 (__nv_bfloat16*)output, batch_size, num_qo_heads, num_kv_heads,
                 page_size, sm_scale, window_left, stream);
-        default:
-            return -1; // f32 prefill is physically unsupported
-    }
-}
-
-// Sink-variant prefill run (gpt-oss). Same contract as
-// flashinfer_batch_prefill_run plus the per-qo-head `sink` logits buffer
-// (same dtype as Q/K/V). Plan via flashinfer_batch_prefill_plan (variant-
-// agnostic).
-int flashinfer_batch_prefill_sink_run(
-    void* float_workspace, size_t float_ws_size,
-    void* int_workspace,
-    int64_t* plan_info_vec, int plan_info_len,
-    void* q,
-    void* k_cache,
-    void* v_cache,
-    int32_t* qo_indptr,
-    int32_t* kv_indptr,
-    int32_t* kv_indices,
-    int32_t* kv_last_page_len,
-    void* sink,
-    void* output,
-    int total_num_rows, int batch_size,
-    int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
-    int dtype,
-    float sm_scale, int window_left,
-    cudaStream_t stream)
-{
-    (void)float_ws_size;
-    (void)head_dim; // fixed at compile time
-    (void)total_num_rows;
-
-    switch (dtype) {
-        case LUMINAL_DTYPE_F16:
-            return batch_prefill_sink_run_t<half>(
-                float_workspace, int_workspace, plan_info_vec, plan_info_len,
-                (half*)q, (half*)k_cache, (half*)v_cache, qo_indptr, kv_indptr,
-                kv_indices, kv_last_page_len, (half*)sink, (half*)output,
-                batch_size, num_qo_heads, num_kv_heads, page_size, sm_scale,
-                window_left, stream);
-        case LUMINAL_DTYPE_BF16:
-            return batch_prefill_sink_run_t<__nv_bfloat16>(
-                float_workspace, int_workspace, plan_info_vec, plan_info_len,
-                (__nv_bfloat16*)q, (__nv_bfloat16*)k_cache, (__nv_bfloat16*)v_cache,
-                qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
-                (__nv_bfloat16*)sink, (__nv_bfloat16*)output, batch_size,
-                num_qo_heads, num_kv_heads, page_size, sm_scale, window_left,
-                stream);
         default:
             return -1; // f32 prefill is physically unsupported
     }
