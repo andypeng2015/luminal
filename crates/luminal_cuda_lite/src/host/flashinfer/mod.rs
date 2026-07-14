@@ -1,5 +1,8 @@
+pub mod fa3;
 pub mod find_indptrs;
 pub mod jit;
+#[cfg(test)]
+pub(crate) mod test_ref;
 
 use std::sync::{Arc, Mutex, OnceLock};
 

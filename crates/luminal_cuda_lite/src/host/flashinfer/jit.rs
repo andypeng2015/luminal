@@ -175,10 +175,56 @@ pub type PrefillRunFn = unsafe extern "C" fn(
     stream: *mut c_void,
 ) -> i32;
 
+// ── FA3 (SM90 / Hopper) wrapper function types — match wrapper_fa3.h ──
+
+pub type Fa3PrefillPlanFn = unsafe extern "C" fn(
+    float_workspace: *mut c_void,
+    float_ws_size: usize,
+    int_workspace: *mut c_void,
+    page_locked_int_workspace: *mut c_void,
+    int_ws_size: usize,
+    qo_indptr_h: *mut i32,
+    kv_indptr_h: *mut i32,
+    kv_len_arr_h: *mut i32,
+    total_num_rows: i32,
+    batch_size: i32,
+    num_qo_heads: i32,
+    num_kv_heads: i32,
+    page_size: i32,
+    causal: i32,
+    stream: *mut c_void,
+    plan_info_out: *mut i64,
+    plan_info_len_out: *mut i32,
+) -> i32;
+
+pub type Fa3PrefillRunFn = unsafe extern "C" fn(
+    int_workspace: *mut c_void,
+    plan_info_vec: *mut i64,
+    plan_info_len: i32,
+    q: *mut c_void,
+    k_cache: *mut c_void,
+    v_cache: *mut c_void,
+    kv_indices: *mut i32,
+    sink: *mut f32,
+    output: *mut c_void,
+    lse: *mut f32,
+    nnz_qo: i32,
+    num_qo_heads: i32,
+    num_kv_heads: i32,
+    page_size: i32,
+    dtype: i32,
+    sm_scale: f32,
+    window_left: i32,
+    causal: i32,
+    stream: *mut c_void,
+) -> i32;
+
 // ── Embedded CUDA sources ──
 
 const WRAPPER_CU: &str = include_str!("wrapper.cu");
 const WRAPPER_H: &str = include_str!("wrapper.h");
+const WRAPPER_FA3_CU: &str = include_str!("wrapper_fa3.cu");
+const WRAPPER_FA3_H: &str = include_str!("wrapper_fa3.h");
 
 // ── Loaded library handle ──
 
@@ -259,6 +305,181 @@ impl FlashInferLib {
             prefill_run,
         })
     }
+}
+
+// ── FA3 (SM90 / Hopper) library: AttentionSink paged batch prefill ──
+//
+// Separate .so from the FA2 wrapper: the hopper kernels need -arch=sm_90a
+// (WGMMA/TMA) and the CUTLASS/CuTe headers, and gpt-oss's sink variant is
+// baked into this wrapper. Decode uses the same entry at qo_len=1.
+
+pub struct Fa3Lib {
+    _lib: libloading::Library,
+    pub prefill_plan: Fa3PrefillPlanFn,
+    pub prefill_run: Fa3PrefillRunFn,
+}
+
+// SAFETY: same rationale as FlashInferLib — process-lifetime pointers, calls
+// serialized by CUDA stream.
+unsafe impl Send for Fa3Lib {}
+unsafe impl Sync for Fa3Lib {}
+
+/// One compiled FA3 wrapper per (HEAD_DIM, use_sliding_window) pair.
+static FA3_LIBS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<(usize, bool), &'static Fa3Lib>>,
+> = OnceLock::new();
+
+/// Ensure the FA3/Hopper sink-attention library is compiled and loaded for
+/// the given HEAD_DIM and sliding-window variant. Thread-safe. Panics on
+/// compile failure; the caller gates on Hopper (compute capability 9.x).
+pub fn ensure_compiled_fa3(head_dim: usize, use_swa: bool) -> &'static Fa3Lib {
+    let libs = FA3_LIBS.get_or_init(Default::default);
+    let mut libs = libs.lock().unwrap();
+    if let Some(lib) = libs.get(&(head_dim, use_swa)) {
+        return lib;
+    }
+    assert!(
+        matches!(head_dim, 64 | 128 | 256),
+        "FlashInfer FA3: unsupported HEAD_DIM={} (SM90 paged prefill supports 64, 128, 256)",
+        head_dim
+    );
+    let so_path = compile_or_cache_fa3(head_dim, use_swa);
+    let lib: &'static Fa3Lib = Box::leak(Box::new(unsafe {
+        Fa3Lib::load(&so_path)
+            .unwrap_or_else(|e| panic!("Failed to load FlashInfer FA3 library: {e}"))
+    }));
+    libs.insert((head_dim, use_swa), lib);
+    lib
+}
+
+impl Fa3Lib {
+    /// Load a compiled FA3 wrapper .so and resolve function pointers.
+    ///
+    /// # Safety
+    /// The .so must be a valid wrapper compiled from wrapper_fa3.cu.
+    unsafe fn load(path: &Path) -> Result<Self, libloading::Error> {
+        let lib = unsafe { libloading::Library::new(path)? };
+        let prefill_plan: Fa3PrefillPlanFn =
+            unsafe { *lib.get::<Fa3PrefillPlanFn>(b"flashinfer_fa3_prefill_plan\0")? };
+        let prefill_run: Fa3PrefillRunFn =
+            unsafe { *lib.get::<Fa3PrefillRunFn>(b"flashinfer_fa3_prefill_run\0")? };
+        Ok(Self {
+            _lib: lib,
+            prefill_plan,
+            prefill_run,
+        })
+    }
+}
+
+/// The Hopper kernels use WGMMA/TMA, which nvcc only emits for the
+/// architecture-specific `sm_90a` target — plain `sm_90` will not compile
+/// them. `FLASHINFER_CUDA_ARCH` still overrides (verbatim) for exotic setups.
+fn fa3_cuda_arch() -> String {
+    if let Ok(arch) = std::env::var("FLASHINFER_CUDA_ARCH")
+        && !arch.is_empty()
+    {
+        return arch;
+    }
+    "sm_90a".to_string()
+}
+
+/// Compile wrapper_fa3.cu for the given HEAD_DIM/variant, or return the
+/// cached .so path. Mirrors `compile_or_cache` (content-hash cache key).
+fn compile_or_cache_fa3(head_dim: usize, use_swa: bool) -> PathBuf {
+    let cache_dir = cache_directory();
+    std::fs::create_dir_all(&cache_dir).expect("Failed to create FlashInfer cache directory");
+
+    let cu = cache_dir.join("wrapper_fa3.cu");
+    let h = cache_dir.join("wrapper_fa3.h");
+    write_if_changed(&cu, WRAPPER_FA3_CU.as_bytes());
+    write_if_changed(&h, WRAPPER_FA3_H.as_bytes());
+
+    let arch = fa3_cuda_arch();
+    let wrapper_hash = {
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        WRAPPER_FA3_CU.hash(&mut hasher);
+        WRAPPER_FA3_H.hash(&mut hasher);
+        hasher.finish()
+    };
+    let so_name = format!(
+        "libflashinfer_fa3_hd{}_swa{}_{}_w{:016x}.so",
+        head_dim, use_swa as u8, arch, wrapper_hash
+    );
+    let so_path = cache_dir.join(&so_name);
+
+    if so_path.exists() {
+        eprintln!(
+            "FlashInfer FA3: using cached library for HEAD_DIM={} ({})",
+            head_dim,
+            so_path.display()
+        );
+        return so_path;
+    }
+
+    let Some((flashinfer_include, cutlass_include)) = locate_flashinfer_includes() else {
+        panic!(
+            "FlashInfer: could not locate header tree. Set LUMINAL_FLASHINFER_DIR to the \
+             FlashInfer source root (the directory containing `include/` and \
+             `3rdparty/cutlass/include/`)."
+        );
+    };
+    // cutlass_utils.cuh also pulls in cutlass/util/* from the tools tree.
+    let cutlass_util_include = cutlass_include.parent().unwrap().join("tools/util/include");
+
+    eprintln!(
+        "FlashInfer FA3: JIT compiling for HEAD_DIM={}, swa={}, arch={} (hopper templates — takes a few minutes) ...",
+        head_dim, use_swa as u8, arch
+    );
+    let start = std::time::Instant::now();
+
+    let output = Command::new("nvcc")
+        .args([
+            "-shared",
+            "-o",
+            so_path.to_str().unwrap(),
+            &format!("-DLUMINAL_HEAD_DIM={}", head_dim),
+            &format!("-DLUMINAL_USE_SWA={}", use_swa as u8),
+            cu.to_str().unwrap(),
+            "-I",
+            flashinfer_include.to_str().unwrap(),
+            "-I",
+            cutlass_include.to_str().unwrap(),
+            "-I",
+            cutlass_util_include.to_str().unwrap(),
+            "-I",
+            cache_dir.to_str().unwrap(),
+            "-std=c++17",
+            &format!("-arch={}", arch),
+            "-O3",
+            "--expt-relaxed-constexpr",
+            "-w",
+            // NOTE: no -rdc=true here (unlike the FA2 wrapper): relocatable
+            // device code makes ptxas SERIALIZE wgmma.mma_async and drop
+            // setmaxnreg — observed directly, and it would gut FA3 perf.
+            "--compiler-options",
+            "-fPIC",
+        ])
+        .output()
+        .expect("Failed to run nvcc. Is the CUDA toolkit installed?");
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let _ = std::fs::remove_file(&so_path);
+        panic!(
+            "FlashInfer FA3 JIT compilation failed (HEAD_DIM={}, arch={}):\nstdout: {}\nstderr: {}",
+            head_dim, arch, stdout, stderr
+        );
+    }
+
+    let elapsed = start.elapsed();
+    eprintln!(
+        "FlashInfer FA3: compiled in {:.1}s → {}",
+        elapsed.as_secs_f64(),
+        so_path.display()
+    );
+
+    so_path
 }
 
 /// Compile wrapper.cu for the given HEAD_DIM/variant, or return cached .so path.
