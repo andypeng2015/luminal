@@ -10,6 +10,7 @@ pub type Ops = (
     cublaslt::CuBlasLt,
     cublaslt::CuBlasLtScaled,
     moe::GLUMoE,
+    moe::fused::FusedMoE,
     flashinfer::FlashInferAttention,
 );
 
@@ -142,6 +143,15 @@ pub trait HostOp: Debug + as_any::AsAny + EgglogOp {
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<()>;
+
+    /// Maximum number of runtime data inputs this op can consume. Used by the
+    /// eager executor to cap the incoming-edge list (schedule-only edges are
+    /// filtered separately). Defaults to the egglog rule arity `n_inputs()`;
+    /// ops with direct-placement modes that take MORE inputs than their rule
+    /// (e.g. FlashInfer's explicit-indptr + sinks form) override this.
+    fn runtime_input_cap(&self) -> usize {
+        self.n_inputs()
+    }
 
     /// Returns the output buffer size in elements.
     /// Return 0 if this op doesn't have a single output buffer (e.g., CudaGraphOp).

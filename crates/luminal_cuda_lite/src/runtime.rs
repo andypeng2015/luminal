@@ -1136,6 +1136,15 @@ impl CudaRuntime {
             } else {
                 bucket.arena_bytes
             };
+            // Growing an existing arena must not hold old + new simultaneously
+            // (peak 2x arena OOMs weight-heavy models); drop the old one and
+            // synchronize so its async free materializes before re-allocating.
+            // Mirrors the free-first order the multi-bucket dispatch uses.
+            if bucket.arena.take().is_some() {
+                // Stale pointers into the dropped arena are recomputed by the
+                // same repopulation step that any new-arena allocation runs.
+                let _ = stream.synchronize();
+            }
             let timer = std::time::Instant::now();
             bucket.arena = Some(unsafe { stream.alloc(allocation_bytes).unwrap() });
             cuda_alloc_time += timer.elapsed();
@@ -2378,7 +2387,7 @@ fn host_data_inputs(
         // They must remain in exec_graph, but they are not data pointers.
         .filter(|e| !is_schedule_only_host_source(llir_graph, e.source()))
         .map(|e| e.source())
-        .take(host_op.n_inputs())
+        .take(host_op.runtime_input_cap())
         .collect_vec()
 }
 
@@ -2562,6 +2571,17 @@ impl Runtime for CudaRuntime {
         llir_graph: &LLIRGraph,
         context: luminal::op::CandidateFilterContext<'_>,
     ) -> luminal::op::CandidateFilterResult {
+        // A random genome can select mutually-referencing enodes across
+        // eclasses (e.g. a fused-region grouping that was only acyclic for a
+        // DIFFERENT member of some eclass, like a host op unioned into a
+        // subgraph the region used to absorb). Such candidates cannot execute
+        // under any packaging; reject them like memory-infeasible ones
+        // instead of letting graph packaging panic mid-compile.
+        if petgraph::algo::is_cyclic_directed(llir_graph) {
+            return luminal::op::CandidateFilterResult::reject_with_display(
+                "cyclic LLIR".to_string(),
+            );
+        }
         let mut bucket = self.compile_bucket(llir_graph);
         let allocation_dyn_map = if let Some(bucket_context) = context.bucket_context {
             bucket.bucket_indices = bucket_context.bucket_indices.clone();
@@ -2714,6 +2734,15 @@ impl Runtime for CudaRuntime {
         if let Err(e) = self.try_load_llir(llir_graph) {
             return Self::invalid_profile_metric(e);
         }
+        // Freshly compiled candidates have an empty last_dyn_map, so
+        // try_load_llir's prebuild gate skips them and the first timed trial
+        // would swallow CUDA-graph capture of every kernel island (seconds,
+        // per-candidate, content-independent — drowning the per-step
+        // differences profiling exists to rank). Prebuild with the actual
+        // profiling dyn_map, exactly like the final post-search load does.
+        if let Err(e) = self.try_prebuild_graphs(dyn_map) {
+            return Self::invalid_profile_metric(e);
+        }
         self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout)
     }
 
@@ -2742,11 +2771,18 @@ impl Runtime for CudaRuntime {
         if let Err(e) = self.try_load_llir_buckets(bucket_context.dim_buckets, &bucket_llirs) {
             return Self::invalid_profile_metric(e);
         }
+        // Same prebuild-before-trials as profile() (see comment there).
+        if let Err(e) = self.try_prebuild_graphs(dyn_map) {
+            return Self::invalid_profile_metric(e);
+        }
         self.profile_loaded_llir(llir_graph, dyn_map, trials, timeout)
     }
 
     #[tracing::instrument(skip_all)]
     fn execute(&mut self, dyn_map: &FxHashMap<char, usize>) -> Self::ExecReturn {
+        // Scope for per-step host-op caches (e.g. FlashInfer's shared indptr
+        // readback): each runtime execution is one epoch.
+        crate::host::flashinfer::bump_exec_epoch();
         let profile_runtime = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
         let runtime_profile_start = std::time::Instant::now();
         let mut bucket_dispatch_time = Duration::ZERO;

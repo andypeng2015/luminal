@@ -2467,7 +2467,11 @@ pub fn kernel_to_host(
                             .is_some_and(|flashinfer| {
                                 let incoming =
                                     llir_graph.edges_directed(*n, Direction::Incoming).count();
-                                incoming == flashinfer.graph_inputs() || incoming == 6
+                                // 4 = derived causal decode; 6 = explicit
+                                // indptrs; 7 = explicit indptrs + sinks.
+                                incoming == flashinfer.graph_inputs()
+                                    || incoming == 6
+                                    || incoming == 7
                             })
                 })
         })
@@ -2477,8 +2481,35 @@ pub fn kernel_to_host(
         return;
     }
 
-    let kernel_subgraphs = partition_marked_convex(llir_graph, &graph_packagable_ops)
-        .expect("CUDA graph packaging requires an acyclic LLIR graph");
+    let kernel_subgraphs = match partition_marked_convex(llir_graph, &graph_packagable_ops) {
+        Ok(subgraphs) => subgraphs,
+        Err(e) => {
+            // Diagnostic: dump every non-trivial strongly-connected component
+            // (the actual cycle membership) before dying.
+            for scc in petgraph::algo::tarjan_scc(&*llir_graph) {
+                if scc.len() > 1 {
+                    eprintln!("CYCLE SCC ({} nodes):", scc.len());
+                    for n in &scc {
+                        let name = llir_graph
+                            .node_weight(*n)
+                            .map(|w| format!("{w:?}"))
+                            .unwrap_or_default();
+                        let ins: Vec<_> = llir_graph
+                            .neighbors_directed(*n, petgraph::Direction::Incoming)
+                            .map(|m| m.index())
+                            .collect();
+                        eprintln!(
+                            "  n{} <- {:?} :: {}",
+                            n.index(),
+                            ins,
+                            name.chars().take(140).collect::<String>()
+                        );
+                    }
+                }
+            }
+            panic!("CUDA graph packaging requires an acyclic LLIR graph: {e:?}");
+        }
+    };
     // Compute the set of FS / FE / Cuda*Elementwise nodes globally absorbed by some
     // FusionEnd in the LLIR. Used by `build_compile_units` to suppress
     // standalone marker compile units for shared FS leaves whose consumers
@@ -2756,7 +2787,10 @@ pub fn kernel_to_host(
                     .map(|e| e.source())
                     .map(|input| resolve_transparent_input(llir_graph, input))
                     .collect_vec();
-                if inputs.len() != flashinfer.graph_inputs() && inputs.len() != 6 {
+                if inputs.len() != flashinfer.graph_inputs()
+                    && inputs.len() != 6
+                    && inputs.len() != 7
+                {
                     continue;
                 }
                 all_buffer_nodes.insert(*node);

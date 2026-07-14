@@ -107,6 +107,28 @@ int flashinfer_batch_prefill_run(
     float sm_scale, int window_left,
     cudaStream_t stream);
 
+// Sink-variant run (gpt-oss attention sinks): as flashinfer_batch_prefill_run
+// plus `sink` = [num_qo_heads] per-head logits (same dtype as Q/K/V). Serves
+// decode too (qo_len=1 rows). Plan via flashinfer_batch_prefill_plan.
+int flashinfer_batch_prefill_sink_run(
+    void* float_workspace, size_t float_ws_size,
+    void* int_workspace,
+    int64_t* plan_info_vec, int plan_info_len,
+    void* q,
+    void* k_cache,
+    void* v_cache,
+    int32_t* qo_indptr,
+    int32_t* kv_indptr,
+    int32_t* kv_indices,
+    int32_t* kv_last_page_len,
+    void* sink,                  // [num_qo_heads], q/k/v dtype
+    void* output,
+    int total_num_rows, int batch_size,
+    int num_qo_heads, int num_kv_heads, int page_size, int head_dim,
+    int dtype,
+    float sm_scale, int window_left,
+    cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

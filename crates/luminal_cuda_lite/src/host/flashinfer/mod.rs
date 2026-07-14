@@ -70,15 +70,20 @@ pub(crate) struct FlashInferDecodeSpec {
     /// the shared prepare cache and capture signatures distinguish kernel
     /// variants.
     window_left: i32,
+    /// Attention sinks present (7-input mode). Forces the prefill kernels:
+    /// the decode kernels have no sink hook, and prefill at qo_len=1 rows is
+    /// upstream's own sink-decode strategy.
+    has_sinks: bool,
     kv_indptr_host: Vec<i32>,
     qo_indptr_host: Vec<i32>,
 }
 
 impl FlashInferDecodeSpec {
-    /// Prefill = more q tokens than sequences. Requires 16-bit dtype (the
-    /// prepare path rejects f32 prefill before this matters).
+    /// Use the prefill kernels: more q tokens than sequences, or sinks (the
+    /// decode kernels have no sink hook). Requires 16-bit dtype (the prepare
+    /// path rejects f32 prefill before this matters).
     fn is_prefill(&self) -> bool {
-        self.total_q_tokens > self.batch_size
+        self.total_q_tokens > self.batch_size || self.has_sinks
     }
 }
 
@@ -91,6 +96,8 @@ pub(crate) struct FlashInferDecodePointers {
     output: u64,
     pub(crate) explicit_qo_indptr: Option<u64>,
     pub(crate) explicit_kv_indptr: Option<u64>,
+    /// Per-qo-head sink logits, Q/K/V dtype (7-input mode).
+    pub(crate) sinks: Option<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,6 +183,72 @@ unsafe impl Sync for FlashInferAttention {}
 
 const FLOAT_WORKSPACE_SIZE: usize = 128 * 1024 * 1024; // 128 MiB
 const INT_WORKSPACE_SIZE: usize = 8 * 1024 * 1024; // 8 MiB
+
+// ── Per-step indptr readback cache ──
+//
+// Every layer's attention island reads the same qo/kv indptr device buffers
+// during prepare; without a cache that is one DtoH memcpy + stream sync PER
+// LAYER (36/tick at gpt-oss). The cache is scoped by an execution epoch that
+// `CudaRuntime::execute` bumps once per step: first island pays the one sync,
+// the other 35 hit the cache.
+
+static EXEC_EPOCH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Called once at the top of `CudaRuntime::execute`; scopes per-step host-op
+/// caches (the shared indptr readback).
+pub fn bump_exec_epoch() {
+    EXEC_EPOCH.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+struct IndptrReadback {
+    epoch: u64,
+    qo_ptr: u64,
+    kv_ptr: u64,
+    r: usize,
+    qo: Vec<i32>,
+    kv: Vec<i32>,
+}
+
+static INDPTR_READBACK: OnceLock<Mutex<Option<IndptrReadback>>> = OnceLock::new();
+
+fn read_indptrs_cached(
+    stream: &Arc<CudaStream>,
+    qo_ptr: u64,
+    kv_ptr: u64,
+    r: usize,
+) -> anyhow::Result<(Vec<i32>, Vec<i32>)> {
+    let epoch = EXEC_EPOCH.load(std::sync::atomic::Ordering::Relaxed);
+    let cache_enabled = std::env::var("LUMINAL_FLASHINFER_INDPTR_CACHE").as_deref() != Ok("0");
+    let cache = INDPTR_READBACK.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap();
+    if cache_enabled
+        && let Some(rb) = guard.as_ref()
+        && rb.epoch == epoch
+        && rb.qo_ptr == qo_ptr
+        && rb.kv_ptr == kv_ptr
+        && rb.r == r
+    {
+        return Ok((rb.qo.clone(), rb.kv.clone()));
+    }
+    let mut qo_bytes = vec![0u8; r * std::mem::size_of::<i32>()];
+    let mut kv_bytes = vec![0u8; r * std::mem::size_of::<i32>()];
+    unsafe {
+        result::memcpy_dtoh_async(&mut qo_bytes, qo_ptr, stream.cu_stream())?;
+        result::memcpy_dtoh_async(&mut kv_bytes, kv_ptr, stream.cu_stream())?;
+    }
+    stream.synchronize()?; // the one DtoH sync per step
+    let qo = bytes_to_i32_vec(qo_bytes);
+    let kv = bytes_to_i32_vec(kv_bytes);
+    *guard = Some(IndptrReadback {
+        epoch,
+        qo_ptr,
+        kv_ptr,
+        r,
+        qo: qo.clone(),
+        kv: kv.clone(),
+    });
+    Ok((qo, kv))
+}
 
 static PAGE_LOCKED_WORKSPACE: OnceLock<PageLockedPtr> = OnceLock::new();
 
@@ -332,6 +405,12 @@ impl FlashInferAttention {
         4
     }
 
+    /// The direct-placement forms take up to 7 inputs (explicit indptrs +
+    /// sinks) — more than the 5-input egglog rule arity.
+    pub(crate) fn max_runtime_inputs() -> usize {
+        7
+    }
+
     pub(crate) fn resolve_for_graph(
         &self,
         self_node: NodeIndex,
@@ -346,9 +425,9 @@ impl FlashInferAttention {
         let c = *dyn_map
             .get(&'c')
             .ok_or_else(|| anyhow::anyhow!("FlashInferAttention requires dynamic dim 'c'"))?;
-        if inputs.len() != 4 && inputs.len() != 6 {
+        if inputs.len() != 4 && inputs.len() != 6 && inputs.len() != 7 {
             anyhow::bail!(
-                "FlashInferAttention expects 4 inputs (derived causal decode) or 6 inputs (explicit indptrs), got {}",
+                "FlashInferAttention expects 4 inputs (derived causal decode), 6 (explicit indptrs), or 7 (explicit indptrs + sinks), got {}",
                 inputs.len()
             );
         }
@@ -407,6 +486,26 @@ impl FlashInferAttention {
                 };
                 (Vec::new(), batch_size, None, None)
             };
+        let sinks = if inputs.len() == 7 {
+            if !dtype.supports_prefill() {
+                anyhow::bail!(
+                    "FlashInferAttention sinks require f16/bf16 (sink decode routes through the prefill kernels); got {:?}",
+                    self.dtype
+                );
+            }
+            let sinks_buf = get_buf("sinks", inputs[6])?;
+            anyhow::ensure!(
+                sinks_buf.len() >= self.num_qo_heads * dtype.size_of(),
+                "FlashInferAttention sinks buffer holds {} bytes, need {} ({} heads of {:?})",
+                sinks_buf.len(),
+                self.num_qo_heads * dtype.size_of(),
+                self.num_qo_heads,
+                self.dtype
+            );
+            Some(sinks_buf.ptr())
+        } else {
+            None
+        };
 
         let sm_scale = if self.sm_scale == 0.0 {
             1.0 / (self.head_dim as f32).sqrt()
@@ -427,6 +526,7 @@ impl FlashInferAttention {
                 dtype,
                 sm_scale_bits: sm_scale.to_bits(),
                 window_left: self.window_left as i32,
+                has_sinks: sinks.is_some(),
                 kv_indptr_host,
                 qo_indptr_host: Vec::new(),
             },
@@ -438,6 +538,7 @@ impl FlashInferAttention {
                 output: out_buf.ptr(),
                 explicit_qo_indptr,
                 explicit_kv_indptr,
+                sinks,
             },
         })
     }
@@ -477,7 +578,15 @@ impl FlashInferAttention {
             resolved.ptrs.explicit_kv_indptr
         {
             let r = spec.batch_size + 1;
-            spec.kv_indptr_host = read_device_i32s(kv_indptr_ptr, r)?;
+            if let Some(qo_indptr_ptr) = resolved.ptrs.explicit_qo_indptr {
+                // Both indptrs come from graph inputs: read them together
+                // through the per-step cache (one sync per step, not per layer).
+                let (qo, kv) = read_indptrs_cached(stream, qo_indptr_ptr, kv_indptr_ptr, r)?;
+                spec.qo_indptr_host = qo;
+                spec.kv_indptr_host = kv;
+            } else {
+                spec.kv_indptr_host = read_device_i32s(kv_indptr_ptr, r)?;
+            }
             (None, None)
         } else if is_prefill {
             // Single-sequence prefill: s q tokens attending causally to a
@@ -518,9 +627,9 @@ impl FlashInferAttention {
 
         // Prefill also needs qo_indptr (host for plan, device for run).
         let (owned_qo_indptr, owned_qo_indptr_ptr) = if is_prefill {
-            if let Some(qo_indptr_ptr) = resolved.ptrs.explicit_qo_indptr {
-                let r = spec.batch_size + 1;
-                spec.qo_indptr_host = read_device_i32s(qo_indptr_ptr, r)?;
+            if resolved.ptrs.explicit_qo_indptr.is_some() {
+                // Already read (with kv) through the per-step cache above.
+                debug_assert_eq!(spec.qo_indptr_host.len(), spec.batch_size + 1);
                 (None, None)
             } else {
                 spec.qo_indptr_host = vec![0, spec.total_q_tokens as i32];
@@ -729,32 +838,65 @@ impl PreparedFlashInferDecode {
                 .explicit_qo_indptr
                 .or(self.owned_qo_indptr_ptr)
                 .ok_or_else(|| anyhow::anyhow!("FlashInfer prefill is missing qo_indptr"))?;
-            unsafe {
-                (self.lib.prefill_run)(
-                    self.float_workspace_ptr as *mut std::ffi::c_void,
-                    FLOAT_WORKSPACE_SIZE,
-                    self.int_workspace_ptr as *mut std::ffi::c_void,
-                    plan_info.as_mut_ptr(),
-                    plan_info.len() as i32,
-                    ptrs.q as *mut std::ffi::c_void,
-                    ptrs.k_cache as *mut std::ffi::c_void,
-                    ptrs.v_cache as *mut std::ffi::c_void,
-                    qo_indptr_ptr as *mut i32,
-                    kv_indptr_ptr as *mut i32,
-                    self.indices_ptr as *mut i32,
-                    self.last_page_len_ptr as *mut i32,
-                    run_output_ptr as *mut std::ffi::c_void,
-                    self.spec.total_q_tokens as i32,
-                    self.spec.batch_size as i32,
-                    self.spec.num_qo_heads as i32,
-                    self.spec.num_kv_heads as i32,
-                    self.spec.page_size as i32,
-                    self.spec.head_dim as i32,
-                    self.spec.dtype as i32,
-                    f32::from_bits(self.spec.sm_scale_bits),
-                    self.spec.window_left,
-                    cu_stream,
-                )
+            if let Some(sinks_ptr) = ptrs.sinks {
+                // Sink variant: same prefill dispatch with the per-head sink
+                // logits folded into the softmax denominator in-kernel.
+                unsafe {
+                    (self.lib.prefill_sink_run)(
+                        self.float_workspace_ptr as *mut std::ffi::c_void,
+                        FLOAT_WORKSPACE_SIZE,
+                        self.int_workspace_ptr as *mut std::ffi::c_void,
+                        plan_info.as_mut_ptr(),
+                        plan_info.len() as i32,
+                        ptrs.q as *mut std::ffi::c_void,
+                        ptrs.k_cache as *mut std::ffi::c_void,
+                        ptrs.v_cache as *mut std::ffi::c_void,
+                        qo_indptr_ptr as *mut i32,
+                        kv_indptr_ptr as *mut i32,
+                        self.indices_ptr as *mut i32,
+                        self.last_page_len_ptr as *mut i32,
+                        sinks_ptr as *mut std::ffi::c_void,
+                        run_output_ptr as *mut std::ffi::c_void,
+                        self.spec.total_q_tokens as i32,
+                        self.spec.batch_size as i32,
+                        self.spec.num_qo_heads as i32,
+                        self.spec.num_kv_heads as i32,
+                        self.spec.page_size as i32,
+                        self.spec.head_dim as i32,
+                        self.spec.dtype as i32,
+                        f32::from_bits(self.spec.sm_scale_bits),
+                        self.spec.window_left,
+                        cu_stream,
+                    )
+                }
+            } else {
+                unsafe {
+                    (self.lib.prefill_run)(
+                        self.float_workspace_ptr as *mut std::ffi::c_void,
+                        FLOAT_WORKSPACE_SIZE,
+                        self.int_workspace_ptr as *mut std::ffi::c_void,
+                        plan_info.as_mut_ptr(),
+                        plan_info.len() as i32,
+                        ptrs.q as *mut std::ffi::c_void,
+                        ptrs.k_cache as *mut std::ffi::c_void,
+                        ptrs.v_cache as *mut std::ffi::c_void,
+                        qo_indptr_ptr as *mut i32,
+                        kv_indptr_ptr as *mut i32,
+                        self.indices_ptr as *mut i32,
+                        self.last_page_len_ptr as *mut i32,
+                        run_output_ptr as *mut std::ffi::c_void,
+                        self.spec.total_q_tokens as i32,
+                        self.spec.batch_size as i32,
+                        self.spec.num_qo_heads as i32,
+                        self.spec.num_kv_heads as i32,
+                        self.spec.page_size as i32,
+                        self.spec.head_dim as i32,
+                        self.spec.dtype as i32,
+                        f32::from_bits(self.spec.sm_scale_bits),
+                        self.spec.window_left,
+                        cu_stream,
+                    )
+                }
             }
         } else {
             unsafe {
@@ -836,6 +978,10 @@ pub(crate) fn flashinfer_graph_plan_capacity(actual_c: usize, max_kv_pages: usiz
 }
 
 impl HostOp for FlashInferAttention {
+    fn runtime_input_cap(&self) -> usize {
+        Self::max_runtime_inputs()
+    }
+
     fn execute(
         &self,
         stream: &Arc<CudaStream>,

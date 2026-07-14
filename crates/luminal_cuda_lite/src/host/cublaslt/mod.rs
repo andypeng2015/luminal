@@ -1565,7 +1565,16 @@ impl CuBlasLt {
         )
         .entered();
 
-        const WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+        // Per-matmul cuBLASLt workspace. Defaults to 32 MiB; lower it via
+        // LUMINAL_CUBLASLT_WORKSPACE_MB for memory-tight models, where the sum
+        // of per-node workspaces (one allocation per matmul) is significant.
+        let workspace_size_mb: usize = std::env::var("LUMINAL_CUBLASLT_WORKSPACE_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(32);
+        let workspace_size = workspace_size_mb * 1024 * 1024;
+        #[allow(non_snake_case)]
+        let WORKSPACE_SIZE = workspace_size;
         let c_spec = LtMatrixSpec {
             dtype: c_cuda_dtype,
             rows: m,
@@ -1767,7 +1776,16 @@ impl HostOp for CuBlasLt {
         let cublaslt = self.get_cublaslt(stream)?;
 
         // Allocate workspace (32 MiB)
-        const WORKSPACE_SIZE: usize = 32 * 1024 * 1024;
+        // Per-matmul cuBLASLt workspace. Defaults to 32 MiB; lower it via
+        // LUMINAL_CUBLASLT_WORKSPACE_MB for memory-tight models, where the sum
+        // of per-node workspaces (one allocation per matmul) is significant.
+        let workspace_size_mb: usize = std::env::var("LUMINAL_CUBLASLT_WORKSPACE_MB")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(32);
+        let workspace_size = workspace_size_mb * 1024 * 1024;
+        #[allow(non_snake_case)]
+        let WORKSPACE_SIZE = workspace_size;
         let c_spec = LtMatrixSpec {
             dtype: c_cuda_dtype,
             rows: m,
@@ -1835,6 +1853,10 @@ impl HostOp for CuBlasLt {
 
     fn output_bytes(&self) -> Expression {
         (self.output_size() * self.d_dtype.bits()).ceil_div(8)
+    }
+
+    fn stats_name(&self) -> Option<&'static str> {
+        Some("CuBlasLt")
     }
 }
 
@@ -2089,5 +2111,64 @@ mod tests {
             .iter()
             .map(|(node, ptr)| (*node, DeviceBuffer::new(*ptr, 16)))
             .collect()
+    }
+
+    /// Probe: which A/B dtype combinations does the box's libcublasLt accept
+    /// at the decode projection shape? Answers whether the weight-recast fix
+    /// can use true mixed inputs (f32 x bf16) or must go bf16 x bf16 with f32
+    /// output (the GLUMoE precedent). Run explicitly:
+    ///   cargo test -p luminal_cuda_lite probe_mixed_dtype -- --ignored --nocapture
+    #[test]
+    #[ignore = "probe, run explicitly"]
+    fn probe_mixed_dtype_support() {
+        let Ok(ctx) = crate::cudarc::driver::CudaContext::new(0) else { return };
+        let stream = ctx.default_stream();
+        let cublaslt = std::sync::Arc::new(CudaBlasLT::new(stream.clone()).unwrap());
+        // q_proj decode shape: [1,2880] x [2880,4096]
+        let (m, n, k) = (1u64, 4096u64, 2880u64);
+        let a_buf = stream.alloc_zeros::<u8>((m * k) as usize * 4).unwrap();
+        let b_buf = stream.alloc_zeros::<u8>((k * n) as usize * 4).unwrap();
+        let d_buf = stream.alloc_zeros::<u8>((m * n) as usize * 4).unwrap();
+        let (a, _g1) = a_buf.device_ptr(&stream);
+        let (b, _g2) = b_buf.device_ptr(&stream);
+        let (d, _g3) = d_buf.device_ptr(&stream);
+
+        let mat = |dtype: cudaDataType, rows: u64, cols: u64| LtMatrixSpec {
+            dtype,
+            rows,
+            cols,
+            ld: cols as i64,
+            batch_stride: (rows * cols) as i64,
+            order: cublasLtOrder_t::CUBLASLT_ORDER_ROW,
+        };
+        let combos = [
+            ("f32 x f32   -> f32", cudaDataType::CUDA_R_32F, cudaDataType::CUDA_R_32F),
+            ("f32 x bf16  -> f32", cudaDataType::CUDA_R_32F, cudaDataType::CUDA_R_16BF),
+            ("bf16 x bf16 -> f32", cudaDataType::CUDA_R_16BF, cudaDataType::CUDA_R_16BF),
+        ];
+        for (name, at, bt) in combos {
+            let spec = LtMatmulSpec {
+                problem: LtMatmulProblem { m, n, k, batch_count: 1 },
+                trans_a: cublasOperation_t::CUBLAS_OP_N,
+                trans_b: cublasOperation_t::CUBLAS_OP_N,
+                a: mat(at, m, k),
+                b: mat(bt, k, n),
+                c: mat(cudaDataType::CUDA_R_32F, m, n),
+                d: mat(cudaDataType::CUDA_R_32F, m, n),
+                compute: LtComputeSpec {
+                    compute_type: cublasComputeType_t::CUBLAS_COMPUTE_32F,
+                    scale_dtype: cudaDataType::CUDA_R_32F,
+                    alpha: LtScalar::F32(1.0),
+                    beta: LtScalar::F32(0.0),
+                    epilogue: cublasLtEpilogue_t::CUBLASLT_EPILOGUE_DEFAULT,
+                },
+                workspace_size: 1024 * 1024,
+            };
+            let ptrs = LtMatmulPointers { a, b, c: d, d, bias: None, a_scale: None, b_scale: None };
+            match prepare_cublaslt_matmul(&stream, &cublaslt, &spec, ptrs) {
+                Ok(_) => eprintln!("{name}: SUPPORTED (heuristic returned an algorithm)"),
+                Err(e) => eprintln!("{name}: NOT SUPPORTED ({e})"),
+            }
+        }
     }
 }
