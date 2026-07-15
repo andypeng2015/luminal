@@ -1,31 +1,93 @@
-; SinkAttention rewrite: paged sink-attention (gpt-oss) → FA3 host op.
+; SinkAttention rewrite: paged sink-attention (gpt-oss) -> FA3 host op.
 ;
 ; Matches the paged GQA attention chain WITH attention sinks:
-;   Scatter(K,V bf16 pools) → Gather(context) → cast F32 → Q·K^T → scale →
-;   add OPAQUE host mask → row-max → max(row_max, sink) (lt-select spelling) →
-;   exp2 / Σ → denominator + exp2(sink - max) → P·V → (nheads, s, hd) out
+;   Scatter(K,V bf16 pools) -> Gather(context) -> cast F32 -> Q.K^T -> scale ->
+;   masked add -> row-max -> max(row_max, sink) (lt-select spelling) ->
+;   exp2 / sum -> denominator + exp2(sink - max) -> P.V -> (nheads, s, hd) out
 ;
-; Design decisions (paged_llama-style "option 3"):
-; - The mask is a host-built Input tensor captured as a PROOF-ONLY anchor;
-;   its causal/window/isolation semantics are NOT proven structurally. The
-;   engine builds the mask and the qo/kv indptrs from the same batch entries,
-;   so they cannot drift (pinned by an engine test on the serve side).
-; - Which mask input feeds the add ("mask_sliding" vs "mask_full") selects
-;   the op's window_left (127 = gpt-oss SLIDING_WINDOW-1, vs -1) — two thin
-;   op rules below pin the Input NAME.
+; Masking design (hybrid):
+; - Causal + cross-sequence isolation arrive as ONE host-built mask Input,
+;   captured as a PROOF-ONLY anchor (its semantics are pinned by the engine
+;   building mask and qo/kv indptrs from the same batch entries, plus an
+;   engine test).
+; - The sliding window is IN-GRAPH (LessThan(k_pos, q_abs - (W-1)) * -1e30
+;   added on top of the base mask): the window constant is read out of the
+;   graph, so sliding-vs-full is STRUCTURALLY proven, and sliding layers
+;   differ structurally from full layers -- which drives loop rolling to the
+;   two-layer block, keeping per-slot masks loop-invariant (they inline via
+;   LoopInputStatic) so this rule matches inside rolled bodies. NOTE: the
+;   period-2 roll needs >= 3 block occurrences, i.e. >= 6 layers; tests below
+;   that depth see different rolling regimes.
 ; - qo_indptr / kv_indptr are free-floating named Inputs (single instance
-;   each — a size-1 join), wired into the op as runtime inputs.
-; - The big join is staged into the sa_island fact in kernel_fuse_late_pre
-;   (the gemma lesson: inlined mask/softmax atoms cross-product across rolled
-;   layer instances in fuse-late).
+;   each -- a size-1 join), wired into the op as runtime inputs.
 ;
-; Depends on relations declared in flashinfer_attention.egg (always loaded —
-; the FlashInferAttention op is registered unconditionally): const_like,
-; flashinfer_head_dim_ok_16bit.
+; Staging (rulesets run once each, in order: _pre -> late x3 -> late2):
+;   sa_masked producers (_pre) -> sa_island fact (kernel_fuse_late) ->
+;   op rule (kernel_fuse_late2).
+;
+; Depends on relations declared in flashinfer_attention.egg (always loaded):
+; const_like, flashinfer_head_dim_ok_16bit.
 
-; (out, q_bf16, k_pool, v_pool, flat_gather_idx, sinks_f32, mask,
-;  nheads, kvdim, hdim, scale)
-(relation sa_island (IR IR IR IR IR IR IR Expression Expression Expression f64))
+; (masked, scores, scale_val, window_left): the masked-scores node, the raw
+; scores it was built from, the softmax scale constant, and the window
+; (-1.0 = full attention).
+(relation sa_masked (IR IR f64 f64))
+
+; Full attention: masked = scaled_scores + host_mask.
+(rule
+    (
+        (= ?masked (Op (Add ?m_s ?m_a ?m_b ?m_o)
+            (ICons ?scaled (ICons ?mask (INil)))))
+        (= ?scaled (Op (Mul ?sc_s ?sc_a ?sc_b ?sc_o)
+            (ICons ?scores (ICons ?scale_c (INil)))))
+        (const_like ?scale_c ?scale_val)
+        (= ?mask (Input ?mask_idx ?mask_name (F32)))
+    )
+    (
+        (sa_masked ?masked ?scores ?scale_val -1.0)
+    )
+    :ruleset kernel_fuse_late_pre
+    :name "SinkAttention masked fact (full)"
+)
+
+; Sliding window: masked = (scaled_scores + host_mask) + window_term, where
+; window_term = Cast(LessThan(k_pos, q_abs - W1)) * -1e30 and W1 is the
+; in-graph window constant (gpt-oss: 127 = SLIDING_WINDOW - 1, exactly
+; FlashInfer's window_left convention).
+(rule
+    (
+        (= ?masked (Op (Add ?o_s ?o_a ?o_b ?o_o)
+            (ICons ?base (ICons ?wterm (INil)))))
+        (= ?base (Op (Add ?b_s ?b_a ?b_b ?b_o)
+            (ICons ?scaled (ICons ?mask (INil)))))
+        (= ?scaled (Op (Mul ?sc_s ?sc_a ?sc_b ?sc_o)
+            (ICons ?scores (ICons ?scale_c (INil)))))
+        (const_like ?scale_c ?scale_val)
+        (= ?mask (Input ?mask_idx ?mask_name (F32)))
+        (= ?wterm (Op (Mul ?w_s ?w_a ?w_b ?w_o)
+            (ICons ?past_f (ICons ?negbig (INil)))))
+        (const_like ?negbig ?negbig_val)
+        (< ?negbig_val -900000000000000000000000000000.0)
+        (= ?past_f (Op (Cast ?pc_sz (F32)) (ICons ?past (INil))))
+        (= ?past (Op (LessThan ?lt_s ?lt_a ?lt_b ?lt_o)
+            (ICons ?k_posf (ICons ?wstart (INil)))))
+        (= ?wstart (Op (Add ?ws_s ?ws_a ?ws_b ?ws_o)
+            (ICons ?q_absf (ICons ?negw (INil)))))
+        (= ?negw (Op (Mul ?nw_s ?nw_a ?nw_b ?nw_o)
+            (ICons ?wconst (ICons ?negone1 (INil)))))
+        (const_like ?wconst ?window_val)
+        (const_like ?negone1 -1.000000)
+    )
+    (
+        (sa_masked ?masked ?scores ?scale_val ?window_val)
+    )
+    :ruleset kernel_fuse_late_pre
+    :name "SinkAttention masked fact (sliding window)"
+)
+
+; (out, q_bf16, k_pool, v_pool, flat_gather_idx, sinks_f32,
+;  nheads, kvdim, hdim, scale, window_left)
+(relation sa_island (IR IR IR IR IR IR Expression Expression Expression f64 f64))
 
 (rule
     (
@@ -64,12 +126,8 @@
             (ICons ?qk (INil))))
         (flashinfer_head_dim_ok_16bit ?hdim)
 
-        ; ── Scale, then the opaque host mask add (proof-only capture) ──
-        (= ?scaled (Op (Mul ?sc_shape ?sc_a ?sc_b ?sc_o)
-            (ICons ?scores (ICons ?scale_c (INil)))))
-        (const_like ?scale_c ?scale_val)
-        (= ?masked (Op (Add ?m_shape ?m_a ?m_b ?m_o)
-            (ICons ?scaled (ICons ?mask (INil)))))
+        ; ── Masked scores: staged fact (full or sliding-window shape) ──
+        (sa_masked ?masked ?scores ?scale_val ?window_val)
 
         ; ── Row max, then max(row_max, sink) in the lt-select spelling ──
         (= ?rmax (Op (Max ?rm_shape (MVar "c") ?rm_in ?rm_iter ?rm_out)
@@ -131,49 +189,29 @@
             (ICons ?pv (INil))))
     )
     (
-        (sa_island ?out ?q_bf ?k_pool ?v_pool ?flat_gidx ?sinks_f ?mask
-            ?nheads ?kvdim ?hdim ?scale_val)
+        (sa_island ?out ?q_bf ?k_pool ?v_pool ?flat_gidx ?sinks_f
+            ?nheads ?kvdim ?hdim ?scale_val ?window_val)
     )
-    :ruleset kernel_fuse_late_pre
+    :ruleset kernel_fuse_late
     :name "SinkAttention island fact"
 )
 
-; ── Op rules: the captured mask's INPUT NAME selects window_left ──
+; ── Op rule: window_left proven from the graph (sa_masked) ──
 
 (rule
     (
-        (sa_island ?out ?q ?kp ?vp ?g ?s ?mask ?nheads ?kvdim ?hdim ?scale_val)
-        (= ?mask (Input ?mask_idx "mask_sliding" (F32)))
+        (sa_island ?out ?q ?kp ?vp ?g ?s ?nheads ?kvdim ?hdim ?scale_val ?window_val)
         (= ?qoi (Input ?qo_idx "qo_indptr" (Int)))
         (= ?kvi (Input ?kv_idx "kv_indptr" (Int)))
     )
     (
         (let ?fi (Op (SinkAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MVar "s") ?scale_val 127.0)
+            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MVar "s") ?scale_val ?window_val)
             (ICons ?q (ICons ?kp (ICons ?vp (ICons ?g
                 (ICons ?qoi (ICons ?kvi (ICons ?s (INil))))))))))
         (union ?out ?fi)
         (set (dtype ?fi) (F32))
     )
     :ruleset kernel_fuse_late2
-    :name "SinkAttention sliding-window op"
-)
-
-(rule
-    (
-        (sa_island ?out ?q ?kp ?vp ?g ?s ?mask ?nheads ?kvdim ?hdim ?scale_val)
-        (= ?mask (Input ?mask_idx "mask_full" (F32)))
-        (= ?qoi (Input ?qo_idx "qo_indptr" (Int)))
-        (= ?kvi (Input ?kv_idx "kv_indptr" (Int)))
-    )
-    (
-        (let ?fi (Op (SinkAttention
-            ?nheads (MDiv ?kvdim ?hdim) ?hdim (MVar "s") ?scale_val -1.0)
-            (ICons ?q (ICons ?kp (ICons ?vp (ICons ?g
-                (ICons ?qoi (ICons ?kvi (ICons ?s (INil))))))))))
-        (union ?out ?fi)
-        (set (dtype ?fi) (F32))
-    )
-    :ruleset kernel_fuse_late2
-    :name "SinkAttention full-attention op"
+    :name "SinkAttention op"
 )
