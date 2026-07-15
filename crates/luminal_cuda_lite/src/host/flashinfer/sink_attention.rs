@@ -37,6 +37,40 @@ use super::{
     flashinfer_workspaces,
 };
 
+/// Per-tick FA3 plan cache. Within one engine tick every layer's
+/// SinkAttention sees the same indptrs, so the two DtoH indptr reads and the
+/// host-side plan need to run once per tick, not once per layer (36x). Tick
+/// boundaries are detected structurally: node indices are unique within one
+/// graph execution, so a repeating node index means the graph is running
+/// again (next tick, or the next profiling trial) and the cache refreshes.
+/// The indptr buffer pointers are part of the key so interleaved graphs
+/// (tests, multi-engine) can't cross-hit.
+struct TickPlanCache {
+    seen_nodes: FxHashMap<usize, ()>,
+    qo_ptr: u64,
+    kv_ptr: u64,
+    /// Sorted dyn-dim snapshot. Guards graph switches that reuse the same
+    /// input buffers without repeating a node — concretely, the first real
+    /// tick after schedule search, which would otherwise reuse the last
+    /// profiling trial's plan (dummy indptrs) with real data.
+    dyn_key: Vec<(char, usize)>,
+    qo_indptr: Vec<i32>,
+    kv_indptr: Vec<i32>,
+    plan_info: [i64; 16],
+    plan_info_len: i32,
+}
+
+static TICK_PLAN: std::sync::Mutex<Option<TickPlanCache>> = std::sync::Mutex::new(None);
+
+/// Grow-only device scratch (q transpose in, kernel output out), reused
+/// across calls instead of a per-call alloc + trailing sync. Stream-ordered
+/// reuse on the same stream is safe; on a stream change (tests) the old
+/// buffers are leaked rather than dropped, since their context may be gone
+/// and in-flight kernels may still read them. Bounded by the largest tick
+/// (~1 MiB at s=128), so leaking on replace/grow costs nothing real.
+static SCRATCH: std::sync::Mutex<Option<(usize, crate::cudarc::driver::CudaSlice<u8>)>> =
+    std::sync::Mutex::new(None);
+
 #[derive(Debug)]
 pub struct SinkAttention {
     pub num_qo_heads: usize,
@@ -199,83 +233,133 @@ impl HostOp for SinkAttention {
 
         let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
 
-        // Read the indptrs back to the host: the FA3 plan is host-side.
-        // Two tiny DtoH syncs per layer per tick — correctness-first v1.
-        let read_device_i32s = |b: DeviceBuffer| -> anyhow::Result<Vec<i32>> {
-            let mut host_bytes = vec![0u8; b.len()];
-            unsafe {
-                result::memcpy_dtoh_async(&mut host_bytes, b.ptr(), stream.cu_stream())?;
-            }
+        let lib = jit::ensure_compiled_fa3(self.head_dim, self.window_left >= 0);
+        let (_float_ws, float_ws_ptr, _int_ws, int_ws_ptr) = flashinfer_workspaces(stream);
+
+        // Plan once per tick (see TickPlanCache): sliding and full layers use
+        // different .so variants, but the plan is window-independent and both
+        // variants compile the identical PrefillSM90Plan, so one plan serves
+        // all 36 layers.
+        let self_idx = self_node.index();
+        let mut dyn_key: Vec<(char, usize)> = _dyn_map.iter().map(|(&k, &v)| (k, v)).collect();
+        dyn_key.sort_unstable();
+        let mut plan_guard = TICK_PLAN.lock().unwrap_or_else(|e| e.into_inner());
+        let reuse = plan_guard.as_ref().is_some_and(|c| {
+            c.qo_ptr == qo_indptr_buf.ptr()
+                && c.kv_ptr == kv_indptr_buf.ptr()
+                && c.dyn_key == dyn_key
+                && !c.seen_nodes.contains_key(&self_idx)
+        });
+        if !reuse {
+            // The plan rewrites the shared page-locked host buffer; sync so
+            // the PREVIOUS plan's async HtoD out of that buffer (and any
+            // kernels still reading scratch we're about to reuse) are done.
             stream.synchronize()?;
-            Ok(bytes_to_i32_vec(host_bytes))
-        };
-        let mut qo_indptr = read_device_i32s(qo_indptr_buf)?;
-        let mut kv_indptr = read_device_i32s(kv_indptr_buf)?;
-        anyhow::ensure!(
-            qo_indptr.len() == kv_indptr.len() && qo_indptr.len() >= 2,
-            "SinkAttention: malformed indptrs (qo len {}, kv len {})",
-            qo_indptr.len(),
-            kv_indptr.len()
-        );
-        let batch_size = qo_indptr.len() - 1;
-        let nnz_qo = *qo_indptr.last().unwrap() as usize;
-        let total_pages = *kv_indptr.last().unwrap() as usize;
+
+            let read_device_i32s = |b: DeviceBuffer| -> anyhow::Result<Vec<i32>> {
+                let mut host_bytes = vec![0u8; b.len()];
+                unsafe {
+                    result::memcpy_dtoh_async(&mut host_bytes, b.ptr(), stream.cu_stream())?;
+                }
+                stream.synchronize()?;
+                Ok(bytes_to_i32_vec(host_bytes))
+            };
+            let mut qo_indptr = read_device_i32s(qo_indptr_buf)?;
+            let mut kv_indptr = read_device_i32s(kv_indptr_buf)?;
+            anyhow::ensure!(
+                qo_indptr.len() == kv_indptr.len() && qo_indptr.len() >= 2,
+                "SinkAttention: malformed indptrs (qo len {}, kv len {})",
+                qo_indptr.len(),
+                kv_indptr.len()
+            );
+            let batch_size = qo_indptr.len() - 1;
+            let nnz_qo = *qo_indptr.last().unwrap() as usize;
+            // page_size = 1: per-sequence kv length in tokens == pages.
+            let mut kv_len_arr: Vec<i32> = kv_indptr.windows(2).map(|w| w[1] - w[0]).collect();
+
+            let page_locked = PAGE_LOCKED_WORKSPACE.get_or_init(|| unsafe {
+                let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+                let status = libc::posix_memalign(&mut ptr, 4096, INT_WORKSPACE_SIZE);
+                assert_eq!(status, 0, "Failed to allocate page-locked workspace");
+                let cuda_status = cuda_pin_memory(ptr, INT_WORKSPACE_SIZE);
+                assert_eq!(cuda_status, 0, "Failed to pin memory");
+                PageLockedPtr(ptr as *mut u8)
+            });
+
+            let mut plan_info = [0i64; 16];
+            let mut plan_info_len: i32 = 0;
+            let plan_ret = unsafe {
+                (lib.prefill_plan)(
+                    float_ws_ptr as *mut std::ffi::c_void,
+                    super::FLOAT_WORKSPACE_SIZE,
+                    int_ws_ptr as *mut std::ffi::c_void,
+                    page_locked.0 as *mut std::ffi::c_void,
+                    INT_WORKSPACE_SIZE,
+                    qo_indptr.as_mut_ptr(),
+                    kv_indptr.as_mut_ptr(),
+                    kv_len_arr.as_mut_ptr(),
+                    nnz_qo as i32,
+                    batch_size as i32,
+                    self.num_qo_heads as i32,
+                    self.num_kv_heads as i32,
+                    /*page_size=*/ 1,
+                    /*causal=*/ 1,
+                    cu_stream,
+                    plan_info.as_mut_ptr(),
+                    &mut plan_info_len,
+                )
+            };
+            anyhow::ensure!(plan_ret == 0, "SinkAttention: fa3 plan failed ({plan_ret})");
+
+            let mut seen_nodes = FxHashMap::default();
+            seen_nodes.insert(self_idx, ());
+            *plan_guard = Some(TickPlanCache {
+                seen_nodes,
+                qo_ptr: qo_indptr_buf.ptr(),
+                kv_ptr: kv_indptr_buf.ptr(),
+                dyn_key,
+                qo_indptr,
+                kv_indptr,
+                plan_info,
+                plan_info_len,
+            });
+        } else {
+            plan_guard.as_mut().unwrap().seen_nodes.insert(self_idx, ());
+        }
+        let cache = plan_guard.as_ref().unwrap();
+        let nnz_qo = *cache.qo_indptr.last().unwrap() as usize;
+        let total_pages = *cache.kv_indptr.last().unwrap() as usize;
         anyhow::ensure!(
             kv_indices.len() >= total_pages * std::mem::size_of::<i32>(),
             "SinkAttention: kv_indices buffer smaller than kv_indptr total"
         );
-        // page_size = 1: per-sequence kv length in tokens == pages.
-        let mut kv_len_arr: Vec<i32> = kv_indptr.windows(2).map(|w| w[1] - w[0]).collect();
+        let mut plan_info = cache.plan_info;
+        let plan_info_len = cache.plan_info_len;
 
-        let lib = jit::ensure_compiled_fa3(self.head_dim, self.window_left >= 0);
-        let (_float_ws, float_ws_ptr, _int_ws, int_ws_ptr) = flashinfer_workspaces(stream);
-        let page_locked = PAGE_LOCKED_WORKSPACE.get_or_init(|| unsafe {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let status = libc::posix_memalign(&mut ptr, 4096, INT_WORKSPACE_SIZE);
-            assert_eq!(status, 0, "Failed to allocate page-locked workspace");
-            let cuda_status = cuda_pin_memory(ptr, INT_WORKSPACE_SIZE);
-            assert_eq!(cuda_status, 0, "Failed to pin memory");
-            PageLockedPtr(ptr as *mut u8)
-        });
-
-        let mut plan_info = [0i64; 16];
-        let mut plan_info_len: i32 = 0;
-        let plan_ret = unsafe {
-            (lib.prefill_plan)(
-                float_ws_ptr as *mut std::ffi::c_void,
-                super::FLOAT_WORKSPACE_SIZE,
-                int_ws_ptr as *mut std::ffi::c_void,
-                page_locked.0 as *mut std::ffi::c_void,
-                INT_WORKSPACE_SIZE,
-                qo_indptr.as_mut_ptr(),
-                kv_indptr.as_mut_ptr(),
-                kv_len_arr.as_mut_ptr(),
-                nnz_qo as i32,
-                batch_size as i32,
-                self.num_qo_heads as i32,
-                self.num_kv_heads as i32,
-                /*page_size=*/ 1,
-                /*causal=*/ 1,
-                cu_stream,
-                plan_info.as_mut_ptr(),
-                &mut plan_info_len,
-            )
-        };
-        anyhow::ensure!(plan_ret == 0, "SinkAttention: fa3 plan failed ({plan_ret})");
-
-        // Kernel-native (s, heads, dim) bf16 scratch, then fused
-        // transpose+upcast into the (heads, s, dim) F32 output buffer.
+        // Kernel-native (s, heads, dim) bf16 scratch (front half: transposed
+        // q in, back half: kernel out), from the grow-only pool. Reuse is
+        // stream-ordered; the refresh-path sync above covers growth.
         let temp_bytes = (nnz_qo * self.num_qo_heads * self.head_dim * 2).max(1);
-        let temp = unsafe { stream.alloc::<u8>(temp_bytes)? };
-        let temp_ptr = temp.device_ptr(stream).0;
+        let mut scratch_guard = SCRATCH.lock().unwrap_or_else(|e| e.into_inner());
+        let stream_key = stream.cu_stream() as usize;
+        let needs_new = !matches!(&*scratch_guard,
+            Some((key, buf)) if *key == stream_key && buf.len() >= 2 * temp_bytes);
+        if needs_new {
+            stream.synchronize()?; // in-flight users of the old scratch
+            let buf = unsafe { stream.alloc::<u8>((2 * temp_bytes).next_power_of_two())? };
+            if let Some((_, old)) = scratch_guard.take() {
+                std::mem::forget(old); // context may be gone; never free
+            }
+            *scratch_guard = Some((stream_key, buf));
+        }
+        let base_ptr = scratch_guard.as_ref().unwrap().1.device_ptr(stream).0;
+        let (q_temp_ptr, temp_ptr) = (base_ptr, base_ptr + temp_bytes as u64);
 
         // The graph's q is (heads, s, dim) — the same heads-major layout
         // world as the output point — but the kernel reads token-major
         // (s, heads, dim) q. The layouts are byte-identical at s == 1
         // (decode), which is how this survived every single-token path;
         // prefill (s > 1) needs the transpose.
-        let q_temp = unsafe { stream.alloc::<u8>(temp_bytes)? };
-        let q_temp_ptr = q_temp.device_ptr(stream).0;
         let qtr_ret = unsafe {
             (lib.transpose_q_bf16)(
                 q.ptr() as *const std::ffi::c_void,
@@ -333,8 +417,9 @@ impl HostOp for SinkAttention {
         };
         anyhow::ensure!(tr_ret == 0, "SinkAttention: output transpose failed");
 
-        // The temp scratch must outlive the async kernels enqueued above.
-        stream.synchronize()?;
+        // No trailing sync: scratch is pooled (never freed), so the enqueued
+        // kernels own it under stream ordering; the next tick's plan-refresh
+        // path syncs before touching shared host buffers or growing scratch.
         Ok(())
     }
 
