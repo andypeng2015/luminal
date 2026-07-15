@@ -228,6 +228,15 @@ pub type Fa3TransposeF32Fn = unsafe extern "C" fn(
     stream: *mut c_void,
 ) -> i32;
 
+pub type Fa3TransposeQFn = unsafe extern "C" fn(
+    src: *const c_void,
+    dst: *mut c_void,
+    batch: i32,
+    heads: i32,
+    dim: i32,
+    stream: *mut c_void,
+) -> i32;
+
 // ── Embedded CUDA sources ──
 
 const WRAPPER_CU: &str = include_str!("wrapper.cu");
@@ -327,6 +336,7 @@ pub struct Fa3Lib {
     pub prefill_plan: Fa3PrefillPlanFn,
     pub prefill_run: Fa3PrefillRunFn,
     pub transpose_output_f32: Fa3TransposeF32Fn,
+    pub transpose_q_bf16: Fa3TransposeQFn,
 }
 
 // SAFETY: same rationale as FlashInferLib — process-lifetime pointers, calls
@@ -373,14 +383,16 @@ impl Fa3Lib {
             unsafe { *lib.get::<Fa3PrefillPlanFn>(b"flashinfer_fa3_prefill_plan\0")? };
         let prefill_run: Fa3PrefillRunFn =
             unsafe { *lib.get::<Fa3PrefillRunFn>(b"flashinfer_fa3_prefill_run\0")? };
-        let transpose_output_f32: Fa3TransposeF32Fn = unsafe {
-            *lib.get::<Fa3TransposeF32Fn>(b"flashinfer_fa3_transpose_output_f32\0")?
-        };
+        let transpose_output_f32: Fa3TransposeF32Fn =
+            unsafe { *lib.get::<Fa3TransposeF32Fn>(b"flashinfer_fa3_transpose_output_f32\0")? };
+        let transpose_q_bf16: Fa3TransposeQFn =
+            unsafe { *lib.get::<Fa3TransposeQFn>(b"flashinfer_fa3_transpose_q_bf16\0")? };
         Ok(Self {
             _lib: lib,
             prefill_plan,
             prefill_run,
             transpose_output_f32,
+            transpose_q_bf16,
         })
     }
 }

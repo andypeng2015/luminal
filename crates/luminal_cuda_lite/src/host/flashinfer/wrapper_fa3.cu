@@ -390,3 +390,33 @@ extern "C" int flashinfer_fa3_transpose_output_f32(
         (const __nv_bfloat16*)src, (float*)dst, batch, heads, dim);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
+
+// ── Q input transpose: (heads, s, dim) bf16 → (s, heads, dim) bf16 ──
+// The graph's q chain lives in the same heads-major layout world as the
+// output point above, but the kernel reads token-major q (q_stride_n =
+// heads*dim). The two layouts are byte-identical at s == 1, so decode and
+// single-token paths never expose the difference — prefill (s > 1) does.
+
+__global__ void fa3_transpose_q_kernel(
+    const __nv_bfloat16* src, __nv_bfloat16* dst, int batch, int heads, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * heads * dim;
+    if (idx >= total) return;
+    int d = idx % dim;
+    int h = (idx / dim) % heads;
+    int b = idx / (heads * dim);
+    dst[idx] = src[h * batch * dim + b * dim + d];
+}
+
+extern "C" int flashinfer_fa3_transpose_q_bf16(
+    const void* src, void* dst,
+    int batch, int heads, int dim,
+    cudaStream_t stream) {
+    int total = batch * heads * dim;
+    if (total == 0) return 0;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    fa3_transpose_q_kernel<<<blocks, threads, 0, stream>>>(
+        (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, batch, heads, dim);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}

@@ -68,4 +68,11 @@ int flashinfer_fa3_transpose_output_f32(
     int batch, int heads, int dim,
     cudaStream_t stream);
 
+// (heads, s, dim) bf16 → (s, heads, dim) bf16: graph-layout q into the
+// kernel-native token-major layout `flashinfer_fa3_prefill_run` expects.
+int flashinfer_fa3_transpose_q_bf16(
+    const void* src, void* dst,
+    int batch, int heads, int dim,
+    cudaStream_t stream);
+
 } // extern "C"

@@ -269,6 +269,28 @@ impl HostOp for SinkAttention {
         let temp = unsafe { stream.alloc::<u8>(temp_bytes)? };
         let temp_ptr = temp.device_ptr(stream).0;
 
+        // The graph's q is (heads, s, dim) — the same heads-major layout
+        // world as the output point — but the kernel reads token-major
+        // (s, heads, dim) q. The layouts are byte-identical at s == 1
+        // (decode), which is how this survived every single-token path;
+        // prefill (s > 1) needs the transpose.
+        let q_temp = unsafe { stream.alloc::<u8>(temp_bytes)? };
+        let q_temp_ptr = q_temp.device_ptr(stream).0;
+        let qtr_ret = unsafe {
+            (lib.transpose_q_bf16)(
+                q.ptr() as *const std::ffi::c_void,
+                q_temp_ptr as *mut std::ffi::c_void,
+                nnz_qo as i32,
+                self.num_qo_heads as i32,
+                self.head_dim as i32,
+                cu_stream,
+            )
+        };
+        anyhow::ensure!(
+            qtr_ret == 0,
+            "SinkAttention: q transpose failed ({qtr_ret})"
+        );
+
         let sm_scale = if self.sm_scale == 0.0 {
             1.0 / (self.head_dim as f32).sqrt()
         } else {
@@ -279,7 +301,7 @@ impl HostOp for SinkAttention {
                 int_ws_ptr as *mut std::ffi::c_void,
                 plan_info.as_mut_ptr(),
                 plan_info_len,
-                q.ptr() as *mut std::ffi::c_void,
+                q_temp_ptr as *mut std::ffi::c_void,
                 k_pool.ptr() as *mut std::ffi::c_void,
                 v_pool.ptr() as *mut std::ffi::c_void,
                 kv_indices.ptr() as *mut i32,
@@ -389,6 +411,18 @@ mod tests {
             }
         }
 
+        // The op contract takes GRAPH-layout q — (heads, s, dim), the layout
+        // the compiled graph produces — while the oracle and kernel work in
+        // token-major. Feeding heads-major here is what pins the op's
+        // internal q transpose (identical layouts at s == 1 would hide it).
+        let mut q_hbd = vec![0.0f32; q.len()];
+        for b in 0..total_qo {
+            for h in 0..nq {
+                let src = &q[(b * nq + h) * HEAD_DIM..][..HEAD_DIM];
+                q_hbd[(h * total_qo + b) * HEAD_DIM..][..HEAD_DIM].copy_from_slice(src);
+            }
+        }
+
         // Slot pool with a scattered layout (pool 2x the context; logical
         // token i at slot 2i+1 — non-contiguous like the real engine).
         let row = nkv * HEAD_DIM;
@@ -411,7 +445,7 @@ mod tests {
         }
 
         let up_bytes = |b: &[u8]| stream.clone_htod(b).unwrap();
-        let d_q = up_bytes(&to_bf16_bytes(&q));
+        let d_q = up_bytes(&to_bf16_bytes(&q_hbd));
         let d_k = up_bytes(&to_bf16_bytes(&k_pool));
         let d_v = up_bytes(&to_bf16_bytes(&v_pool));
         let d_idx = stream.clone_htod(&kv_indices_host).unwrap();
