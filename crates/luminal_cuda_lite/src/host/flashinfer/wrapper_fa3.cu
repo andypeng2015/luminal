@@ -360,3 +360,33 @@ int flashinfer_fa3_prefill_run(
 }
 
 } // extern "C"
+
+// ── Output transpose + upcast: (s, heads, dim) bf16 → (heads, s, dim) f32 ──
+// The kernel writes NHD; luminal's attention chain point being replaced is
+// (heads, s, dim) in F32 (the graph computes attention in F32 and o_proj
+// casts weights up). Fusing the layout change and the upcast into one pass
+// keeps the host-op boundary a single kernel.
+
+__global__ void fa3_transpose_upcast_kernel(
+    const __nv_bfloat16* src, float* dst, int batch, int heads, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = batch * heads * dim;
+    if (idx >= total) return;
+    int d = idx % dim;
+    int h = (idx / dim) % heads;
+    int b = idx / (heads * dim);
+    dst[h * batch * dim + b * dim + d] = __bfloat162float(src[idx]);
+}
+
+extern "C" int flashinfer_fa3_transpose_output_f32(
+    const void* src, void* dst,
+    int batch, int heads, int dim,
+    cudaStream_t stream) {
+    int total = batch * heads * dim;
+    if (total == 0) return 0;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    fa3_transpose_upcast_kernel<<<blocks, threads, 0, stream>>>(
+        (const __nv_bfloat16*)src, (float*)dst, batch, heads, dim);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}

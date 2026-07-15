@@ -1,6 +1,7 @@
 pub mod fa3;
 pub mod find_indptrs;
 pub mod jit;
+pub mod sink_attention;
 #[cfg(test)]
 pub(crate) mod test_ref;
 

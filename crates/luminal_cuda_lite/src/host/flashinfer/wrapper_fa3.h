@@ -62,4 +62,10 @@ int flashinfer_fa3_prefill_run(
     float sm_scale, int window_left, int causal,
     cudaStream_t stream);
 
+// (s, heads, dim) bf16 → (heads, s, dim) f32, one fused pass.
+int flashinfer_fa3_transpose_output_f32(
+    const void* src, void* dst,
+    int batch, int heads, int dim,
+    cudaStream_t stream);
+
 } // extern "C"
