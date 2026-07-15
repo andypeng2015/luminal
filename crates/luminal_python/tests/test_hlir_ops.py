@@ -2281,9 +2281,12 @@ def test_scatter_elements(device: torch.device):
     model: torch.nn.Module = ScatterElementsTestModel().to(device)
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], device=device)
+    x_before = x.clone()
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
     assert torch.allclose(output, original)
+    # In-place scatter candidates must never write into caller memory.
+    assert torch.equal(x, x_before)
 
 
 def test_scatter_elements_axis0(device: torch.device):
@@ -2291,9 +2294,12 @@ def test_scatter_elements_axis0(device: torch.device):
     model: torch.nn.Module = ScatterElementsAxis0TestModel().to(device)
     model_compiled: Callable = torch.compile(model, backend=luminal_backend)
     x: torch.Tensor = torch.tensor([[1.0, 2.0, 3.0], [4.0, 5.0, 6.0]], device=device)
+    x_before = x.clone()
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
     assert torch.allclose(output, original)
+    # In-place scatter candidates must never write into caller memory.
+    assert torch.equal(x, x_before)
 
 
 # ========== ScatterND Tests ==========
@@ -2306,9 +2312,12 @@ def test_scatter_nd(device: torch.device):
     x: torch.Tensor = torch.tensor(
         [[1.0, 2.0, 3.0], [4.0, 5.0, 6.0], [7.0, 8.0, 9.0]], device=device
     )
+    x_before = x.clone()
     original: torch.Tensor = model(x)
     output: torch.Tensor = model_compiled(x)
     assert torch.allclose(output, original)
+    # In-place scatter candidates must never write into caller memory.
+    assert torch.equal(x, x_before)
 
 
 # ========== Bool-mask index_put correctness tests ==========

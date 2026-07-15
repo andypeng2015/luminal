@@ -1842,8 +1842,58 @@ impl CudaRuntime {
         }
     }
 
+    /// In-place ops (output_aliases_input) write into their alias target's
+    /// buffer. When that target is an external pointer (a caller-owned tensor,
+    /// e.g. a zero-copy torch input), writing would mutate caller memory -
+    /// replace it with an owned device copy first. The copy is the same cost
+    /// the op's non-in-place variant would pay.
+    fn own_external_inplace_targets(&mut self, bucket_idx: usize) {
+        let mut to_own: Vec<NodeIndex> = Vec::new();
+        {
+            let bucket = &self.compiled_buckets[bucket_idx];
+            for target in bucket.output_alias_map.values() {
+                let mut node = *target;
+                let mut visited = FxHashSet::default();
+                while let Some(next) = bucket.output_alias_map.get(&node) {
+                    if !visited.insert(node) {
+                        break;
+                    }
+                    node = *next;
+                }
+                if let Some(hlir_node) = bucket.llir_to_hlir.get(&node)
+                    && matches!(self.hlir_buffers.get(hlir_node), Some(CudaInput::Ptr(_)))
+                {
+                    to_own.push(*hlir_node);
+                }
+            }
+        }
+        for hlir_node in to_own {
+            let Some(ext) = self.external_buffers.get(&hlir_node) else {
+                continue;
+            };
+            let len = ext.len();
+            let src_ptr = ext.device_ptr(&self.cuda_stream).0;
+            let owned = self.cuda_stream.alloc_zeros::<u8>(len).unwrap();
+            unsafe {
+                result::memcpy_dtod_async(
+                    owned.device_ptr(&self.cuda_stream).0,
+                    src_ptr,
+                    len,
+                    self.cuda_stream.cu_stream(),
+                )
+                .expect("cuMemcpyDtoDAsync failed");
+            }
+            self.cuda_stream.synchronize().unwrap();
+            self.external_buffers.remove(&hlir_node);
+            self.hlir_buffers
+                .insert(hlir_node, CudaInput::Buffer { buf: owned, len });
+            self.changed_hlir.insert(hlir_node);
+        }
+    }
+
     fn prepare_bucket_buffers(&mut self, bucket_idx: usize, dyn_map: &FxHashMap<char, usize>) {
         let profile_prepare = std::env::var_os("LUMINAL_CUDA_PROFILE_RECAPTURE").is_some();
+        self.own_external_inplace_targets(bucket_idx);
         let prepare_start = std::time::Instant::now();
         let changed_hlir_count = self.changed_hlir.len();
         let timer = std::time::Instant::now();
