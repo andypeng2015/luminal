@@ -420,3 +420,93 @@ extern "C" int flashinfer_fa3_transpose_q_bf16(
         (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, batch, heads, dim);
     return cudaGetLastError() == cudaSuccess ? 0 : -1;
 }
+
+// ── Split-KV decode support ──
+//
+// The SM90 planner has no KV splitting: at qo_len=1 one CTA serially sweeps
+// each sequence's whole context. The host op splits each sequence's KV into
+// chunks, runs the prefill kernel over the EXPANDED batch (one entry per
+// chunk, q row duplicated, sink logits = -1e30 so the per-chunk finalize()
+// adds exactly zero to the denominator), then merges the partials below.
+
+// Graph-layout (heads, batch, dim) bf16 q → [P, heads, dim] bf16 rows, where
+// row p duplicates the query token map[p]. Same math as fa3_transpose_q_kernel
+// plus the indirection; the plain transpose stays untouched for the
+// single-pass path.
+__global__ void fa3_expand_q_kernel(
+    const __nv_bfloat16* src, __nv_bfloat16* dst, const int32_t* map,
+    int p_total, int batch, int heads, int dim) {
+    int idx = blockIdx.x * blockDim.x + threadIdx.x;
+    int total = p_total * heads * dim;
+    if (idx >= total) return;
+    int d = idx % dim;
+    int h = (idx / dim) % heads;
+    int p = idx / (heads * dim);
+    dst[idx] = src[h * batch * dim + map[p] * dim + d];
+}
+
+extern "C" int flashinfer_fa3_expand_q_bf16(
+    const void* src, void* dst, const int32_t* map,
+    int p_total, int batch, int heads, int dim,
+    cudaStream_t stream) {
+    int total = p_total * heads * dim;
+    if (total == 0) return 0;
+    int threads = 256;
+    int blocks = (total + threads - 1) / threads;
+    fa3_expand_q_kernel<<<blocks, threads, 0, stream>>>(
+        (const __nv_bfloat16*)src, (__nv_bfloat16*)dst, map, p_total, batch,
+        heads, dim);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}
+
+// LSE-merge of per-chunk partials with the REAL sink injected exactly once.
+//
+// Convention (must match OnlineSoftmaxWithSink::finalize above): the kernel's
+// LSE is BASE-2, lse_p = m_p + log2(d_p); with the fake -1e30 sink its
+// exp2(log_sink - m) contribution is exactly 0, so lse_p is the pure sinkless
+// logsumexp of chunk p. Partial outputs are already normalized:
+// o_p = num_p / d_p. Therefore, with M = max(sink*log2e, max_p lse_p):
+//   den = exp2(sink*log2e - M) + Σ_p exp2(lse_p - M)
+//   out = Σ_p exp2(lse_p - M) · o_p / den
+// The sink is a raw logit: multiplied by log2(e) only, never by sm_scale
+// (matches AttentionSink's log_sink), and joins the denominator only.
+// Fuses the bf16→f32 upcast and the transpose to graph layout (heads, B, dim),
+// replacing flashinfer_fa3_transpose_output_f32 on this path.
+//
+// pv:  [P, H, D] bf16 partial outputs   plse: [P, H] f32 base-2 LSEs
+// merge_indptr: [B+1] i32 (device)      sinks: [H] f32 raw logits
+// out: [H, B, D] f32
+__global__ void fa3_merge_sink_kernel(
+    const __nv_bfloat16* pv, const float* plse, const int32_t* merge_indptr,
+    const float* sinks, float* out, int B, int H, int D) {
+    int b = blockIdx.x;
+    int h = blockIdx.y;
+    int d = threadIdx.x;
+    if (b >= B || h >= H || d >= D) return;
+    int p0 = merge_indptr[b], p1 = merge_indptr[b + 1];
+    const float LOG2E = 1.44269504088896340736f;
+    float log_sink = sinks[h] * LOG2E;
+    float m = log_sink;
+    for (int p = p0; p < p1; ++p) m = fmaxf(m, plse[p * H + h]);
+    float den = exp2f(log_sink - m); // sink: denominator only, exactly once
+    float num = 0.f;
+    for (int p = p0; p < p1; ++p) {
+        float w = exp2f(plse[p * H + h] - m); // = exp2(m_p - m) * d_p
+        den += w;
+        num += w * __bfloat162float(pv[(p * H + h) * D + d]);
+    }
+    out[(h * B + b) * D + d] = num / den;
+}
+
+extern "C" int flashinfer_fa3_merge_sink_f32(
+    const void* pv, const float* plse, const int32_t* merge_indptr,
+    const float* sinks, void* out, int B, int H, int D,
+    cudaStream_t stream) {
+    if (B == 0) return 0;
+    if (D > 1024) return -2;
+    dim3 grid(B, H);
+    fa3_merge_sink_kernel<<<grid, D, 0, stream>>>(
+        (const __nv_bfloat16*)pv, plse, merge_indptr, sinks, (float*)out, B, H,
+        D);
+    return cudaGetLastError() == cudaSuccess ? 0 : -1;
+}

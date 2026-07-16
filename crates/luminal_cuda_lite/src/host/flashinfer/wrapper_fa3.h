@@ -75,4 +75,21 @@ int flashinfer_fa3_transpose_q_bf16(
     int batch, int heads, int dim,
     cudaStream_t stream);
 
+// Split-KV decode: graph-layout (heads, batch, dim) bf16 q → [p_total, heads,
+// dim] bf16, row p duplicating query token map[p] (device ptr, len p_total).
+int flashinfer_fa3_expand_q_bf16(
+    const void* src, void* dst, const int32_t* map,
+    int p_total, int batch, int heads, int dim,
+    cudaStream_t stream);
+
+// Split-KV decode: base-2 LSE-merge of per-chunk partials, REAL sink logits
+// (raw, ×log2e internally, no sm_scale) injected into the denominator exactly
+// once, fused upcast+transpose to (heads, B, dim) f32 graph layout.
+//   pv [P,H,D] bf16, plse [P,H] f32, merge_indptr [B+1] i32 device,
+//   sinks [H] f32, out [H,B,D] f32. Requires D <= 1024 (one block per (b,h)).
+int flashinfer_fa3_merge_sink_f32(
+    const void* pv, const float* plse, const int32_t* merge_indptr,
+    const float* sinks, void* out, int B, int H, int D,
+    cudaStream_t stream);
+
 } // extern "C"

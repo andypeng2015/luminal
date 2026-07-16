@@ -7,6 +7,14 @@ pub(crate) mod test_ref;
 
 use std::sync::{Arc, Mutex, OnceLock};
 
+/// Serializes ALL flashinfer GPU tests ACROSS modules (fa3 + sink_attention):
+/// they share the process-wide page-locked plan staging
+/// (PAGE_LOCKED_WORKSPACE), the per-tick plan cache, and the split scratch
+/// pools — concurrent plans from two test modules corrupt each other.
+/// Per-module locks are NOT enough; this must be the single lock.
+#[cfg(test)]
+pub(crate) static TEST_LOCK: Mutex<()> = Mutex::new(());
+
 use luminal::{
     dtype::DType,
     egglog_utils::{

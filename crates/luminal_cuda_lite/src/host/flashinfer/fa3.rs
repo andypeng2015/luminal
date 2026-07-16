@@ -29,11 +29,11 @@ mod tests {
     };
     use crate::cudarc::driver::{CudaContext, DevicePtr};
 
-    /// Serializes the tests in this module: they share the process-wide
+    /// Serializes flashinfer GPU tests: they share the process-wide
     /// page-locked plan scratch (PAGE_LOCKED_WORKSPACE), which concurrent
     /// plan() calls would corrupt (the engine is single-threaded; cargo test
-    /// is not).
-    static TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    /// is not). One lock across BOTH test modules — see flashinfer/mod.rs.
+    use super::super::TEST_LOCK;
 
     const HEAD_DIM: usize = 64;
     const DTYPE_BF16: i32 = 2;
@@ -600,5 +600,91 @@ mod tests {
             "decode tick batch={batch} kv={kv_len} heads {nq}/{nkv} hd{HEAD_DIM}: \
              FA3+sink {fa3_us:.1} us/layer, FA2 (sinkless) {fa2_us:.1} us/layer"
         );
+    }
+
+    /// Split-KV merge kernel in isolation: ragged partials per sequence
+    /// combined in base-2 LSE space with the REAL sink joining the
+    /// denominator exactly once, output written in (heads, B, dim) F32 graph
+    /// layout. CPU oracle does the identical combine in f64. Sinks alternate
+    /// dominant (+8, exp2 term rules the denominator) and negligible (-20)
+    /// per head so both max branches are exercised.
+    #[test]
+    fn fa3_merge_sink_unit() {
+        if !hopper_gpu() {
+            eprintln!("skipping fa3_merge_sink_unit: needs Hopper GPU");
+            return;
+        }
+        let _guard = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let ctx = CudaContext::new(0).unwrap();
+        let stream = ctx.default_stream();
+        let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
+        let lib = jit::ensure_compiled_fa3(HEAD_DIM, false);
+
+        let (b, h, d) = (3usize, 64usize, HEAD_DIM);
+        let merge_indptr: Vec<i32> = vec![0, 2, 5, 7];
+        let p_total = 7usize;
+        // Partial LSEs in [-6, 6] (base-2 domain); partial outputs are
+        // normalized attention rows, so bf16 values in [-1, 1].
+        let plse: Vec<f32> = deterministic_f32(p_total * h, 11)
+            .iter()
+            .map(|x| x * 6.0)
+            .collect();
+        let pv = round_to_bf16(&deterministic_f32(p_total * h * d, 12));
+        let sinks: Vec<f32> = (0..h)
+            .map(|i| if i % 2 == 0 { 8.0 } else { -20.0 })
+            .collect();
+
+        // f64 CPU oracle of the exact combine the kernel documents.
+        let mut want = vec![0.0f32; h * b * d];
+        for bi in 0..b {
+            for hi in 0..h {
+                let (p0, p1) = (merge_indptr[bi] as usize, merge_indptr[bi + 1] as usize);
+                let log_sink = sinks[hi] as f64 * std::f64::consts::LOG2_E;
+                let mut m = log_sink;
+                for p in p0..p1 {
+                    m = m.max(plse[p * h + hi] as f64);
+                }
+                let mut den = (log_sink - m).exp2();
+                let mut num = vec![0.0f64; d];
+                for p in p0..p1 {
+                    let w = ((plse[p * h + hi] as f64) - m).exp2();
+                    den += w;
+                    for (di, acc) in num.iter_mut().enumerate() {
+                        *acc += w * pv[(p * h + hi) * d + di] as f64;
+                    }
+                }
+                for di in 0..d {
+                    want[(hi * b + bi) * d + di] = (num[di] / den) as f32;
+                }
+            }
+        }
+
+        let d_pv = stream.clone_htod(&to_bf16_bytes(&pv)).unwrap();
+        let d_plse = stream.clone_htod(&plse).unwrap();
+        let d_indptr = stream.clone_htod(&merge_indptr).unwrap();
+        let d_sinks = stream.clone_htod(&sinks).unwrap();
+        let d_out = stream.clone_htod(&vec![0u8; h * b * d * 4]).unwrap();
+        let ret = unsafe {
+            (lib.merge_sink_f32)(
+                d_pv.device_ptr(&stream).0 as *const std::ffi::c_void,
+                d_plse.device_ptr(&stream).0 as *const f32,
+                d_indptr.device_ptr(&stream).0 as *const i32,
+                d_sinks.device_ptr(&stream).0 as *const f32,
+                d_out.device_ptr(&stream).0 as *mut std::ffi::c_void,
+                b as i32,
+                h as i32,
+                d as i32,
+                cu_stream,
+            )
+        };
+        assert_eq!(ret, 0, "merge_sink launch failed");
+        stream.synchronize().unwrap();
+        let got: Vec<f32> = stream
+            .clone_dtoh(&d_out)
+            .unwrap()
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_close(&got, &want, BF16_RTOL, BF16_ATOL, "merge sink unit");
     }
 }
