@@ -1,8 +1,8 @@
-//! FusedMoE: the gpt-oss MXFP4 MoE as one host op — a stream-ordered pair of
-//! launches (see `decode.cu`): phase 1 gate_up dequant-GEMV + clamped SwiGLU,
-//! phase 2 down projection + top-k weighted mix, for ALL batch sizes (the
-//! tiled GEMM chain was deleted after a forced-path A/B, and the cooperative
-//! single-launch variant after the split A/B; see comments in `execute`).
+//! FusedMoE: the gpt-oss MXFP4 MoE as one host op, dispatching by batch
+//! size. Small batches (num_pairs <= MOE_GEMM_MIN_PAIRS) run a stream-ordered
+//! pair of GEMV launches (see `decode.cu`): phase 1 gate_up dequant-GEMV +
+//! clamped SwiGLU, phase 2 down projection + top-k weighted mix. Larger
+//! batches take the expert-grouped tensor-core chain (`execute_grouped`).
 //!
 //! Installed by the union-only rewrite in `fused_moe_rewrite.egg`, whose LHS
 //! is the model's dense reference spelling (`moe_naive`). Enforcement of the
@@ -69,17 +69,10 @@ fn ensure_kernels_compiled() {
     });
 }
 
-/// Which MoE implementation `execute` runs. Grouped = the expert-grouped
-/// (tokens-to-weights) GEMM chain; Gemv = the per-token fused decode kernel.
-/// Grouped when num_pairs > MOE_GEMM_MIN_PAIRS — the bench crossover:
-/// r4 GEMV 2.43ms vs grouped-MMA 3.69 at 256 pairs; mma 4.36 vs r4 4.85 at
-/// 512. (Pre-row-blocking the crossover was 64 pairs.)
-#[derive(Clone, Copy, PartialEq, Debug)]
-enum MoePath {
-    Gemv,
-    Grouped,
-}
-
+/// Above this many (token, expert) pairs `execute` leaves the per-token
+/// GEMV for the expert-grouped (tokens-to-weights) GEMM chain — the bench
+/// crossover: r4 GEMV 2.43ms vs grouped-MMA 3.69 at 256 pairs; mma 4.36 vs
+/// r4 4.85 at 512. (Pre-row-blocking the crossover was 64 pairs.)
 const MOE_GEMM_MIN_PAIRS: usize = 256;
 
 /// The expert-grouped (tokens-to-weights) chain: cast x to bf16, sort
@@ -113,27 +106,6 @@ pub(crate) fn execute_grouped(
     let num_pairs = seq * top_k;
     let gate_up_n = 2 * intermediate;
     let bm = moe_gemm::BM_MMA;
-    #[allow(clippy::too_many_arguments)]
-    let gemm = |a: u64,
-                bq: u64,
-                bs: u64,
-                c: u64,
-                bias: u64,
-                tw: u64,
-                sids: u64,
-                eids: u64,
-                npp: u64,
-                n: usize,
-                k: usize,
-                em: usize,
-                nvt: usize,
-                tk: usize,
-                mrw: bool|
-     -> anyhow::Result<()> {
-        moe_gemm::fused_moe_mxfp4_gemm_mma(
-            stream, a, bq, bs, c, bias, tw, sids, eids, npp, n, k, em, nvt, tk, mrw,
-        )
-    };
 
     // Scratch (freed at end of execute; arena packing via extra_buffer_nodes
     // is a later refinement).
@@ -162,7 +134,8 @@ pub(crate) fn execute_grouped(
     )?;
 
     let em = align_bufs.max_num_tokens_padded;
-    gemm(
+    moe_gemm::fused_moe_mxfp4_gemm_mma(
+        stream,
         sptr(&x_bf16),
         gu_blocks,
         gu_scales,
@@ -192,7 +165,8 @@ pub(crate) fn execute_grouped(
 
     // Down GEMM consumes per-pair rows (top_k=1 indexing) and applies the
     // routing weight in its epilogue.
-    gemm(
+    moe_gemm::fused_moe_mxfp4_gemm_mma(
+        stream,
         sptr(&hid),
         dn_blocks,
         dn_scales,
@@ -442,15 +416,10 @@ impl HostOp for FusedMoE {
         // ~445GB/s) — 71% of a 64-token prefill tick — so the grouped chain
         // is restored as the prefill path, with a tensor-core inner loop
         // replacing the SIMT one that actually lost that A/B.
-        let path = if num_pairs > MOE_GEMM_MIN_PAIRS {
-            MoePath::Grouped
-        } else {
-            MoePath::Gemv
-        };
         // Both grouped GEMMs need K % 64 and K <= MMA_MAX_K (gate_up
         // K=hidden, down K=inter); shapes outside that stay on the GEMV
         // path rather than failing mid-chain.
-        if path == MoePath::Grouped
+        if num_pairs > MOE_GEMM_MIN_PAIRS
             && hidden % 64 == 0
             && intermediate % 64 == 0
             && hidden <= moe_gemm::MMA_MAX_K
@@ -524,21 +493,11 @@ impl HostOp for FusedMoE {
 #[cfg(test)]
 mod tests {
     use super::super::test_ref::{
-        ChainWeights, assert_close, host_chain_reference, host_chain_reference_f32, to_bf16_bytes,
+        ChainWeights, Lcg, assert_close, host_chain_reference, host_chain_reference_f32,
+        to_bf16_bytes,
     };
     use super::*;
     use crate::cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
-
-    struct Lcg(u64);
-    impl Lcg {
-        fn below(&mut self, n: usize) -> usize {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((self.0 >> 33) as usize) % n
-        }
-    }
 
     /// Execute the op directly (hand-built buffers map) at tiny dims and
     /// compare against the shared host chain reference. The topk index buffer

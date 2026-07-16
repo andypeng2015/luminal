@@ -212,6 +212,7 @@ pub fn moe_align_block_size(
 
 #[cfg(test)]
 mod tests {
+    use super::super::test_ref::Lcg;
     use super::*;
     use crate::cudarc::driver::CudaContext;
 
@@ -355,17 +356,6 @@ mod tests {
     }
 
     /// Deterministic LCG so tests are reproducible without rand.
-    struct Lcg(u64);
-    impl Lcg {
-        fn below(&mut self, n: usize) -> usize {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((self.0 >> 33) as usize) % n
-        }
-    }
-
     // ids taken from https://github.com/vllm-project/vllm/blob/main/vllm/model_executor/layers/fused_moe/moe_align_block_size.py
     #[test]
     fn moe_align_happy_path() {

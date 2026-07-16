@@ -1,19 +1,18 @@
-// Fused single-kernel MoE decode path: gate_up GEMV + clamped interleaved
-// SwiGLU + down GEMV + routed-weight sum, one cooperative launch per step.
+// Fused MoE decode path: phase 1 gate_up GEMV + clamped interleaved SwiGLU,
+// phase 2 down GEMV + routed-weight sum — two regular stream-ordered
+// launches per step.
 //
 // At decode (s*top_k pairs small) the MoE degenerates to per-expert
 // matrix-vector products with a hard global dependency in the middle: every
 // down-row dot reads the ENTIRE hidden vector, so down work cannot start
-// until all gate/up dots finished across all blocks. grid.sync() (cooperative
-// launch) is that barrier; the launcher must size the grid to co-resident
-// occupancy (see decode.rs).
+// until all gate/up dots finished across all blocks. The launch boundary
+// between the two phases is that barrier.
 //
-// Replaces, per step: f32->bf16 cast, both align kernels, both tiled GEMMs,
-// swiglu and moe_sum — six launches and their padding waste (tiled BM=64
-// blocks carry ~4 live rows at s=1) become one launch where every weight
-// byte read feeds a real output. Weight layout/decode math identical to
-// moe.cu: blocks [E, N, K/2] (lo nibble = even k), e8m0 scales [E, N, K/32],
-// bf16 biases.
+// Replaces, per step: f32->bf16 cast, both align kernels, both grouped
+// GEMMs, swiglu and moe_sum — and their padding waste (grouped tiles carry
+// few live rows at s=1); here every weight byte read feeds a real output.
+// Weight layout/decode math identical to moe.cu: blocks [E, N, K/2]
+// (lo nibble = even k), e8m0 scales [E, N, K/32], bf16 biases.
 //
 // Work mapping: warp-per-output-element, grid-stride over flat task ids.
 //   phase 1: task = pair * inter + j  -> hidden[pair][j]  (two dots + swiglu)

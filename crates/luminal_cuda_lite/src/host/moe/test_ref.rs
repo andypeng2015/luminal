@@ -169,3 +169,15 @@ pub fn assert_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
     );
     assert!(max_rel < tol, "{label}: max_rel {max_rel} exceeds {tol}");
 }
+
+/// Deterministic LCG for test data — shared by every moe test module.
+pub struct Lcg(pub u64);
+impl Lcg {
+    pub fn below(&mut self, n: usize) -> usize {
+        self.0 = self
+            .0
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        ((self.0 >> 33) as usize) % n
+    }
+}

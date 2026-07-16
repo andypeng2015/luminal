@@ -20,10 +20,9 @@ use crate::{
 
 const MOE_GEMM_SRC: &str = include_str!("moe.cu");
 
-/// Tile sizes fixed inside moe.cu. `BM` must equal the `block_size` used when
-/// running `align::moe_align_block_size` (the expert_ids-per-tile coupling).
 /// Tensor-core kernel tiles (fixed inside moe.cu). `BM_MMA` must equal the
-/// `block_size` used when running `align::moe_align_block_size`.
+/// `block_size` used when running `align::moe_align_block_size` (the
+/// expert_ids-per-tile coupling).
 pub const BM_MMA: usize = 16;
 pub const BN_MMA: usize = 64;
 /// The mma kernel stages the whole-K e8m0 strip in smem: K/32 <= 96.
@@ -59,10 +58,12 @@ fn kernels(stream: &Arc<CudaStream>) -> &'static MoeGemmKernels {
     })
 }
 
-/// Launch the tensor-core (m16n8k16) variant. Same contract as
-/// `fused_moe_mxfp4_gemm`, with the align step run at block_size == BM_MMA
-/// and two extra static limits: K % 64 == 0 and K <= MMA_MAX_K (the whole-K
-/// e8m0 strip is staged in shared memory once per block).
+/// Launch the tensor-core (m16n8k16) grouped MoE GEMM: C[pair] = A[pair] x
+/// dequant(B[expert(pair)]) + bias[expert], with pairs pre-sorted by expert
+/// (align step run at block_size == BM_MMA) and the routing weight applied
+/// in the epilogue when `mul_routed_weight`. Static limits: K % 64 == 0 and
+/// K <= MMA_MAX_K (the whole-K e8m0 strip is staged in shared memory once
+/// per block); N must be even (bf16x2 epilogue stores).
 #[allow(clippy::too_many_arguments)]
 pub fn fused_moe_mxfp4_gemm_mma(
     stream: &Arc<CudaStream>,
@@ -127,24 +128,15 @@ pub fn fused_moe_mxfp4_gemm_mma(
 }
 
 #[cfg(test)]
-pub(crate) mod tests {
-    use super::super::test_ref::{ChainWeights, assert_close, host_chain_reference, to_bf16_bytes};
+mod tests {
+    use super::super::test_ref::{
+        ChainWeights, Lcg, assert_close, host_chain_reference, to_bf16_bytes,
+    };
     use super::super::{align, moe_ops};
     use super::*;
     use crate::cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
 
     /// Tiny deterministic RNG for test data.
-    struct Lcg(u64);
-    impl Lcg {
-        fn below(&mut self, n: usize) -> usize {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((self.0 >> 33) as usize) % n
-        }
-    }
-
     /// Host oracle for ONE grouped GEMM (order-independent: the kernel
     /// writes per-pair rows, so align placement doesn't matter).
     #[allow(clippy::too_many_arguments)]
@@ -184,9 +176,11 @@ pub(crate) mod tests {
     }
 
     /// T4: the tensor-core kernel in isolation. Cases: random ragged tokens
-    /// (padded tiles + expert==-1 blocks live), one-hot x (fragment-mapping
+    /// (padded tiles with sentinel slots; the -1 expert_ids blocks sit past
+    /// num_tokens_post_pad and early-return), one-hot x (fragment-mapping
     /// bugs become (k,n)-coordinate-diagnosable), widened e8m0 range, k-loop
-    /// (K=128), routed-weight epilogue, multi n-tile (N=128).
+    /// (K=128), routed-weight epilogue, multi n-tile (N=128), and a ragged
+    /// last n-tile (N=96) exercising the guarded epilogue/staging paths.
     #[test]
     fn moe_gemm_mma_tiny() {
         let Ok(ctx) = CudaContext::new(0) else { return };
@@ -236,6 +230,19 @@ pub(crate) mod tests {
                 scale_lo: 100,
                 scale_hi: 160,
                 mul_routed: true,
+                bias: true,
+            },
+            Case {
+                // N % BN_MMA != 0: the last n-tile is ragged, covering the
+                // guarded scale/B staging and the guarded bias+store epilogue.
+                label: "mma ragged-n96",
+                tokens: 13,
+                k_dim: 64,
+                n_dim: 96,
+                one_hot: false,
+                scale_lo: 125,
+                scale_hi: 131,
+                mul_routed: false,
                 bias: true,
             },
         ];

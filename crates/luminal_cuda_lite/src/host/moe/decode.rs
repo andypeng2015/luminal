@@ -1,14 +1,12 @@
-//! Fused single-kernel MoE decode path (see decode.cu): gate_up GEMV +
-//! SwiGLU + down GEMV + routed sum in ONE cooperative launch, for the
-//! small-batch regime where the tiled GEMM path is padding-dominated.
+//! Fused MoE decode path (see decode.cu): two regular stream-ordered
+//! launches — phase 1 gate_up GEMV + SwiGLU, phase 2 down GEMV + routed
+//! sum — for the small-batch regime where the grouped GEMM chain is
+//! padding-dominated.
 //!
 //! Output contract: writes `out` f32 `[seq, hidden]` = the complete MoE block
 //! output (bias + routed-weight sum applied). Needs only one scratch buffer:
 //! `hidden` f32 `[seq*top_k, inter]`. Reads x as f32 directly (no cast
 //! kernel) and the routing tensors in place (no align kernels).
-//!
-//! Cooperative-launch contract: the grid is sized to co-resident occupancy
-//! (queried per-function, cached) — launching wider would fail outright.
 
 use std::sync::{Arc, OnceLock};
 
@@ -165,17 +163,13 @@ pub fn fused_moe_decode_with_rows(
     alpha: f32,
     limit: f32,
 ) -> anyhow::Result<()> {
+    // 32-aligned dims are also exactly what the kernel's uint4 weight loads
+    // need: row stride k/2 bytes divisible by 16.
     anyhow::ensure!(
         hidden_dim.is_multiple_of(32) && inter.is_multiple_of(32),
         "decode GEMV requires 32-aligned dims (e8m0 group width): hidden={hidden_dim}, inter={inter}"
     );
     anyhow::ensure!(idx_row_stride >= top_k, "idx_row_stride must be >= top_k");
-    // The kernel loads weight groups as uint4: every row must start 16B
-    // aligned, i.e. row stride (k/2 bytes) divisible by 16.
-    anyhow::ensure!(
-        (hidden_dim / 2).is_multiple_of(16) && (inter / 2).is_multiple_of(16),
-        "decode GEMV requires 16B-aligned weight rows (dims % 32 == 0)"
-    );
     if seq == 0 || top_k == 0 {
         return Ok(());
     }
@@ -246,20 +240,9 @@ pub fn fused_moe_decode_with_rows(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_ref::{assert_close, to_bf16_bytes};
+    use super::super::test_ref::{Lcg, assert_close, to_bf16_bytes};
     use super::*;
     use crate::cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
-
-    struct Lcg(u64);
-    impl Lcg {
-        fn below(&mut self, n: usize) -> usize {
-            self.0 = self
-                .0
-                .wrapping_mul(6364136223846793005)
-                .wrapping_add(1442695040888963407);
-            ((self.0 >> 33) as usize) % n
-        }
-    }
 
     /// Kernel iteration harness: times the fused decode kernel at the real
     /// gpt-oss decode workload (E=128, H=I=2880, top-4, s=1) with synthetic
@@ -535,7 +518,6 @@ mod tests {
             let got_b = stream.clone_dtoh(&d_out).unwrap();
             results.push(bytemuck::cast_slice::<u8, f32>(&got_b).to_vec());
         }
-        let got: &[f32] = &results[0];
 
         use super::super::test_ref::{ChainWeights, host_chain_reference_f32};
         let want = host_chain_reference_f32(
@@ -558,6 +540,8 @@ mod tests {
 
         // 0.01: f32 summation-order noise (warp-parallel vs sequential)
         // amplified on cancellation-heavy outputs; NOT quantization slack.
-        assert_close(got, &want, 0.01, "decode_fused_tiny");
+        for (rows, got) in [1usize, 2, 4].iter().zip(&results) {
+            assert_close(got, &want, 0.01, &format!("decode_fused_tiny_r{rows}"));
+        }
     }
 }
