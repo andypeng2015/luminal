@@ -25,9 +25,8 @@ const MOE_GEMM_SRC: &str = include_str!("moe.cu");
 
 /// Tile sizes fixed inside moe.cu. `BM` must equal the `block_size` used when
 /// running `align::moe_align_block_size` (the expert_ids-per-tile coupling).
-pub const BM: usize = 64;
-pub const BN: usize = 64;
-/// Tensor-core variant tiles (fixed inside moe.cu's mma kernel).
+/// Tensor-core kernel tiles (fixed inside moe.cu). `BM_MMA` must equal the
+/// `block_size` used when running `align::moe_align_block_size`.
 pub const BM_MMA: usize = 16;
 pub const BN_MMA: usize = 64;
 /// The mma kernel stages the whole-K e8m0 strip in smem: K/32 <= 96.
@@ -35,7 +34,6 @@ pub const MMA_MAX_K: usize = 3072;
 
 struct MoeGemmKernels {
     _module: Arc<CudaModule>,
-    gemm: CudaFunction,
     gemm_mma: CudaFunction,
 }
 
@@ -58,84 +56,10 @@ fn kernels(stream: &Arc<CudaStream>) -> &'static MoeGemmKernels {
             .load_module(ptx)
             .expect("moe_gemm module load failed");
         MoeGemmKernels {
-            gemm: module.load_function("fused_moe_mxfp4_gemm").unwrap(),
             gemm_mma: module.load_function("fused_moe_mxfp4_gemm_mma").unwrap(),
             _module: module,
         }
     })
-}
-
-/// Launch the fused MXFP4 grouped GEMM.
-///
-/// Pointers are device addresses; layouts (all contiguous):
-///   a           bf16 [num_tokens, k]
-///   b_q         u8   [num_experts, n, k/2]  (lo nibble = even k)
-///   b_scale     u8   [num_experts, n, k/32] (e8m0)
-///   c           bf16 [num_pairs, n]
-///   bias        bf16 [num_experts, n]; pass 0 for none
-///   topk_weights f32 [num_pairs]
-///   sorted/expert/num_post: the align outputs (align run with block_size==BM)
-///
-/// `em` = length of sorted_token_ids; `num_valid_tokens` = num_pairs (the
-/// sentinel value in sorted ids).
-#[allow(clippy::too_many_arguments)]
-pub fn fused_moe_mxfp4_gemm(
-    stream: &Arc<CudaStream>,
-    a_ptr: u64,
-    b_q_ptr: u64,
-    b_scale_ptr: u64,
-    c_ptr: u64,
-    bias_ptr: u64,
-    topk_weights_ptr: u64,
-    sorted_token_ids_ptr: u64,
-    expert_ids_ptr: u64,
-    num_tokens_post_padded_ptr: u64,
-    n: usize,
-    k: usize,
-    em: usize,
-    num_valid_tokens: usize,
-    top_k: usize,
-    mul_routed_weight: bool,
-) -> anyhow::Result<()> {
-    anyhow::ensure!(
-        k % 64 == 0,
-        "K must be a multiple of BK=64 (no K-tail masking beyond it)"
-    );
-    // em may be ragged (align capacity = numel + E*(BM-1)): tiles past the
-    // padded total early-exit BEFORE touching sorted_token_ids, and the
-    // padded total is always a BM multiple, so the ragged tail is never read.
-    let kf = kernels(stream);
-    let (n_i, k_i) = (n as i32, k as i32);
-    let nvt = num_valid_tokens as i64;
-    let (top_k_i, mrw_i) = (top_k as i32, mul_routed_weight as i32);
-    let grid = (
-        (n as u32).div_ceil(BN as u32),
-        (em as u32).div_ceil(BM as u32),
-        1,
-    );
-    let mut b = stream.launch_builder(&kf.gemm);
-    b.arg(&a_ptr)
-        .arg(&b_q_ptr)
-        .arg(&b_scale_ptr)
-        .arg(&c_ptr)
-        .arg(&bias_ptr)
-        .arg(&topk_weights_ptr)
-        .arg(&sorted_token_ids_ptr)
-        .arg(&expert_ids_ptr)
-        .arg(&num_tokens_post_padded_ptr)
-        .arg(&n_i)
-        .arg(&k_i)
-        .arg(&nvt)
-        .arg(&top_k_i)
-        .arg(&mrw_i);
-    unsafe {
-        b.launch(LaunchConfig {
-            grid_dim: grid,
-            block_dim: (256, 1, 1),
-            shared_mem_bytes: 0, // static smem only
-        })?;
-    }
-    Ok(())
 }
 
 /// Launch the tensor-core (m16n8k16) variant. Same contract as
@@ -473,7 +397,7 @@ pub(crate) mod tests {
         let d_ids = stream
             .memcpy_stod(bytemuck::cast_slice::<i32, u8>(&topk_ids))
             .unwrap();
-        let bufs = align::MoeAlignBuffers::alloc(&stream, num_pairs, e_cnt, BM).unwrap();
+        let bufs = align::MoeAlignBuffers::alloc(&stream, num_pairs, e_cnt, BM_MMA).unwrap();
         align::moe_align_block_size(
             &stream,
             ptr(&d_ids),
@@ -481,7 +405,7 @@ pub(crate) mod tests {
             top_k,
             top_k,
             e_cnt,
-            BM,
+            BM_MMA,
             &bufs,
         )
         .unwrap();
@@ -498,7 +422,7 @@ pub(crate) mod tests {
 
         let em = bufs.max_num_tokens_padded;
         let d_gu_out = stream.alloc_zeros::<u8>(num_pairs * gate_up_n * 2).unwrap();
-        fused_moe_mxfp4_gemm(
+        fused_moe_mxfp4_gemm_mma(
             &stream,
             ptr(&d_xb),
             ptr(&d_gu_q),
@@ -532,7 +456,7 @@ pub(crate) mod tests {
 
         // Down GEMM consumes per-pair rows: top_k=1 makes pair==row.
         let d_dn_out = stream.alloc_zeros::<u8>(num_pairs * hidden * 2).unwrap();
-        fused_moe_mxfp4_gemm(
+        fused_moe_mxfp4_gemm_mma(
             &stream,
             ptr(&d_hid),
             ptr(&d_dn_q),

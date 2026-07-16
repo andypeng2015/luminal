@@ -71,13 +71,25 @@ fn ensure_kernels_compiled() {
 
 /// Which MoE implementation `execute` runs. Grouped = the expert-grouped
 /// (tokens-to-weights) GEMM chain; Gemv = the per-token fused decode kernel.
-/// `LUMINAL_MOE_FORCE_PATH=gemv|grouped` overrides for A/B and rollback.
-/// Unset currently means Gemv unconditionally — the threshold dispatch lands
-/// together with the MMA kernel once the bench data fixes the crossover.
+/// `LUMINAL_MOE_FORCE_PATH=gemv|grouped` overrides for A/B and rollback
+/// (gemv = full rollback to the pre-grouped behavior). Unset: grouped when
+/// num_pairs > LUMINAL_MOE_GEMM_MIN_PAIRS (default 64) — the bench crossover
+/// (gemv 1.80/3.48/7.00/14.20 ms vs mma 1.90/2.69/3.68/4.36 ms at
+/// seq 16/32/64/128, i.e. pairs 64/128/256/512).
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum MoePath {
     Gemv,
     Grouped,
+}
+
+fn moe_gemm_min_pairs() -> usize {
+    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *MIN.get_or_init(|| {
+        std::env::var("LUMINAL_MOE_GEMM_MIN_PAIRS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(64)
+    })
 }
 
 fn forced_moe_path() -> Option<MoePath> {
@@ -95,30 +107,6 @@ fn forced_moe_path() -> Option<MoePath> {
     )
 }
 
-/// Which GEMM kernel the grouped chain launches. Mma is the tensor-core
-/// m16n8k16 kernel (the production choice); Simt is the restored f32
-/// correctness baseline, kept until the bench data decides its fate.
-/// `LUMINAL_MOE_GEMM_KERNEL=simt|mma` overrides.
-#[derive(Clone, Copy, PartialEq, Debug)]
-pub(crate) enum GroupedKernel {
-    Simt,
-    Mma,
-}
-
-fn grouped_kernel_choice() -> GroupedKernel {
-    static CHOICE: std::sync::OnceLock<GroupedKernel> = std::sync::OnceLock::new();
-    *CHOICE.get_or_init(
-        || match std::env::var("LUMINAL_MOE_GEMM_KERNEL").as_deref() {
-            Ok("simt") => GroupedKernel::Simt,
-            Ok("mma") | Err(_) => GroupedKernel::Mma,
-            Ok(other) => {
-                eprintln!("FusedMoE: unknown LUMINAL_MOE_GEMM_KERNEL={other:?}, using mma");
-                GroupedKernel::Mma
-            }
-        },
-    )
-}
-
 /// The expert-grouped (tokens-to-weights) chain: cast x to bf16, sort
 /// (token, expert) pairs by expert on-GPU, gate_up GEMM (bias in epilogue),
 /// SwiGLU, down GEMM (routing weight in epilogue), top-k sum. All
@@ -127,6 +115,7 @@ fn grouped_kernel_choice() -> GroupedKernel {
 /// the mma kernel additionally needs K <= moe_gemm::MMA_MAX_K (both K's are
 /// 2880 for gpt-oss). Standalone fn (not a method) so tests drive it
 /// directly instead of mutating the process-global LUMINAL_MOE_FORCE_PATH.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_grouped(
     stream: &Arc<CudaStream>,
     x_ptr: u64,
@@ -146,55 +135,9 @@ pub(crate) fn execute_grouped(
     num_experts: usize,
     idx_row_stride: usize,
 ) -> anyhow::Result<()> {
-    execute_grouped_with(
-        stream,
-        grouped_kernel_choice(),
-        x_ptr,
-        gu_blocks,
-        gu_scales,
-        gu_bias,
-        dn_blocks,
-        dn_scales,
-        dn_bias,
-        topk_idx,
-        topk_vals,
-        out_ptr,
-        hidden,
-        intermediate,
-        top_k,
-        seq,
-        num_experts,
-        idx_row_stride,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_grouped_with(
-    stream: &Arc<CudaStream>,
-    kernel: GroupedKernel,
-    x_ptr: u64,
-    gu_blocks: u64,
-    gu_scales: u64,
-    gu_bias: u64,
-    dn_blocks: u64,
-    dn_scales: u64,
-    dn_bias: u64,
-    topk_idx: u64,
-    topk_vals: u64,
-    out_ptr: u64,
-    hidden: usize,
-    intermediate: usize,
-    top_k: usize,
-    seq: usize,
-    num_experts: usize,
-    idx_row_stride: usize,
-) -> anyhow::Result<()> {
     let num_pairs = seq * top_k;
     let gate_up_n = 2 * intermediate;
-    let bm = match kernel {
-        GroupedKernel::Simt => moe_gemm::BM,
-        GroupedKernel::Mma => moe_gemm::BM_MMA,
-    };
+    let bm = moe_gemm::BM_MMA;
     #[allow(clippy::too_many_arguments)]
     let gemm = |a: u64,
                 bq: u64,
@@ -212,14 +155,9 @@ pub(crate) fn execute_grouped_with(
                 tk: usize,
                 mrw: bool|
      -> anyhow::Result<()> {
-        match kernel {
-            GroupedKernel::Simt => moe_gemm::fused_moe_mxfp4_gemm(
-                stream, a, bq, bs, c, bias, tw, sids, eids, npp, n, k, em, nvt, tk, mrw,
-            ),
-            GroupedKernel::Mma => moe_gemm::fused_moe_mxfp4_gemm_mma(
-                stream, a, bq, bs, c, bias, tw, sids, eids, npp, n, k, em, nvt, tk, mrw,
-            ),
-        }
+        moe_gemm::fused_moe_mxfp4_gemm_mma(
+            stream, a, bq, bs, c, bias, tw, sids, eids, npp, n, k, em, nvt, tk, mrw,
+        )
     };
 
     // Scratch (freed at end of execute; arena packing via extra_buffer_nodes
@@ -529,7 +467,13 @@ impl HostOp for FusedMoE {
         // ~445GB/s) — 71% of a 64-token prefill tick — so the grouped chain
         // is restored as the prefill path, with a tensor-core inner loop
         // replacing the SIMT one that actually lost that A/B.
-        let path = forced_moe_path().unwrap_or(MoePath::Gemv);
+        let path = forced_moe_path().unwrap_or({
+            if num_pairs > moe_gemm_min_pairs() {
+                MoePath::Grouped
+            } else {
+                MoePath::Gemv
+            }
+        });
         // Both grouped GEMMs need K % 64 (gate_up K=hidden, down K=inter).
         if path == MoePath::Grouped && hidden % 64 == 0 && intermediate % 64 == 0 {
             return execute_grouped(
@@ -622,24 +566,22 @@ mod tests {
     /// exercise the row-stride derivation the graph binding relies on.
     #[test]
     fn fused_moe_op_tiny() {
-        run_op_case(13, None);
+        run_op_case(13, false);
     }
 
     #[test]
     fn fused_moe_op_large_batch() {
         // 40 tokens x top_k 2 = 80 pairs: grid-strides past one resident
         // wave (the old tiled regime), same kernel.
-        run_op_case(40, None);
+        run_op_case(40, false);
     }
 
     /// T2: the restored expert-grouped chain at the op boundary — 40 tokens
     /// (80 pairs, multiple BM blocks) and 13 tokens (single ragged block).
     #[test]
     fn fused_moe_op_grouped_tiny() {
-        for kernel in [GroupedKernel::Simt, GroupedKernel::Mma] {
-            run_op_case(40, Some(kernel));
-            run_op_case(13, Some(kernel));
-        }
+        run_op_case(40, true);
+        run_op_case(13, true);
     }
 
     /// Build device buffers for a synthetic MoE of the given dims; returns
@@ -742,9 +684,8 @@ mod tests {
         let (host, dev) = synth_moe(&stream, &mut rng, tokens, top_k, e_cnt, hidden, inter);
         let (x, gu_q, gu_s, gu_bias, dn_q, dn_s, dn_bias, topk_ids, topk_w) = host;
         let d_out = stream.alloc_zeros::<u8>(tokens * hidden * 4).unwrap();
-        super::execute_grouped_with(
+        super::execute_grouped(
             &stream,
-            GroupedKernel::Mma,
             ptr(&dev[0]),
             ptr(&dev[3]),
             ptr(&dev[4]),
@@ -853,11 +794,10 @@ mod tests {
                 )
                 .unwrap()
             });
-            for (label, kernel) in [("simt", GroupedKernel::Simt), ("mma", GroupedKernel::Mma)] {
-                run(label, &|| {
-                    super::execute_grouped_with(
+            {
+                run("mma", &|| {
+                    super::execute_grouped(
                         &stream,
-                        kernel,
                         ptr(&dev[0]),
                         ptr(&dev[3]),
                         ptr(&dev[4]),
@@ -881,7 +821,7 @@ mod tests {
         }
     }
 
-    fn run_op_case(tokens: usize, grouped: Option<GroupedKernel>) {
+    fn run_op_case(tokens: usize, grouped: bool) {
         let Ok(ctx) = CudaContext::new(0) else { return };
         let stream = ctx.default_stream();
 
@@ -959,12 +899,11 @@ mod tests {
         };
         let mut dyn_map = FxHashMap::default();
         dyn_map.insert('s', tokens);
-        if let Some(kernel) = grouped {
+        if grouped {
             // Drive the grouped chain directly: env-var path forcing would
             // race other tests (process-global).
-            super::execute_grouped_with(
+            super::execute_grouped(
                 &stream,
-                kernel,
                 d_x.device_ptr(&stream).0,
                 d_gu_q.device_ptr(&stream).0,
                 d_gu_s.device_ptr(&stream).0,
@@ -1000,8 +939,12 @@ mod tests {
             dn_bias: &dn_bias,
         };
         // The GEMV path keeps f32 internally; the grouped chain rounds
-        // through bf16 between stages — each gets the matching oracle.
-        if grouped.is_some() {
+        // through bf16 between stages — each gets the matching oracle. An
+        // undirected op.execute call routes by the num_pairs threshold, so
+        // large batches are expected to take the grouped path (this is the
+        // dispatch's op-boundary coverage).
+        let expect_grouped = grouped || tokens * 2 > super::moe_gemm_min_pairs();
+        if expect_grouped {
             let want = host_chain_reference(
                 &weights, &x, &topk_ids, &topk_w, tokens, top_k, hidden, inter,
             );
