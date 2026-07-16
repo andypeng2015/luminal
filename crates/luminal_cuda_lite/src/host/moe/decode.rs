@@ -19,10 +19,10 @@ use crate::{
 
 const SOURCE: &str = include_str!("decode.cu");
 const BLOCK_THREADS: u32 = 256;
-// A block-cooperative split-K variant was built, benched, and removed
-// (commit a6f93621 has it): warp-per-row won at every pair count once the
-// __constant__-LUT replay serialization was fixed (131.6 vs 151.2 us at
-// s=1; 1875 vs 2161 at pairs=64).
+// A block-cooperative split-K variant was built, benched, and removed:
+// warp-per-row won at every pair count once the __constant__-LUT replay
+// serialization was fixed (131.6 vs 151.2 us at s=1; 1875 vs 2161 at
+// pairs=64).
 
 struct DecodeKernel {
     _module: Arc<CudaModule>,

@@ -84,6 +84,11 @@ pub fn fused_moe_mxfp4_gemm_mma(
 ) -> anyhow::Result<()> {
     anyhow::ensure!(k % 64 == 0, "K must be a multiple of BK=64");
     anyhow::ensure!(
+        n % 2 == 0,
+        "N must be even: the epilogue writes bf16x2 pairs, and an odd N \
+         misaligns the vector store for odd output rows"
+    );
+    anyhow::ensure!(
         k <= MMA_MAX_K,
         "K={k} exceeds the mma kernel's staged-scale limit {MMA_MAX_K}"
     );

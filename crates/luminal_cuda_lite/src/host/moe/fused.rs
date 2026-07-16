@@ -436,8 +436,8 @@ impl HostOp for FusedMoE {
 
         // Path history: the ORIGINAL tiled GEMM chain (SIMT f32 inner loop,
         // fixed BM=64) lost a forced-path A/B at 36L (decode TPOT 43.2 vs
-        // 87.5 ms; 35-token prefill 295 vs 400 ms) and was deleted in
-        // 46c4aa45. nsys measurement (2026-07-16) then showed the GEMV costs
+        // 87.5 ms; 35-token prefill 295 vs 400 ms) and was deleted.
+        // nsys measurement (2026-07-16) then showed the GEMV costs
         // ~112-122us/token at ALL batch sizes (no cross-token weight reuse,
         // ~445GB/s) — 71% of a 64-token prefill tick — so the grouped chain
         // is restored as the prefill path, with a tensor-core inner loop
@@ -447,8 +447,15 @@ impl HostOp for FusedMoE {
         } else {
             MoePath::Gemv
         };
-        // Both grouped GEMMs need K % 64 (gate_up K=hidden, down K=inter).
-        if path == MoePath::Grouped && hidden % 64 == 0 && intermediate % 64 == 0 {
+        // Both grouped GEMMs need K % 64 and K <= MMA_MAX_K (gate_up
+        // K=hidden, down K=inter); shapes outside that stay on the GEMV
+        // path rather than failing mid-chain.
+        if path == MoePath::Grouped
+            && hidden % 64 == 0
+            && intermediate % 64 == 0
+            && hidden <= moe_gemm::MMA_MAX_K
+            && intermediate <= moe_gemm::MMA_MAX_K
+        {
             return execute_grouped(
                 stream,
                 x_buf.ptr(),
@@ -547,6 +554,15 @@ mod tests {
         // 40 tokens x top_k 2 = 80 pairs: grid-strides past one resident
         // wave (the old tiled regime), same kernel.
         run_op_case(40, false);
+    }
+
+    /// The undirected op boundary ABOVE the dispatch threshold: 160 tokens x
+    /// top_k 2 = 320 pairs > MOE_GEMM_MIN_PAIRS, so `execute` itself routes
+    /// to the grouped chain — covering the buffer-derived idx_row_stride and
+    /// ensure chain the direct execute_grouped tests bypass.
+    #[test]
+    fn fused_moe_op_dispatches_grouped() {
+        run_op_case(160, false);
     }
 
     /// T2: the restored expert-grouped chain at the op boundary — 40 tokens

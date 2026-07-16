@@ -151,8 +151,10 @@ extern "C" __global__ void fused_moe_mxfp4_gemm_mma(
         float v0 = acc[2 * h + 0];
         float v1 = acc[2 * h + 1];
         if (bias) {
-            v0 += __bfloat162float(bias[expert * N + ncol]);
-            v1 += __bfloat162float(bias[expert * N + ncol + 1]);
+            // Ragged-N tail tile: the stores below are guarded, so the bias
+            // reads must be too or lanes past N read out of bounds.
+            if (ncol < N) v0 += __bfloat162float(bias[expert * N + ncol]);
+            if (ncol + 1 < N) v1 += __bfloat162float(bias[expert * N + ncol + 1]);
         }
         v0 *= rw;
         v1 *= rw;
