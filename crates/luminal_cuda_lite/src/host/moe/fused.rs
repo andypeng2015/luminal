@@ -95,14 +95,38 @@ fn forced_moe_path() -> Option<MoePath> {
     )
 }
 
+/// Which GEMM kernel the grouped chain launches. Mma is the tensor-core
+/// m16n8k16 kernel (the production choice); Simt is the restored f32
+/// correctness baseline, kept until the bench data decides its fate.
+/// `LUMINAL_MOE_GEMM_KERNEL=simt|mma` overrides.
+#[derive(Clone, Copy, PartialEq, Debug)]
+pub(crate) enum GroupedKernel {
+    Simt,
+    Mma,
+}
+
+fn grouped_kernel_choice() -> GroupedKernel {
+    static CHOICE: std::sync::OnceLock<GroupedKernel> = std::sync::OnceLock::new();
+    *CHOICE.get_or_init(
+        || match std::env::var("LUMINAL_MOE_GEMM_KERNEL").as_deref() {
+            Ok("simt") => GroupedKernel::Simt,
+            Ok("mma") | Err(_) => GroupedKernel::Mma,
+            Ok(other) => {
+                eprintln!("FusedMoE: unknown LUMINAL_MOE_GEMM_KERNEL={other:?}, using mma");
+                GroupedKernel::Mma
+            }
+        },
+    )
+}
+
 /// The expert-grouped (tokens-to-weights) chain: cast x to bf16, sort
 /// (token, expert) pairs by expert on-GPU, gate_up GEMM (bias in epilogue),
 /// SwiGLU, down GEMM (routing weight in epilogue), top-k sum. All
 /// stream-ordered; no DtoH, no mid-execute sync. Requires
-/// hidden % 64 == 0 && intermediate % 64 == 0 (the GEMMs' K % BK contract).
-/// Standalone fn (not a method) so tests drive it directly instead of
-/// mutating the process-global LUMINAL_MOE_FORCE_PATH.
-#[allow(clippy::too_many_arguments)]
+/// hidden % 64 == 0 && intermediate % 64 == 0 (the GEMMs' K % BK contract);
+/// the mma kernel additionally needs K <= moe_gemm::MMA_MAX_K (both K's are
+/// 2880 for gpt-oss). Standalone fn (not a method) so tests drive it
+/// directly instead of mutating the process-global LUMINAL_MOE_FORCE_PATH.
 pub(crate) fn execute_grouped(
     stream: &Arc<CudaStream>,
     x_ptr: u64,
@@ -122,13 +146,86 @@ pub(crate) fn execute_grouped(
     num_experts: usize,
     idx_row_stride: usize,
 ) -> anyhow::Result<()> {
+    execute_grouped_with(
+        stream,
+        grouped_kernel_choice(),
+        x_ptr,
+        gu_blocks,
+        gu_scales,
+        gu_bias,
+        dn_blocks,
+        dn_scales,
+        dn_bias,
+        topk_idx,
+        topk_vals,
+        out_ptr,
+        hidden,
+        intermediate,
+        top_k,
+        seq,
+        num_experts,
+        idx_row_stride,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn execute_grouped_with(
+    stream: &Arc<CudaStream>,
+    kernel: GroupedKernel,
+    x_ptr: u64,
+    gu_blocks: u64,
+    gu_scales: u64,
+    gu_bias: u64,
+    dn_blocks: u64,
+    dn_scales: u64,
+    dn_bias: u64,
+    topk_idx: u64,
+    topk_vals: u64,
+    out_ptr: u64,
+    hidden: usize,
+    intermediate: usize,
+    top_k: usize,
+    seq: usize,
+    num_experts: usize,
+    idx_row_stride: usize,
+) -> anyhow::Result<()> {
     let num_pairs = seq * top_k;
     let gate_up_n = 2 * intermediate;
+    let bm = match kernel {
+        GroupedKernel::Simt => moe_gemm::BM,
+        GroupedKernel::Mma => moe_gemm::BM_MMA,
+    };
+    #[allow(clippy::too_many_arguments)]
+    let gemm = |a: u64,
+                bq: u64,
+                bs: u64,
+                c: u64,
+                bias: u64,
+                tw: u64,
+                sids: u64,
+                eids: u64,
+                npp: u64,
+                n: usize,
+                k: usize,
+                em: usize,
+                nvt: usize,
+                tk: usize,
+                mrw: bool|
+     -> anyhow::Result<()> {
+        match kernel {
+            GroupedKernel::Simt => moe_gemm::fused_moe_mxfp4_gemm(
+                stream, a, bq, bs, c, bias, tw, sids, eids, npp, n, k, em, nvt, tk, mrw,
+            ),
+            GroupedKernel::Mma => moe_gemm::fused_moe_mxfp4_gemm_mma(
+                stream, a, bq, bs, c, bias, tw, sids, eids, npp, n, k, em, nvt, tk, mrw,
+            ),
+        }
+    };
 
     // Scratch (freed at end of execute; arena packing via extra_buffer_nodes
     // is a later refinement).
     let x_bf16 = unsafe { stream.alloc::<u8>(seq * hidden * 2)? };
-    let align_bufs = align::MoeAlignBuffers::alloc(stream, num_pairs, num_experts, moe_gemm::BM)?;
+    let align_bufs = align::MoeAlignBuffers::alloc(stream, num_pairs, num_experts, bm)?;
     let gu_out = unsafe { stream.alloc::<u8>(num_pairs * gate_up_n * 2)? };
     let hid = unsafe { stream.alloc::<u8>(num_pairs * intermediate * 2)? };
     let dn_out = unsafe { stream.alloc::<u8>(num_pairs * hidden * 2)? };
@@ -147,13 +244,12 @@ pub(crate) fn execute_grouped(
         top_k,
         idx_row_stride,
         num_experts,
-        moe_gemm::BM,
+        bm,
         &align_bufs,
     )?;
 
     let em = align_bufs.max_num_tokens_padded;
-    moe_gemm::fused_moe_mxfp4_gemm(
-        stream,
+    gemm(
         sptr(&x_bf16),
         gu_blocks,
         gu_scales,
@@ -183,8 +279,7 @@ pub(crate) fn execute_grouped(
 
     // Down GEMM consumes per-pair rows (top_k=1 indexing) and applies the
     // routing weight in its epilogue.
-    moe_gemm::fused_moe_mxfp4_gemm(
-        stream,
+    gemm(
         sptr(&hid),
         dn_blocks,
         dn_scales,
@@ -527,25 +622,266 @@ mod tests {
     /// exercise the row-stride derivation the graph binding relies on.
     #[test]
     fn fused_moe_op_tiny() {
-        run_op_case(13, false);
+        run_op_case(13, None);
     }
 
     #[test]
     fn fused_moe_op_large_batch() {
         // 40 tokens x top_k 2 = 80 pairs: grid-strides past one resident
         // wave (the old tiled regime), same kernel.
-        run_op_case(40, false);
+        run_op_case(40, None);
     }
 
     /// T2: the restored expert-grouped chain at the op boundary — 40 tokens
     /// (80 pairs, multiple BM blocks) and 13 tokens (single ragged block).
     #[test]
     fn fused_moe_op_grouped_tiny() {
-        run_op_case(40, true);
-        run_op_case(13, true);
+        for kernel in [GroupedKernel::Simt, GroupedKernel::Mma] {
+            run_op_case(40, Some(kernel));
+            run_op_case(13, Some(kernel));
+        }
     }
 
-    fn run_op_case(tokens: usize, grouped: bool) {
+    /// Build device buffers for a synthetic MoE of the given dims; returns
+    /// (host copies for oracles, device slices in fused-op input order).
+    #[allow(clippy::type_complexity)]
+    fn synth_moe(
+        stream: &Arc<CudaStream>,
+        rng: &mut Lcg,
+        tokens: usize,
+        top_k: usize,
+        e_cnt: usize,
+        hidden: usize,
+        inter: usize,
+    ) -> (
+        (
+            Vec<f32>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<f32>,
+            Vec<u8>,
+            Vec<u8>,
+            Vec<f32>,
+            Vec<i32>,
+            Vec<f32>,
+        ),
+        Vec<CudaSlice<u8>>,
+    ) {
+        let gate_up_n = 2 * inter;
+        let x: Vec<f32> = (0..tokens * hidden)
+            .map(|_| (rng.below(200) as f32 - 100.0) / 50.0)
+            .collect();
+        let gu_q: Vec<u8> = (0..e_cnt * gate_up_n * hidden / 2)
+            .map(|_| rng.below(256) as u8)
+            .collect();
+        let gu_s: Vec<u8> = (0..e_cnt * gate_up_n * hidden / 32)
+            .map(|_| 121 + rng.below(8) as u8)
+            .collect();
+        let gu_bias: Vec<f32> = (0..e_cnt * gate_up_n)
+            .map(|_| (rng.below(100) as f32 - 50.0) / 25.0)
+            .collect();
+        let dn_q: Vec<u8> = (0..e_cnt * hidden * inter / 2)
+            .map(|_| rng.below(256) as u8)
+            .collect();
+        let dn_s: Vec<u8> = (0..e_cnt * hidden * inter / 32)
+            .map(|_| 121 + rng.below(8) as u8)
+            .collect();
+        let dn_bias: Vec<f32> = (0..e_cnt * hidden)
+            .map(|_| (rng.below(100) as f32 - 50.0) / 25.0)
+            .collect();
+        let mut topk_ids = Vec::with_capacity(tokens * top_k);
+        let mut topk_w = Vec::with_capacity(tokens * top_k);
+        for _ in 0..tokens {
+            let mut picked = [usize::MAX; 8];
+            let mut wsum = 0.0f32;
+            let mut ws = [0.0f32; 8];
+            for k in 0..top_k {
+                let mut e = rng.below(e_cnt);
+                while picked[..k].contains(&e) {
+                    e = rng.below(e_cnt);
+                }
+                picked[k] = e;
+                ws[k] = 0.1 + (rng.below(90) as f32) / 100.0;
+                wsum += ws[k];
+            }
+            for k in 0..top_k {
+                topk_ids.push(picked[k] as i32);
+                topk_w.push(ws[k] / wsum);
+            }
+        }
+        let up = |bytes: &[u8]| stream.clone_htod(bytes).unwrap();
+        let dev = vec![
+            up(bytemuck::cast_slice::<f32, u8>(&x)),
+            up(bytemuck::cast_slice::<i32, u8>(&topk_ids)),
+            up(bytemuck::cast_slice::<f32, u8>(&topk_w)),
+            up(&gu_q),
+            up(&gu_s),
+            up(&to_bf16_bytes(&gu_bias)),
+            up(&dn_q),
+            up(&dn_s),
+            up(&to_bf16_bytes(&dn_bias)),
+        ];
+        (
+            (
+                x, gu_q, gu_s, gu_bias, dn_q, dn_s, dn_bias, topk_ids, topk_w,
+            ),
+            dev,
+        )
+    }
+
+    /// T5: the mma chain at the real contraction size (K = 2880 on both
+    /// GEMMs, 45 BK steps, 90-byte scale rows) — the tiny cases can't see
+    /// scale-strip indexing bugs past group 2.
+    #[test]
+    fn moe_mma_real_k() {
+        let Ok(ctx) = CudaContext::new(0) else { return };
+        let stream = ctx.default_stream();
+        let ptr = |b: &CudaSlice<u8>| b.device_ptr(&stream).0;
+        let (tokens, top_k, e_cnt, hidden, inter) = (16usize, 4usize, 8usize, 2880usize, 2880usize);
+        let mut rng = Lcg(97);
+        let (host, dev) = synth_moe(&stream, &mut rng, tokens, top_k, e_cnt, hidden, inter);
+        let (x, gu_q, gu_s, gu_bias, dn_q, dn_s, dn_bias, topk_ids, topk_w) = host;
+        let d_out = stream.alloc_zeros::<u8>(tokens * hidden * 4).unwrap();
+        super::execute_grouped_with(
+            &stream,
+            GroupedKernel::Mma,
+            ptr(&dev[0]),
+            ptr(&dev[3]),
+            ptr(&dev[4]),
+            ptr(&dev[5]),
+            ptr(&dev[6]),
+            ptr(&dev[7]),
+            ptr(&dev[8]),
+            ptr(&dev[1]),
+            ptr(&dev[2]),
+            ptr(&d_out),
+            hidden,
+            inter,
+            top_k,
+            tokens,
+            e_cnt,
+            top_k,
+        )
+        .unwrap();
+        stream.synchronize().unwrap();
+        let got_b = stream.clone_dtoh(&d_out).unwrap();
+        let got: &[f32] = bytemuck::cast_slice(&got_b);
+        let weights = ChainWeights {
+            gu_q: &gu_q,
+            gu_s: &gu_s,
+            gu_bias: &gu_bias,
+            dn_q: &dn_q,
+            dn_s: &dn_s,
+            dn_bias: &dn_bias,
+        };
+        let want = host_chain_reference(
+            &weights, &x, &topk_ids, &topk_w, tokens, top_k, hidden, inter,
+        );
+        assert_close(got, &want, 0.05, "mma real-K chain");
+    }
+
+    /// T6: the decision bench — GEMV vs SIMT-grouped vs MMA-grouped at real
+    /// dims across the seq range the engine actually produces. Prints
+    /// ms/call and effective weight-streaming GB/s. Not an assertion.
+    #[test]
+    #[ignore = "benchmark, run explicitly"]
+    fn moe_bench_gemv_vs_grouped() {
+        let Ok(ctx) = CudaContext::new(0) else { return };
+        let stream = ctx.default_stream();
+        let ptr = |b: &CudaSlice<u8>| b.device_ptr(&stream).0;
+        let (top_k, e_cnt, hidden, inter) = (4usize, 128usize, 2880usize, 2880usize);
+        let gate_up_n = 2 * inter;
+        let mut rng = Lcg(1234);
+        let max_seq = 128usize;
+        let (_, dev) = synth_moe(&stream, &mut rng, max_seq, top_k, e_cnt, hidden, inter);
+        let d_out = stream.alloc_zeros::<u8>(max_seq * hidden * 4).unwrap();
+        let scratch = stream
+            .alloc_zeros::<u8>(max_seq * top_k * inter * 4)
+            .unwrap();
+
+        // Per-pair expert-weight bytes (fp4 + scales), for the no-reuse
+        // traffic model; grouped traffic is bounded by touched-experts
+        // instead — printed per unique-expert sweep for context.
+        let per_expert_bytes = (gate_up_n * hidden / 2 + gate_up_n * hidden / 32)
+            + (hidden * inter / 2 + hidden * inter / 32);
+
+        let iters = 50;
+        for &seq in &[16usize, 32, 64, 128] {
+            let num_pairs = seq * top_k;
+            let mut run = |label: &str, f: &dyn Fn()| {
+                for _ in 0..5 {
+                    f();
+                }
+                stream.synchronize().unwrap();
+                let t0 = std::time::Instant::now();
+                for _ in 0..iters {
+                    f();
+                }
+                stream.synchronize().unwrap();
+                let ms = t0.elapsed().as_secs_f64() * 1e3 / iters as f64;
+                // GEMV traffic: every pair re-reads its expert. Grouped
+                // floor: each of <=E touched experts read once.
+                let gemv_gb = (num_pairs * per_expert_bytes) as f64 / 1e9;
+                let floor_gb = (e_cnt.min(num_pairs) * per_expert_bytes) as f64 / 1e9;
+                println!(
+                    "seq {seq:>4} {label:<6} {ms:>8.3} ms | gemv-model {:>6.0} GB/s | floor-model {:>6.0} GB/s",
+                    gemv_gb / (ms / 1e3),
+                    floor_gb / (ms / 1e3),
+                );
+            };
+            run("gemv", &|| {
+                decode::fused_moe_decode(
+                    &stream,
+                    ptr(&dev[0]),
+                    ptr(&dev[3]),
+                    ptr(&dev[4]),
+                    ptr(&dev[5]),
+                    ptr(&dev[6]),
+                    ptr(&dev[7]),
+                    ptr(&dev[8]),
+                    ptr(&dev[1]),
+                    ptr(&dev[2]),
+                    ptr(&scratch),
+                    ptr(&d_out),
+                    hidden,
+                    inter,
+                    top_k,
+                    seq,
+                    top_k,
+                    SWIGLU_ALPHA,
+                    SWIGLU_LIMIT,
+                )
+                .unwrap()
+            });
+            for (label, kernel) in [("simt", GroupedKernel::Simt), ("mma", GroupedKernel::Mma)] {
+                run(label, &|| {
+                    super::execute_grouped_with(
+                        &stream,
+                        kernel,
+                        ptr(&dev[0]),
+                        ptr(&dev[3]),
+                        ptr(&dev[4]),
+                        ptr(&dev[5]),
+                        ptr(&dev[6]),
+                        ptr(&dev[7]),
+                        ptr(&dev[8]),
+                        ptr(&dev[1]),
+                        ptr(&dev[2]),
+                        ptr(&d_out),
+                        hidden,
+                        inter,
+                        top_k,
+                        seq,
+                        e_cnt,
+                        top_k,
+                    )
+                    .unwrap()
+                });
+            }
+        }
+    }
+
+    fn run_op_case(tokens: usize, grouped: Option<GroupedKernel>) {
         let Ok(ctx) = CudaContext::new(0) else { return };
         let stream = ctx.default_stream();
 
@@ -623,11 +959,12 @@ mod tests {
         };
         let mut dyn_map = FxHashMap::default();
         dyn_map.insert('s', tokens);
-        if grouped {
+        if let Some(kernel) = grouped {
             // Drive the grouped chain directly: env-var path forcing would
             // race other tests (process-global).
-            super::execute_grouped(
+            super::execute_grouped_with(
                 &stream,
+                kernel,
                 d_x.device_ptr(&stream).0,
                 d_gu_q.device_ptr(&stream).0,
                 d_gu_s.device_ptr(&stream).0,
@@ -664,7 +1001,7 @@ mod tests {
         };
         // The GEMV path keeps f32 internally; the grouped chain rounds
         // through bf16 between stages — each gets the matching oracle.
-        if grouped {
+        if grouped.is_some() {
             let want = host_chain_reference(
                 &weights, &x, &topk_ids, &topk_w, tokens, top_k, hidden, inter,
             );
