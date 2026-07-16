@@ -31,6 +31,12 @@ struct DecodeKernel {
     /// unbounded (one warp per task, no residency cap).
     phase1: CudaFunction,
     phase2: CudaFunction,
+    /// Row-blocked variants (R outputs per warp sharing one activation
+    /// read); see the ncu note in decode.cu.
+    phase1_r2: CudaFunction,
+    phase1_r4: CudaFunction,
+    phase2_r2: CudaFunction,
+    phase2_r4: CudaFunction,
     #[cfg(test)]
     debug_dot: CudaFunction,
 }
@@ -52,6 +58,10 @@ fn kernel(stream: &Arc<CudaStream>) -> &'static DecodeKernel {
         let phase2 = module
             .load_function("moe_phase2")
             .expect("moe_phase2 should exist");
+        let phase1_r2 = module.load_function("moe_phase1_r2").unwrap();
+        let phase1_r4 = module.load_function("moe_phase1_r4").unwrap();
+        let phase2_r2 = module.load_function("moe_phase2_r2").unwrap();
+        let phase2_r4 = module.load_function("moe_phase2_r4").unwrap();
         #[cfg(test)]
         let debug_dot = module
             .load_function("debug_row_dot")
@@ -60,6 +70,10 @@ fn kernel(stream: &Arc<CudaStream>) -> &'static DecodeKernel {
             _module: module,
             phase1,
             phase2,
+            phase1_r2,
+            phase1_r4,
+            phase2_r2,
+            phase2_r4,
             #[cfg(test)]
             debug_dot,
         }
@@ -77,9 +91,69 @@ pub fn warm(stream: &Arc<CudaStream>) {
 /// gate/up+SwiGLU, phase 2 down+mix); split beat the old cooperative single
 /// launch by 5-16% across seq 1..16
 /// tokens. All pointers are device addresses; see decode.cu for layouts.
+/// Rows-per-warp for the GEMV: 1 = original kernels, 2/4 = row-blocked.
+/// `LUMINAL_MOE_GEMV_ROWS` overrides; dims not divisible by R fall back to 1.
+fn gemv_rows_default() -> usize {
+    static ROWS: OnceLock<usize> = OnceLock::new();
+    *ROWS.get_or_init(|| {
+        std::env::var("LUMINAL_MOE_GEMV_ROWS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .filter(|r| matches!(r, 1 | 2 | 4))
+            .unwrap_or(4) // bench: r4 fastest at every seq 1..128 (2-3x r1)
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 pub fn fused_moe_decode(
     stream: &Arc<CudaStream>,
+    x_ptr: u64,
+    gu_q_ptr: u64,
+    gu_scale_ptr: u64,
+    gu_bias_ptr: u64,
+    dn_q_ptr: u64,
+    dn_scale_ptr: u64,
+    dn_bias_ptr: u64,
+    topk_ids_ptr: u64,
+    topk_w_ptr: u64,
+    hidden_scratch_ptr: u64,
+    out_ptr: u64,
+    hidden_dim: usize,
+    inter: usize,
+    top_k: usize,
+    seq: usize,
+    idx_row_stride: usize,
+    alpha: f32,
+    limit: f32,
+) -> anyhow::Result<()> {
+    fused_moe_decode_with_rows(
+        stream,
+        gemv_rows_default(),
+        x_ptr,
+        gu_q_ptr,
+        gu_scale_ptr,
+        gu_bias_ptr,
+        dn_q_ptr,
+        dn_scale_ptr,
+        dn_bias_ptr,
+        topk_ids_ptr,
+        topk_w_ptr,
+        hidden_scratch_ptr,
+        out_ptr,
+        hidden_dim,
+        inter,
+        top_k,
+        seq,
+        idx_row_stride,
+        alpha,
+        limit,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn fused_moe_decode_with_rows(
+    stream: &Arc<CudaStream>,
+    rows: usize,
     x_ptr: u64,
     gu_q_ptr: u64,
     gu_scale_ptr: u64,
@@ -114,7 +188,18 @@ pub fn fused_moe_decode(
         return Ok(());
     }
 
+    // Dims must split evenly into row blocks; otherwise original kernels.
+    let rows = if rows > 1 && inter % rows == 0 && hidden_dim % rows == 0 {
+        rows
+    } else {
+        1
+    };
     let k = kernel(stream);
+    let (p1, p2) = match rows {
+        2 => (&k.phase1_r2, &k.phase2_r2),
+        4 => (&k.phase1_r4, &k.phase2_r4),
+        _ => (&k.phase1, &k.phase2),
+    };
     // Split launch (measured 5-16% faster than the cooperative single launch
     // across seq 1..16): one warp per task, unbounded grid, phase order
     // enforced by the stream.
@@ -133,7 +218,7 @@ pub fn fused_moe_decode(
     );
     unsafe {
         stream
-            .launch_builder(&k.phase1)
+            .launch_builder(p1)
             .arg(&x_ptr)
             .arg(&gu_q_ptr)
             .arg(&gu_scale_ptr)
@@ -147,9 +232,9 @@ pub fn fused_moe_decode(
             .arg(&stride)
             .arg(&alpha)
             .arg(&limit)
-            .launch(grid(seq * top_k * inter))?;
+            .launch(grid(seq * top_k * inter / rows))?;
         stream
-            .launch_builder(&k.phase2)
+            .launch_builder(p2)
             .arg(&dn_q_ptr)
             .arg(&dn_scale_ptr)
             .arg(&dn_bias_ptr)
@@ -162,7 +247,7 @@ pub fn fused_moe_decode(
             .arg(&tk)
             .arg(&s)
             .arg(&stride)
-            .launch(grid(seq * hidden_dim))?;
+            .launch(grid(seq * hidden_dim / rows))?;
     }
     Ok(())
 }
@@ -427,32 +512,38 @@ mod tests {
             .unwrap();
         let d_out = stream.alloc_zeros::<u8>(tokens * hidden * 4).unwrap();
 
-        fused_moe_decode(
-            &stream,
-            ptr(&d_x),
-            ptr(&d_gu_q),
-            ptr(&d_gu_s),
-            ptr(&d_gu_b),
-            ptr(&d_dn_q),
-            ptr(&d_dn_s),
-            ptr(&d_dn_b),
-            ptr(&d_ids),
-            ptr(&d_w),
-            ptr(&d_hid),
-            ptr(&d_out),
-            hidden,
-            inter,
-            top_k,
-            tokens,
-            idx_row_stride,
-            1.702,
-            7.0,
-        )
-        .unwrap();
-        stream.synchronize().unwrap();
-
-        let got_b = stream.clone_dtoh(&d_out).unwrap();
-        let got: &[f32] = bytemuck::cast_slice(&got_b);
+        // All row-block variants must match the same oracle (R divides the
+        // 64-wide tiny dims, so every kernel pair actually runs).
+        let mut results: Vec<Vec<f32>> = vec![];
+        for rows in [1usize, 2, 4] {
+            fused_moe_decode_with_rows(
+                &stream,
+                rows,
+                ptr(&d_x),
+                ptr(&d_gu_q),
+                ptr(&d_gu_s),
+                ptr(&d_gu_b),
+                ptr(&d_dn_q),
+                ptr(&d_dn_s),
+                ptr(&d_dn_b),
+                ptr(&d_ids),
+                ptr(&d_w),
+                ptr(&d_hid),
+                ptr(&d_out),
+                hidden,
+                inter,
+                top_k,
+                tokens,
+                idx_row_stride,
+                1.702,
+                7.0,
+            )
+            .unwrap();
+            stream.synchronize().unwrap();
+            let got_b = stream.clone_dtoh(&d_out).unwrap();
+            results.push(bytemuck::cast_slice::<u8, f32>(&got_b).to_vec());
+        }
+        let got: &[f32] = &results[0];
 
         use super::super::test_ref::{ChainWeights, host_chain_reference_f32};
         let want = host_chain_reference_f32(

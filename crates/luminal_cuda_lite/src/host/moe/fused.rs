@@ -88,7 +88,9 @@ fn moe_gemm_min_pairs() -> usize {
         std::env::var("LUMINAL_MOE_GEMM_MIN_PAIRS")
             .ok()
             .and_then(|v| v.parse().ok())
-            .unwrap_or(64)
+            // r4 GEMV vs grouped-MMA crossover: r4 2.43ms vs mma 3.69 at 256
+            // pairs; mma 4.36 vs r4 4.85 at 512. (Pre-row-blocking this was 64.)
+            .unwrap_or(256)
     })
 }
 
@@ -747,7 +749,7 @@ mod tests {
             + (hidden * inter / 2 + hidden * inter / 32);
 
         let iters = 50;
-        for &seq in &[16usize, 32, 64, 128] {
+        for &seq in &[1usize, 2, 4, 8, 16, 32, 64, 128] {
             let num_pairs = seq * top_k;
             let mut run = |label: &str, f: &dyn Fn()| {
                 for _ in 0..5 {
@@ -770,30 +772,33 @@ mod tests {
                     floor_gb / (ms / 1e3),
                 );
             };
-            run("gemv", &|| {
-                decode::fused_moe_decode(
-                    &stream,
-                    ptr(&dev[0]),
-                    ptr(&dev[3]),
-                    ptr(&dev[4]),
-                    ptr(&dev[5]),
-                    ptr(&dev[6]),
-                    ptr(&dev[7]),
-                    ptr(&dev[8]),
-                    ptr(&dev[1]),
-                    ptr(&dev[2]),
-                    ptr(&scratch),
-                    ptr(&d_out),
-                    hidden,
-                    inter,
-                    top_k,
-                    seq,
-                    top_k,
-                    SWIGLU_ALPHA,
-                    SWIGLU_LIMIT,
-                )
-                .unwrap()
-            });
+            for rows in [1usize, 2, 4] {
+                run(&format!("gemv_r{rows}"), &|| {
+                    decode::fused_moe_decode_with_rows(
+                        &stream,
+                        rows,
+                        ptr(&dev[0]),
+                        ptr(&dev[3]),
+                        ptr(&dev[4]),
+                        ptr(&dev[5]),
+                        ptr(&dev[6]),
+                        ptr(&dev[7]),
+                        ptr(&dev[8]),
+                        ptr(&dev[1]),
+                        ptr(&dev[2]),
+                        ptr(&scratch),
+                        ptr(&d_out),
+                        hidden,
+                        inter,
+                        top_k,
+                        seq,
+                        top_k,
+                        SWIGLU_ALPHA,
+                        SWIGLU_LIMIT,
+                    )
+                    .unwrap()
+                });
+            }
             {
                 run("mma", &|| {
                     super::execute_grouped(
