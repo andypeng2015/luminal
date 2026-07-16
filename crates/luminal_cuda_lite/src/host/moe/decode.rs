@@ -14,9 +14,7 @@ use std::sync::{Arc, OnceLock};
 
 use crate::{
     compile_module_image_for_current_device,
-    cudarc::driver::{
-        CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg,
-    },
+    cudarc::driver::{CudaFunction, CudaModule, CudaStream, LaunchConfig, PushKernelArg},
 };
 
 const SOURCE: &str = include_str!("decode.cu");
@@ -200,14 +198,21 @@ mod tests {
         let gate_up_n = 2 * inter;
         let mut rng = Lcg(9);
 
-        let fill = |n: usize, rng: &mut Lcg| -> Vec<u8> { (0..n).map(|_| rng.below(256) as u8).collect() };
+        let fill =
+            |n: usize, rng: &mut Lcg| -> Vec<u8> { (0..n).map(|_| rng.below(256) as u8).collect() };
         let gu_q = fill(e_cnt * gate_up_n * hidden / 2, &mut rng);
-        let gu_s: Vec<u8> = (0..e_cnt * gate_up_n * hidden / 32).map(|_| 124 + rng.below(6) as u8).collect();
+        let gu_s: Vec<u8> = (0..e_cnt * gate_up_n * hidden / 32)
+            .map(|_| 124 + rng.below(6) as u8)
+            .collect();
         let dn_q = fill(e_cnt * hidden * inter / 2, &mut rng);
-        let dn_s: Vec<u8> = (0..e_cnt * hidden * inter / 32).map(|_| 124 + rng.below(6) as u8).collect();
+        let dn_s: Vec<u8> = (0..e_cnt * hidden * inter / 32)
+            .map(|_| 124 + rng.below(6) as u8)
+            .collect();
         let gu_b: Vec<f32> = (0..e_cnt * gate_up_n).map(|_| 0.01).collect();
         let dn_b: Vec<f32> = (0..e_cnt * hidden).map(|_| 0.01).collect();
-        let x: Vec<f32> = (0..seq * hidden).map(|_| (rng.below(200) as f32 - 100.0) / 100.0).collect();
+        let x: Vec<f32> = (0..seq * hidden)
+            .map(|_| (rng.below(200) as f32 - 100.0) / 100.0)
+            .collect();
         let ids: Vec<i32> = vec![3, 71, 15, 120];
         let w: Vec<f32> = vec![0.4, 0.3, 0.2, 0.1];
 
@@ -236,7 +241,9 @@ mod tests {
         let d_ids_all = up(bytemuck::cast_slice::<i32, u8>(&ids_all));
         let d_w_all = up(bytemuck::cast_slice::<f32, u8>(&w_all));
         let d_x_all = up(bytemuck::cast_slice::<f32, u8>(&x_all));
-        let d_hid_all = stream.alloc_zeros::<u8>(max_seq * top_k * inter * 4).unwrap();
+        let d_hid_all = stream
+            .alloc_zeros::<u8>(max_seq * top_k * inter * 4)
+            .unwrap();
         let d_out_all = stream.alloc_zeros::<u8>(max_seq * hidden * 4).unwrap();
 
         eprintln!("seq  pairs   us/launch   GB/s(weights)   x36 (ms)");
@@ -245,24 +252,45 @@ mod tests {
             for s_i in [1usize, 2, 4, 8, 16] {
                 let launch = || {
                     fused_moe_decode(
-                        &stream, ptr(&d_x_all), ptr(&d_gu_q), ptr(&d_gu_s), ptr(&d_gu_b),
-                        ptr(&d_dn_q), ptr(&d_dn_s), ptr(&d_dn_b), ptr(&d_ids_all),
-                        ptr(&d_w_all), ptr(&d_hid_all), ptr(&d_out_all),
-                        hidden, inter, top_k, s_i, top_k, 1.702, 7.0,
+                        &stream,
+                        ptr(&d_x_all),
+                        ptr(&d_gu_q),
+                        ptr(&d_gu_s),
+                        ptr(&d_gu_b),
+                        ptr(&d_dn_q),
+                        ptr(&d_dn_s),
+                        ptr(&d_dn_b),
+                        ptr(&d_ids_all),
+                        ptr(&d_w_all),
+                        ptr(&d_hid_all),
+                        ptr(&d_out_all),
+                        hidden,
+                        inter,
+                        top_k,
+                        s_i,
+                        top_k,
+                        1.702,
+                        7.0,
                     )
                     .unwrap()
                 };
-                for _ in 0..20 { launch(); }
+                for _ in 0..20 {
+                    launch();
+                }
                 stream.synchronize().unwrap();
                 let iters = 200;
                 let t = std::time::Instant::now();
-                for _ in 0..iters { launch(); }
+                for _ in 0..iters {
+                    launch();
+                }
                 stream.synchronize().unwrap();
                 let us = t.elapsed().as_secs_f64() * 1e6 / iters as f64;
                 // distinct expert rows touched (worst case: all pairs distinct)
                 let bytes = (s_i * top_k).min(e_cnt)
-                    * (gate_up_n * hidden / 2 + gate_up_n * hidden / 32
-                        + hidden * inter / 2 + hidden * inter / 32);
+                    * (gate_up_n * hidden / 2
+                        + gate_up_n * hidden / 32
+                        + hidden * inter / 2
+                        + hidden * inter / 32);
                 let gbps = bytes as f64 / (us * 1e-6) / 1e9;
                 eprintln!(
                     "{name}     {s_i:>3}  {:>5}   {us:>8.1}   {gbps:>10.0}      {:>6.2}",
@@ -281,12 +309,20 @@ mod tests {
         let stream = ctx.default_stream();
         let (e_cnt, n_dim, k_dim) = (3usize, 8usize, 64usize);
         let mut rng = Lcg(5);
-        let bq: Vec<u8> = (0..e_cnt * n_dim * k_dim / 2).map(|_| rng.below(256) as u8).collect();
-        let bs: Vec<u8> = (0..e_cnt * n_dim * k_dim / 32).map(|_| 120 + rng.below(12) as u8).collect();
-        let vec: Vec<f32> = (0..k_dim).map(|_| (rng.below(200) as f32 - 100.0) / 40.0).collect();
+        let bq: Vec<u8> = (0..e_cnt * n_dim * k_dim / 2)
+            .map(|_| rng.below(256) as u8)
+            .collect();
+        let bs: Vec<u8> = (0..e_cnt * n_dim * k_dim / 32)
+            .map(|_| 120 + rng.below(12) as u8)
+            .collect();
+        let vec: Vec<f32> = (0..k_dim)
+            .map(|_| (rng.below(200) as f32 - 100.0) / 40.0)
+            .collect();
         let d_bq = stream.clone_htod(&bq).unwrap();
         let d_bs = stream.clone_htod(&bs).unwrap();
-        let d_v = stream.clone_htod(bytemuck::cast_slice::<f32, u8>(&vec)).unwrap();
+        let d_v = stream
+            .clone_htod(bytemuck::cast_slice::<f32, u8>(&vec))
+            .unwrap();
         let d_out = stream.alloc_zeros::<u8>(4).unwrap();
         let k = kernel(&stream);
         for (e, row) in [(0usize, 0usize), (1, 3), (2, 7), (1, 5)] {
@@ -300,8 +336,14 @@ mod tests {
             unsafe {
                 stream
                     .launch_builder(&k.debug_dot)
-                    .arg(&pq).arg(&ps).arg(&pv).arg(&po)
-                    .arg(&ei).arg(&ni).arg(&ki).arg(&ri)
+                    .arg(&pq)
+                    .arg(&ps)
+                    .arg(&pv)
+                    .arg(&po)
+                    .arg(&ei)
+                    .arg(&ni)
+                    .arg(&ki)
+                    .arg(&ri)
                     .launch(LaunchConfig {
                         grid_dim: (1, 1, 1),
                         block_dim: (32, 1, 1),
@@ -380,7 +422,9 @@ mod tests {
         let d_dn_q = up(&dn_q);
         let d_dn_s = up(&dn_s);
         let d_dn_b = up(&to_bf16_bytes(&dn_bias));
-        let d_hid = stream.alloc_zeros::<u8>(tokens * top_k * inter * 4).unwrap();
+        let d_hid = stream
+            .alloc_zeros::<u8>(tokens * top_k * inter * 4)
+            .unwrap();
         let d_out = stream.alloc_zeros::<u8>(tokens * hidden * 4).unwrap();
 
         fused_moe_decode(

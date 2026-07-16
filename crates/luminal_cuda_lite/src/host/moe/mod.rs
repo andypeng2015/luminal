@@ -1,5 +1,8 @@
+pub mod align;
 pub mod decode;
 pub mod fused;
+pub mod moe_gemm;
+pub mod moe_ops;
 #[cfg(test)]
 pub(crate) mod test_ref;
 
