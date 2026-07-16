@@ -2121,7 +2121,9 @@ mod tests {
     #[test]
     #[ignore = "probe, run explicitly"]
     fn probe_mixed_dtype_support() {
-        let Ok(ctx) = crate::cudarc::driver::CudaContext::new(0) else { return };
+        let Ok(ctx) = crate::cudarc::driver::CudaContext::new(0) else {
+            return;
+        };
         let stream = ctx.default_stream();
         let cublaslt = std::sync::Arc::new(CudaBlasLT::new(stream.clone()).unwrap());
         // q_proj decode shape: [1,2880] x [2880,4096]
@@ -2142,13 +2144,30 @@ mod tests {
             order: cublasLtOrder_t::CUBLASLT_ORDER_ROW,
         };
         let combos = [
-            ("f32 x f32   -> f32", cudaDataType::CUDA_R_32F, cudaDataType::CUDA_R_32F),
-            ("f32 x bf16  -> f32", cudaDataType::CUDA_R_32F, cudaDataType::CUDA_R_16BF),
-            ("bf16 x bf16 -> f32", cudaDataType::CUDA_R_16BF, cudaDataType::CUDA_R_16BF),
+            (
+                "f32 x f32   -> f32",
+                cudaDataType::CUDA_R_32F,
+                cudaDataType::CUDA_R_32F,
+            ),
+            (
+                "f32 x bf16  -> f32",
+                cudaDataType::CUDA_R_32F,
+                cudaDataType::CUDA_R_16BF,
+            ),
+            (
+                "bf16 x bf16 -> f32",
+                cudaDataType::CUDA_R_16BF,
+                cudaDataType::CUDA_R_16BF,
+            ),
         ];
         for (name, at, bt) in combos {
             let spec = LtMatmulSpec {
-                problem: LtMatmulProblem { m, n, k, batch_count: 1 },
+                problem: LtMatmulProblem {
+                    m,
+                    n,
+                    k,
+                    batch_count: 1,
+                },
                 trans_a: cublasOperation_t::CUBLAS_OP_N,
                 trans_b: cublasOperation_t::CUBLAS_OP_N,
                 a: mat(at, m, k),
@@ -2164,7 +2183,15 @@ mod tests {
                 },
                 workspace_size: 1024 * 1024,
             };
-            let ptrs = LtMatmulPointers { a, b, c: d, d, bias: None, a_scale: None, b_scale: None };
+            let ptrs = LtMatmulPointers {
+                a,
+                b,
+                c: d,
+                d,
+                bias: None,
+                a_scale: None,
+                b_scale: None,
+            };
             match prepare_cublaslt_matmul(&stream, &cublaslt, &spec, ptrs) {
                 Ok(_) => eprintln!("{name}: SUPPORTED (heuristic returned an algorithm)"),
                 Err(e) => eprintln!("{name}: NOT SUPPORTED ({e})"),
