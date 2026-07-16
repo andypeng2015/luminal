@@ -37,50 +37,12 @@ use super::{
     flashinfer_workspaces,
 };
 
-/// Per-tick FA3 plan cache. Within one engine tick every layer's
-/// SinkAttention sees the same indptrs, so the two DtoH indptr reads and the
-/// host-side plan need to run once per tick, not once per layer (36x). Tick
-/// boundaries are detected structurally: node indices are unique within one
-/// graph execution, so a repeating node index means the graph is running
-/// again (next tick, or the next profiling trial) and the cache refreshes.
-/// The indptr buffer pointers are part of the key so interleaved graphs
-/// (tests, multi-engine) can't cross-hit.
-struct TickPlanCache {
-    seen_nodes: FxHashMap<usize, ()>,
-    qo_ptr: u64,
-    kv_ptr: u64,
-    /// Sorted dyn-dim snapshot. Guards graph switches that reuse the same
-    /// input buffers without repeating a node — concretely, the first real
-    /// tick after schedule search, which would otherwise reuse the last
-    /// profiling trial's plan (dummy indptrs) with real data.
-    dyn_key: Vec<(char, usize)>,
-    qo_indptr: Vec<i32>,
-    kv_indptr: Vec<i32>,
-    plan_info: [i64; 16],
-    plan_info_len: i32,
-    /// Split-KV decode state for FULL-attention layers this tick; None ⇒
-    /// every layer takes the single-pass path.
-    split: Option<SplitState>,
-}
-
-/// Per-tick split-KV decode plan: the expanded (one-entry-per-chunk) batch's
-/// plan_info (backed by SPLIT_INT_WORKSPACE, not the shared int workspace)
-/// plus the metadata already uploaded into SPLIT_SCRATCH.
-struct SplitState {
-    plan_info: [i64; 16],
-    plan_info_len: i32,
-    p_total: usize,
-    batch: usize,
-}
-
-static TICK_PLAN: std::sync::Mutex<Option<TickPlanCache>> = std::sync::Mutex::new(None);
-
 /// Grow-only device scratch (q transpose in, kernel output out), reused
 /// across calls instead of a per-call alloc + trailing sync. Stream-ordered
-/// reuse on the same stream is safe; on a stream change (tests) the old
-/// buffers are leaked rather than dropped, since their context may be gone
-/// and in-flight kernels may still read them. Bounded by the largest tick
-/// (~1 MiB at s=128), so leaking on replace/grow costs nothing real.
+/// reuse on the same stream is safe (each execute's indptr-readback sync
+/// drains prior consumers); on a stream change (tests) the old buffers are
+/// leaked rather than dropped, since their context may be gone. Bounded by
+/// the largest tick, so leaking on replace/grow costs nothing real.
 static SCRATCH: std::sync::Mutex<Option<(usize, crate::cudarc::driver::CudaSlice<u8>)>> =
     std::sync::Mutex::new(None);
 
@@ -90,18 +52,6 @@ static SCRATCH: std::sync::Mutex<Option<(usize, crate::cudarc::driver::CudaSlice
 /// merge indptr [B+1 i32], fake sinks [H × -1e30 f32].
 static SPLIT_SCRATCH: std::sync::Mutex<Option<(usize, crate::cudarc::driver::CudaSlice<u8>)>> =
     std::sync::Mutex::new(None);
-
-/// Second 8 MiB int workspace: the shared one holds the tick's single-pass
-/// plan (sliding layers use it all tick), so the expanded split plan needs
-/// its own backing store. One live plan per workspace.
-static SPLIT_INT_WORKSPACE: std::sync::Mutex<
-    Option<(usize, crate::cudarc::driver::CudaSlice<u8>)>,
-> = std::sync::Mutex::new(None);
-
-/// Dedicated pinned staging for the split plan, so plan B never races the
-/// shared PAGE_LOCKED_WORKSPACE that plan A's async HtoD may still be
-/// draining from.
-static SPLIT_PINNED: std::sync::OnceLock<PageLockedPtr> = std::sync::OnceLock::new();
 
 /// Split-KV decode schedule: how one pure-decode tick's sequences partition
 /// into KV chunks. All host-side; built once per tick from the cached
@@ -153,6 +103,8 @@ fn compute_split_schedule(
         return None;
     }
     let b = qo_indptr.len().checked_sub(1)?;
+    // w[1] - w[0] == 1 for all query_index_pointers means we are in a decode only
+    // situation, so no need to do splitting
     if b == 0 || !qo_indptr.windows(2).all(|w| w[1] - w[0] == 1) {
         return None;
     }
@@ -204,8 +156,7 @@ fn compute_split_schedule(
 }
 
 /// Byte offsets of the SPLIT_SCRATCH sections for a given schedule size.
-/// Deterministic in (p, b, h, d) so execute can recompute them from
-/// SplitState instead of storing pointers.
+/// Deterministic in (p, b, h, d).
 struct SplitOffsets {
     q_exp: usize,
     partial_out: usize,
@@ -259,104 +210,6 @@ fn grow_only_buffer(
         *guard = Some((stream_key, buf));
     }
     Ok(guard.as_ref().unwrap().1.device_ptr(stream).0)
-}
-
-/// Build the tick's split-KV plan (plan B) + upload its metadata. Called from
-/// the refresh path only (after the single-pass plan A), so the stream has
-/// already synchronized. Any failure degrades to None — the tick falls back
-/// to single-pass, never errors.
-#[allow(clippy::too_many_arguments)]
-fn build_split_state(
-    stream: &Arc<CudaStream>,
-    cu_stream: *mut std::ffi::c_void,
-    float_ws_ptr: u64,
-    qo_indptr: &[i32],
-    kv_indptr: &[i32],
-    num_qo_heads: usize,
-    num_kv_heads: usize,
-    head_dim: usize,
-) -> Option<SplitState> {
-    let sched =
-        compute_split_schedule(qo_indptr, kv_indptr, device_sm_count(), num_kv_heads as i32)?;
-    let p_total = sched.token_map.len();
-    let batch = qo_indptr.len() - 1;
-
-    let build = || -> anyhow::Result<SplitState> {
-        // Scratch + metadata upload. Pageable host memory: the async HtoD
-        // degrades to a synchronous copy, which is fine once per tick for
-        // ~9 KiB and lets the temporaries drop immediately.
-        let offs = split_offsets(p_total, batch, num_qo_heads, head_dim);
-        let base = grow_only_buffer(&SPLIT_SCRATCH, stream, offs.total)?;
-        let neg_sinks = vec![-1e30f32; num_qo_heads];
-        unsafe {
-            let htod = |off: usize, bytes: &[u8]| -> anyhow::Result<()> {
-                result::memcpy_htod_async(base + off as u64, bytes, stream.cu_stream())?;
-                Ok(())
-            };
-            htod(offs.token_map, bytemuck_i32(&sched.token_map))?;
-            htod(offs.merge_indptr, bytemuck_i32(&sched.merge_indptr))?;
-            htod(offs.neg_sinks, bytemuck_f32(&neg_sinks))?;
-        }
-
-        // Plan B: own int workspace + own pinned staging (the shared ones
-        // hold plan A for the tick's sliding layers).
-        let split_int_ws = grow_only_buffer(&SPLIT_INT_WORKSPACE, stream, INT_WORKSPACE_SIZE)?;
-        let pinned = SPLIT_PINNED.get_or_init(|| unsafe {
-            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-            let status = libc::posix_memalign(&mut ptr, 4096, INT_WORKSPACE_SIZE);
-            assert_eq!(status, 0, "Failed to allocate split page-locked workspace");
-            let cuda_status = cuda_pin_memory(ptr, INT_WORKSPACE_SIZE);
-            assert_eq!(cuda_status, 0, "Failed to pin split workspace");
-            PageLockedPtr(ptr as *mut u8)
-        });
-
-        // The plan is window-independent; the split path only ever runs full
-        // attention, so plan and run both use the swa=0 variant.
-        let lib = jit::ensure_compiled_fa3(head_dim, false);
-        let mut qo = sched.qo_indptr.clone();
-        let mut kvp = sched.kv_indptr.clone();
-        let mut kvl = sched.kv_len_arr.clone();
-        let mut plan_info = [0i64; 16];
-        let mut plan_info_len: i32 = 0;
-        let plan_ret = unsafe {
-            (lib.prefill_plan)(
-                float_ws_ptr as *mut std::ffi::c_void,
-                super::FLOAT_WORKSPACE_SIZE,
-                split_int_ws as *mut std::ffi::c_void,
-                pinned.0 as *mut std::ffi::c_void,
-                INT_WORKSPACE_SIZE,
-                qo.as_mut_ptr(),
-                kvp.as_mut_ptr(),
-                kvl.as_mut_ptr(),
-                p_total as i32,
-                p_total as i32,
-                num_qo_heads as i32,
-                num_kv_heads as i32,
-                /*page_size=*/ 1,
-                /*causal=*/ 1,
-                cu_stream,
-                plan_info.as_mut_ptr(),
-                &mut plan_info_len,
-            )
-        };
-        anyhow::ensure!(plan_ret == 0, "split plan failed ({plan_ret})");
-        Ok(SplitState {
-            plan_info,
-            plan_info_len,
-            p_total,
-            batch,
-        })
-    };
-    match build() {
-        Ok(s) => Some(s),
-        Err(e) => {
-            static WARNED: std::sync::Once = std::sync::Once::new();
-            WARNED.call_once(|| {
-                eprintln!("SinkAttention: split-KV disabled for this run: {e}");
-            });
-            None
-        }
-    }
 }
 
 fn bytemuck_i32(v: &[i32]) -> &[u8] {
@@ -547,145 +400,120 @@ impl HostOp for SinkAttention {
         let lib = jit::ensure_compiled_fa3(self.head_dim, self.window_left >= 0);
         let (_float_ws, float_ws_ptr, _int_ws, int_ws_ptr) = flashinfer_workspaces(stream);
 
-        // Plan once per tick (see TickPlanCache): sliding and full layers use
-        // different .so variants, but the plan is window-independent and both
-        // variants compile the identical PrefillSM90Plan, so one plan serves
-        // all 36 layers.
-        let self_idx = self_node.index();
-        let mut dyn_key: Vec<(char, usize)> = _dyn_map.iter().map(|(&k, &v)| (k, v)).collect();
-        dyn_key.sort_unstable();
-        let mut plan_guard = TICK_PLAN.lock().unwrap_or_else(|e| e.into_inner());
-        let reuse = plan_guard.as_ref().is_some_and(|c| {
-            c.qo_ptr == qo_indptr_buf.ptr()
-                && c.kv_ptr == kv_indptr_buf.ptr()
-                && c.dyn_key == dyn_key
-                && !c.seen_nodes.contains_key(&self_idx)
-        });
-        if !reuse {
-            // The plan rewrites the shared page-locked host buffer; sync so
-            // the PREVIOUS plan's async HtoD out of that buffer (and any
-            // kernels still reading scratch we're about to reuse) are done.
+        // Read the indptrs back to the host: the FA3 plan is host-side and
+        // runs once per execute. The first read's synchronize also drains
+        // the previous execute's async traffic out of the shared pinned plan
+        // buffer and the scratch pools before this call rewrites them.
+        // (A per-tick plan cache existed briefly — d6d022be — but its
+        // tick-detection machinery wasn't worth ~2.6ms/tick at this stage;
+        // the commit is the reference if it earns its way back.)
+        let read_device_i32s = |b: DeviceBuffer| -> anyhow::Result<Vec<i32>> {
+            let mut host_bytes = vec![0u8; b.len()];
+            unsafe {
+                result::memcpy_dtoh_async(&mut host_bytes, b.ptr(), stream.cu_stream())?;
+            }
             stream.synchronize()?;
-
-            let read_device_i32s = |b: DeviceBuffer| -> anyhow::Result<Vec<i32>> {
-                let mut host_bytes = vec![0u8; b.len()];
-                unsafe {
-                    result::memcpy_dtoh_async(&mut host_bytes, b.ptr(), stream.cu_stream())?;
-                }
-                stream.synchronize()?;
-                Ok(bytes_to_i32_vec(host_bytes))
-            };
-            let mut qo_indptr = read_device_i32s(qo_indptr_buf)?;
-            let mut kv_indptr = read_device_i32s(kv_indptr_buf)?;
-            anyhow::ensure!(
-                qo_indptr.len() == kv_indptr.len() && qo_indptr.len() >= 2,
-                "SinkAttention: malformed indptrs (qo len {}, kv len {})",
-                qo_indptr.len(),
-                kv_indptr.len()
-            );
-            let batch_size = qo_indptr.len() - 1;
-            let nnz_qo = *qo_indptr.last().unwrap() as usize;
-            // page_size = 1: per-sequence kv length in tokens == pages.
-            let mut kv_len_arr: Vec<i32> = kv_indptr.windows(2).map(|w| w[1] - w[0]).collect();
-
-            let page_locked = PAGE_LOCKED_WORKSPACE.get_or_init(|| unsafe {
-                let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
-                let status = libc::posix_memalign(&mut ptr, 4096, INT_WORKSPACE_SIZE);
-                assert_eq!(status, 0, "Failed to allocate page-locked workspace");
-                let cuda_status = cuda_pin_memory(ptr, INT_WORKSPACE_SIZE);
-                assert_eq!(cuda_status, 0, "Failed to pin memory");
-                PageLockedPtr(ptr as *mut u8)
-            });
-
-            let mut plan_info = [0i64; 16];
-            let mut plan_info_len: i32 = 0;
-            let plan_ret = unsafe {
-                (lib.prefill_plan)(
-                    float_ws_ptr as *mut std::ffi::c_void,
-                    super::FLOAT_WORKSPACE_SIZE,
-                    int_ws_ptr as *mut std::ffi::c_void,
-                    page_locked.0 as *mut std::ffi::c_void,
-                    INT_WORKSPACE_SIZE,
-                    qo_indptr.as_mut_ptr(),
-                    kv_indptr.as_mut_ptr(),
-                    kv_len_arr.as_mut_ptr(),
-                    nnz_qo as i32,
-                    batch_size as i32,
-                    self.num_qo_heads as i32,
-                    self.num_kv_heads as i32,
-                    /*page_size=*/ 1,
-                    /*causal=*/ 1,
-                    cu_stream,
-                    plan_info.as_mut_ptr(),
-                    &mut plan_info_len,
-                )
-            };
-            anyhow::ensure!(plan_ret == 0, "SinkAttention: fa3 plan failed ({plan_ret})");
-
-            // Plan B: split-KV decode for the tick's full-attention layers
-            // (None on prefill/mixed/short-context ticks — single-pass).
-            let split = build_split_state(
-                stream,
-                cu_stream,
-                float_ws_ptr,
-                &qo_indptr,
-                &kv_indptr,
-                self.num_qo_heads,
-                self.num_kv_heads,
-                self.head_dim,
-            );
-
-            let mut seen_nodes = FxHashMap::default();
-            seen_nodes.insert(self_idx, ());
-            *plan_guard = Some(TickPlanCache {
-                seen_nodes,
-                qo_ptr: qo_indptr_buf.ptr(),
-                kv_ptr: kv_indptr_buf.ptr(),
-                dyn_key,
-                qo_indptr,
-                kv_indptr,
-                plan_info,
-                plan_info_len,
-                split,
-            });
-        } else {
-            plan_guard.as_mut().unwrap().seen_nodes.insert(self_idx, ());
-        }
-        let cache = plan_guard.as_ref().unwrap();
-        let nnz_qo = *cache.qo_indptr.last().unwrap() as usize;
-        let total_pages = *cache.kv_indptr.last().unwrap() as usize;
+            Ok(bytes_to_i32_vec(host_bytes))
+        };
+        let mut qo_indptr = read_device_i32s(qo_indptr_buf)?;
+        let mut kv_indptr = read_device_i32s(kv_indptr_buf)?;
+        anyhow::ensure!(
+            qo_indptr.len() == kv_indptr.len() && qo_indptr.len() >= 2,
+            "SinkAttention: malformed indptrs (qo len {}, kv len {})",
+            qo_indptr.len(),
+            kv_indptr.len()
+        );
+        let batch_size = qo_indptr.len() - 1;
+        let nnz_qo = *qo_indptr.last().unwrap() as usize;
+        let total_pages = *kv_indptr.last().unwrap() as usize;
         anyhow::ensure!(
             kv_indices.len() >= total_pages * std::mem::size_of::<i32>(),
             "SinkAttention: kv_indices buffer smaller than kv_indptr total"
         );
-        let mut plan_info = cache.plan_info;
-        let plan_info_len = cache.plan_info_len;
+        // page_size = 1: per-sequence kv length in tokens == pages.
+        let mut kv_len_arr: Vec<i32> = kv_indptr.windows(2).map(|w| w[1] - w[0]).collect();
+
+        let page_locked = PAGE_LOCKED_WORKSPACE.get_or_init(|| unsafe {
+            let mut ptr: *mut std::ffi::c_void = std::ptr::null_mut();
+            let status = libc::posix_memalign(&mut ptr, 4096, INT_WORKSPACE_SIZE);
+            assert_eq!(status, 0, "Failed to allocate page-locked workspace");
+            let cuda_status = cuda_pin_memory(ptr, INT_WORKSPACE_SIZE);
+            assert_eq!(cuda_status, 0, "Failed to pin memory");
+            PageLockedPtr(ptr as *mut u8)
+        });
+
+        let sm_scale = if self.sm_scale == 0.0 {
+            1.0 / (self.head_dim as f32).sqrt()
+        } else {
+            self.sm_scale as f32
+        };
 
         // ── Split-KV decode path (full-attention layers, pure-decode ticks
-        // with long context). Chunks were planned at refresh; run the kernel
-        // over the expanded batch with FAKE sinks (-1e30 ⇒ the per-chunk
-        // finalize adds exactly 0 to the denominator) and non-null LSE, then
-        // merge with the REAL sink injected exactly once. ──
+        // with long context): run the kernel over an expanded one-entry-per-
+        // chunk batch with FAKE sinks (-1e30 ⇒ the per-chunk finalize adds
+        // exactly 0 to the denominator) and non-null LSE, then merge with
+        // the REAL sink injected exactly once. Only one plan is live per
+        // execute, so the shared workspaces serve both paths. ──
         if self.window_left < 0 {
-            if let Some(split) = cache.split.as_ref() {
-                anyhow::ensure!(
-                    split.batch == nnz_qo,
-                    "SinkAttention split: batch {} != nnz_qo {nnz_qo}",
-                    split.batch
-                );
-                let offs =
-                    split_offsets(split.p_total, split.batch, self.num_qo_heads, self.head_dim);
-                // Base can't have moved since refresh: growth only happens
-                // there, and stream/key mismatches force a refresh first.
+            if let Some(sched) = compute_split_schedule(
+                &qo_indptr,
+                &kv_indptr,
+                device_sm_count(),
+                self.num_kv_heads as i32,
+            ) {
+                let p_total = sched.token_map.len();
+                let offs = split_offsets(p_total, batch_size, self.num_qo_heads, self.head_dim);
                 let base = grow_only_buffer(&SPLIT_SCRATCH, stream, offs.total)?;
-                let p = split.p_total as i32;
+                // Pageable host memory: the async HtoD degrades to a
+                // synchronous copy — fine for ~9 KiB.
+                let neg_sinks = vec![-1e30f32; self.num_qo_heads];
+                unsafe {
+                    let htod = |off: usize, bytes: &[u8]| -> anyhow::Result<()> {
+                        result::memcpy_htod_async(base + off as u64, bytes, stream.cu_stream())?;
+                        Ok(())
+                    };
+                    htod(offs.token_map, bytemuck_i32(&sched.token_map))?;
+                    htod(offs.merge_indptr, bytemuck_i32(&sched.merge_indptr))?;
+                    htod(offs.neg_sinks, bytemuck_f32(&neg_sinks))?;
+                }
+
+                let mut qo = sched.qo_indptr;
+                let mut kvp = sched.kv_indptr;
+                let mut kvl = sched.kv_len_arr;
+                let mut plan_info = [0i64; 16];
+                let mut plan_info_len: i32 = 0;
+                let plan_ret = unsafe {
+                    (lib.prefill_plan)(
+                        float_ws_ptr as *mut std::ffi::c_void,
+                        super::FLOAT_WORKSPACE_SIZE,
+                        int_ws_ptr as *mut std::ffi::c_void,
+                        page_locked.0 as *mut std::ffi::c_void,
+                        INT_WORKSPACE_SIZE,
+                        qo.as_mut_ptr(),
+                        kvp.as_mut_ptr(),
+                        kvl.as_mut_ptr(),
+                        p_total as i32,
+                        p_total as i32,
+                        self.num_qo_heads as i32,
+                        self.num_kv_heads as i32,
+                        /*page_size=*/ 1,
+                        /*causal=*/ 1,
+                        cu_stream,
+                        plan_info.as_mut_ptr(),
+                        &mut plan_info_len,
+                    )
+                };
+                anyhow::ensure!(
+                    plan_ret == 0,
+                    "SinkAttention: split plan failed ({plan_ret})"
+                );
 
                 let exp_ret = unsafe {
                     (lib.expand_q_bf16)(
                         q.ptr() as *const std::ffi::c_void,
                         (base + offs.q_exp as u64) as *mut std::ffi::c_void,
                         (base + offs.token_map as u64) as *const i32,
-                        p,
+                        p_total as i32,
                         nnz_qo as i32,
                         self.num_qo_heads as i32,
                         self.head_dim as i32,
@@ -694,19 +522,11 @@ impl HostOp for SinkAttention {
                 };
                 anyhow::ensure!(exp_ret == 0, "SinkAttention split: expand_q failed");
 
-                let split_int_ws =
-                    grow_only_buffer(&SPLIT_INT_WORKSPACE, stream, INT_WORKSPACE_SIZE)?;
-                let mut split_plan_info = split.plan_info;
-                let sm_scale = if self.sm_scale == 0.0 {
-                    1.0 / (self.head_dim as f32).sqrt()
-                } else {
-                    self.sm_scale as f32
-                };
                 let run_ret = unsafe {
                     (lib.prefill_run)(
-                        split_int_ws as *mut std::ffi::c_void,
-                        split_plan_info.as_mut_ptr(),
-                        split.plan_info_len,
+                        int_ws_ptr as *mut std::ffi::c_void,
+                        plan_info.as_mut_ptr(),
+                        plan_info_len,
                         (base + offs.q_exp as u64) as *mut std::ffi::c_void,
                         k_pool.ptr() as *mut std::ffi::c_void,
                         v_pool.ptr() as *mut std::ffi::c_void,
@@ -714,7 +534,7 @@ impl HostOp for SinkAttention {
                         (base + offs.neg_sinks as u64) as *mut f32,
                         (base + offs.partial_out as u64) as *mut std::ffi::c_void,
                         (base + offs.partial_lse as u64) as *mut f32,
-                        p,
+                        p_total as i32,
                         self.num_qo_heads as i32,
                         self.num_kv_heads as i32,
                         /*page_size=*/ 1,
@@ -737,7 +557,7 @@ impl HostOp for SinkAttention {
                         (base + offs.merge_indptr as u64) as *const i32,
                         sinks.ptr() as *const f32,
                         out.ptr() as *mut std::ffi::c_void,
-                        split.batch as i32,
+                        batch_size as i32,
                         self.num_qo_heads as i32,
                         self.head_dim as i32,
                         cu_stream,
@@ -747,6 +567,32 @@ impl HostOp for SinkAttention {
                 return Ok(());
             }
         }
+
+        // ── Single-pass path ──
+        let mut plan_info = [0i64; 16];
+        let mut plan_info_len: i32 = 0;
+        let plan_ret = unsafe {
+            (lib.prefill_plan)(
+                float_ws_ptr as *mut std::ffi::c_void,
+                super::FLOAT_WORKSPACE_SIZE,
+                int_ws_ptr as *mut std::ffi::c_void,
+                page_locked.0 as *mut std::ffi::c_void,
+                INT_WORKSPACE_SIZE,
+                qo_indptr.as_mut_ptr(),
+                kv_indptr.as_mut_ptr(),
+                kv_len_arr.as_mut_ptr(),
+                nnz_qo as i32,
+                batch_size as i32,
+                self.num_qo_heads as i32,
+                self.num_kv_heads as i32,
+                /*page_size=*/ 1,
+                /*causal=*/ 1,
+                cu_stream,
+                plan_info.as_mut_ptr(),
+                &mut plan_info_len,
+            )
+        };
+        anyhow::ensure!(plan_ret == 0, "SinkAttention: fa3 plan failed ({plan_ret})");
 
         // Kernel-native (s, heads, dim) bf16 scratch (front half: transposed
         // q in, back half: kernel out), from the grow-only pool. Reuse is
