@@ -14,8 +14,7 @@
 //!
 //! The rewrite rule (sink_attention.egg) matches the paged gpt-oss sink
 //! attention chain and unions this op in; which host-mask Input feeds the
-//! chain ("mask_sliding" vs "mask_full") selects window_left. Disable with
-//! LUMINAL_DISABLE_SINK_ATTENTION=1.
+//! chain ("mask_sliding" vs "mask_full") selects window_left.
 
 use std::sync::Arc;
 
@@ -98,10 +97,6 @@ impl EgglogOp for SinkAttention {
         // The FA3 kernels are Hopper-only (sm_90a WGMMA/TMA): emit no rules
         // on other architectures so the search never selects the op there.
         if crate::device_compute_major() != 9 {
-            return vec![];
-        }
-        // Kill switch for A/B-ing compile cost and for emergencies.
-        if std::env::var("LUMINAL_DISABLE_SINK_ATTENTION").is_ok_and(|v| v == "1") {
             return vec![];
         }
         vec![Rule::raw(include_str!("sink_attention.egg"))]

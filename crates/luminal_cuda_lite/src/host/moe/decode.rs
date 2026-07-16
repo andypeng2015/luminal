@@ -92,17 +92,9 @@ pub fn warm(stream: &Arc<CudaStream>) {
 /// launch by 5-16% across seq 1..16
 /// tokens. All pointers are device addresses; see decode.cu for layouts.
 /// Rows-per-warp for the GEMV: 1 = original kernels, 2/4 = row-blocked.
-/// `LUMINAL_MOE_GEMV_ROWS` overrides; dims not divisible by R fall back to 1.
-fn gemv_rows_default() -> usize {
-    static ROWS: OnceLock<usize> = OnceLock::new();
-    *ROWS.get_or_init(|| {
-        std::env::var("LUMINAL_MOE_GEMV_ROWS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            .filter(|r| matches!(r, 1 | 2 | 4))
-            .unwrap_or(4) // bench: r4 fastest at every seq 1..128 (2-3x r1)
-    })
-}
+/// Bench: r4 fastest at every seq 1..128 (2-3x r1); dims not divisible by
+/// R fall back to 1 inside `fused_moe_decode_with_rows`.
+const GEMV_ROWS: usize = 4;
 
 #[allow(clippy::too_many_arguments)]
 pub fn fused_moe_decode(
@@ -128,7 +120,7 @@ pub fn fused_moe_decode(
 ) -> anyhow::Result<()> {
     fused_moe_decode_with_rows(
         stream,
-        gemv_rows_default(),
+        GEMV_ROWS,
         x_ptr,
         gu_q_ptr,
         gu_scale_ptr,

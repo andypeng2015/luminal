@@ -1,13 +1,9 @@
-//! Launch wrapper + tests for `moe.cu`'s `fused_moe_mxfp4_gemm`: the grouped
-//! MoE GEMM consuming the `align` building block's outputs (tokens gathered
-//! to resident MXFP4 weights). Semantics follow the Triton spec-of-record at
-//! `harness/fused_moe_mxfp4_triton.py`; this CUDA version stages f32 tiles in
-//! shared memory and accumulates with scalar fmaf (more precise than the
-//! Triton kernel, which rounds scaled weights to bf16 before `tl.dot`).
-//! `fused_moe_mxfp4_gemm_mma` is the tensor-core variant (BM=16 m16n8k16
-//! tiles, register dequant, one packed fp4 byte per B operand register);
-//! the SIMT kernel stays as the correctness baseline until the bench data
-//! decides its fate.
+//! Launch wrapper + tests for `moe.cu`'s `fused_moe_mxfp4_gemm_mma`: the
+//! grouped MoE GEMM consuming the `align` building block's outputs (tokens
+//! gathered to resident MXFP4 weights). Semantics follow the Triton
+//! spec-of-record at `harness/fused_moe_mxfp4_triton.py`; this CUDA version
+//! uses tensor cores (BM=16 m16n8k16 tiles, register dequant, one packed fp4
+//! byte per B operand register).
 //!
 //! Verification is oracle-based: `harness/moe_gemm_oracle.py` runs the Triton
 //! reference on pinned inputs (including host-computed align metadata, so

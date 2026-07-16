@@ -827,13 +827,6 @@ impl PreparedFlashInferDecode {
 
 pub(crate) fn flashinfer_graph_plan_capacity(actual_c: usize, max_kv_pages: usize) -> usize {
     let required = actual_c.max(1);
-    if let Some(capacity) = std::env::var("LUMINAL_FLASHINFER_DECODE_GRAPH_CAPACITY")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .filter(|&value| value > 0)
-    {
-        return capacity.max(required);
-    }
     // Tiered capacity instead of the full KV pool: planning at the pool size
     // (e.g. 4096) makes the decode kernel split KV into a padded grid that is
     // mostly invalid blocks at short contexts (measured 6.3µs decode + 2.3µs

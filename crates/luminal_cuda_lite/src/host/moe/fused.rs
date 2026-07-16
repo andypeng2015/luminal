@@ -71,43 +71,16 @@ fn ensure_kernels_compiled() {
 
 /// Which MoE implementation `execute` runs. Grouped = the expert-grouped
 /// (tokens-to-weights) GEMM chain; Gemv = the per-token fused decode kernel.
-/// `LUMINAL_MOE_FORCE_PATH=gemv|grouped` overrides for A/B and rollback
-/// (gemv = full rollback to the pre-grouped behavior). Unset: grouped when
-/// num_pairs > LUMINAL_MOE_GEMM_MIN_PAIRS (default 64) — the bench crossover
-/// (gemv 1.80/3.48/7.00/14.20 ms vs mma 1.90/2.69/3.68/4.36 ms at
-/// seq 16/32/64/128, i.e. pairs 64/128/256/512).
+/// Grouped when num_pairs > MOE_GEMM_MIN_PAIRS — the bench crossover:
+/// r4 GEMV 2.43ms vs grouped-MMA 3.69 at 256 pairs; mma 4.36 vs r4 4.85 at
+/// 512. (Pre-row-blocking the crossover was 64 pairs.)
 #[derive(Clone, Copy, PartialEq, Debug)]
 enum MoePath {
     Gemv,
     Grouped,
 }
 
-fn moe_gemm_min_pairs() -> usize {
-    static MIN: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MIN.get_or_init(|| {
-        std::env::var("LUMINAL_MOE_GEMM_MIN_PAIRS")
-            .ok()
-            .and_then(|v| v.parse().ok())
-            // r4 GEMV vs grouped-MMA crossover: r4 2.43ms vs mma 3.69 at 256
-            // pairs; mma 4.36 vs r4 4.85 at 512. (Pre-row-blocking this was 64.)
-            .unwrap_or(256)
-    })
-}
-
-fn forced_moe_path() -> Option<MoePath> {
-    static FORCED: std::sync::OnceLock<Option<MoePath>> = std::sync::OnceLock::new();
-    *FORCED.get_or_init(
-        || match std::env::var("LUMINAL_MOE_FORCE_PATH").as_deref() {
-            Ok("gemv") => Some(MoePath::Gemv),
-            Ok("grouped") => Some(MoePath::Grouped),
-            Ok(other) => {
-                eprintln!("FusedMoE: unknown LUMINAL_MOE_FORCE_PATH={other:?} ignored");
-                None
-            }
-            Err(_) => None,
-        },
-    )
-}
+const MOE_GEMM_MIN_PAIRS: usize = 256;
 
 /// The expert-grouped (tokens-to-weights) chain: cast x to bf16, sort
 /// (token, expert) pairs by expert on-GPU, gate_up GEMM (bias in epilogue),
@@ -116,7 +89,7 @@ fn forced_moe_path() -> Option<MoePath> {
 /// hidden % 64 == 0 && intermediate % 64 == 0 (the GEMMs' K % BK contract);
 /// the mma kernel additionally needs K <= moe_gemm::MMA_MAX_K (both K's are
 /// 2880 for gpt-oss). Standalone fn (not a method) so tests drive it
-/// directly instead of mutating the process-global LUMINAL_MOE_FORCE_PATH.
+/// directly regardless of the num_pairs dispatch threshold.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn execute_grouped(
     stream: &Arc<CudaStream>,
@@ -469,13 +442,11 @@ impl HostOp for FusedMoE {
         // ~445GB/s) — 71% of a 64-token prefill tick — so the grouped chain
         // is restored as the prefill path, with a tensor-core inner loop
         // replacing the SIMT one that actually lost that A/B.
-        let path = forced_moe_path().unwrap_or({
-            if num_pairs > moe_gemm_min_pairs() {
-                MoePath::Grouped
-            } else {
-                MoePath::Gemv
-            }
-        });
+        let path = if num_pairs > MOE_GEMM_MIN_PAIRS {
+            MoePath::Grouped
+        } else {
+            MoePath::Gemv
+        };
         // Both grouped GEMMs need K % 64 (gate_up K=hidden, down K=inter).
         if path == MoePath::Grouped && hidden % 64 == 0 && intermediate % 64 == 0 {
             return execute_grouped(
@@ -948,7 +919,7 @@ mod tests {
         // undirected op.execute call routes by the num_pairs threshold, so
         // large batches are expected to take the grouped path (this is the
         // dispatch's op-boundary coverage).
-        let expect_grouped = grouped || tokens * 2 > super::moe_gemm_min_pairs();
+        let expect_grouped = grouped || tokens * 2 > super::MOE_GEMM_MIN_PAIRS;
         if expect_grouped {
             let want = host_chain_reference(
                 &weights, &x, &topk_ids, &topk_w, tokens, top_k, hidden, inter,
