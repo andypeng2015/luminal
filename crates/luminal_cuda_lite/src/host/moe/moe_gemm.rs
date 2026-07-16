@@ -1,14 +1,15 @@
 //! Launch wrapper + tests for `moe.cu`'s `fused_moe_mxfp4_gemm_mma`: the
 //! grouped MoE GEMM consuming the `align` building block's outputs (tokens
-//! gathered to resident MXFP4 weights). Semantics follow the Triton
-//! spec-of-record at `harness/fused_moe_mxfp4_triton.py`; this CUDA version
-//! uses tensor cores (BM=16 m16n8k16 tiles, register dequant, one packed fp4
-//! byte per B operand register).
+//! gathered to resident MXFP4 weights), matching vLLM's fused_moe Triton
+//! kernel semantics (sorted (token, expert) pairs; each BM-row tile reads
+//! its expert's weights once). This CUDA version uses tensor cores (BM=16
+//! m16n8k16 tiles, register dequant, one packed fp4 byte per B operand
+//! register).
 //!
-//! Verification is oracle-based: `harness/moe_gemm_oracle.py` runs the Triton
-//! reference on pinned inputs (including host-computed align metadata, so
-//! placement order is deterministic) and dumps fixtures that the tests here
-//! replay through the CUDA kernel.
+//! Verification is oracle-based: the tests replay deterministic inputs
+//! (including host-computed align metadata, so tile placement is fixed)
+//! against the CPU reference chain in `test_ref.rs`, which rounds through
+//! bf16 exactly where the kernel does.
 
 use std::sync::{Arc, OnceLock};
 
