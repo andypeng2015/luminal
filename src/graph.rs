@@ -945,27 +945,6 @@ impl Graph {
             .iter()
             .map(|&node| cheap_rolling_node_hash(&self.graph, node, &self.custom_ops))
             .collect();
-        // LUMINAL_ROLL_DEBUG=1: dump the full hashed linearization for offline
-        // periodicity analysis (why a window size does or doesn't hash-match).
-        if std::env::var("LUMINAL_ROLL_DEBUG").is_ok_and(|v| v == "1") {
-            eprintln!("ROLL_DEBUG topo_len={}", topo.len());
-            for (i, &n) in topo.iter().enumerate() {
-                let sig = rolling_op_signature(&self.graph, n, &self.custom_ops);
-                let short: String = sig.chars().take(60).collect::<String>().replace('\n', " ");
-                let ind = self
-                    .graph
-                    .neighbors_directed(n, Direction::Incoming)
-                    .count();
-                let outd = self
-                    .graph
-                    .neighbors_directed(n, Direction::Outgoing)
-                    .count();
-                eprintln!(
-                    "ROLL_DEBUG {i} h={:016x} in={ind} out={outd} {}",
-                    node_hashes[i], short
-                );
-            }
-        }
         let rolling_hash = RollingHash64::new(&node_hashes);
         let mut diagnostics = RollingSearchDiagnostics::default();
         let mut best_overall: Option<RollingCandidate> = None;
