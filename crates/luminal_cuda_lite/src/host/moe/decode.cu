@@ -30,10 +30,6 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
     return v;
 }
 
-// History (bench data in git): split launches beat one cooperative kernel
-// with grid.sync (5-16%); R=4 row-blocking beat R=1 (2-3x, which was
-// L1-bound re-reading activations 8:1 vs weight bytes).
-
 // One scale-group (32 cols): activation float4s loaded once, dotted vs R rows.
 template <int R>
 __device__ __forceinline__ void mxfp4_group_dot_rows(
