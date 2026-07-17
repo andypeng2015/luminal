@@ -1,8 +1,10 @@
-//! FusedMoE: the gpt-oss MXFP4 MoE as one host op, dispatching by batch
-//! size. Small batches (num_pairs <= MOE_GEMM_MIN_PAIRS) run a stream-ordered
-//! pair of GEMV launches (see `decode.cu`): phase 1 gate_up dequant-GEMV +
-//! clamped SwiGLU, phase 2 down projection + top-k weighted mix. Larger
-//! batches take the expert-grouped tensor-core chain (`execute_grouped`).
+//! FusedMoE: the gpt-oss MXFP4 MoE as one host op — a stream-ordered pair
+//! of GEMV launches (see `decode.cu`) at every batch size: phase 1 gate_up
+//! dequant-GEMV + clamped SwiGLU, phase 2 down projection + top-k weighted
+//! mix. (An expert-grouped tensor-core chain for large prefill batches was
+//! removed in a simplification pass; post-row-blocking it only beat the
+//! GEMV by ~10% at 512 pairs. Resurrect from this commit's parent if
+//! prefill MoE becomes the wall again.)
 //!
 //! Installed by the union-only rewrite in `fused_moe_rewrite.egg`, whose LHS
 //! is the model's dense reference spelling (`moe_naive`). Enforcement of the
@@ -46,12 +48,12 @@ use crate::{
     host::{DeviceBuffer, HostOp},
 };
 
-use super::{align, decode, moe_gemm, moe_ops};
+use super::decode;
 
 const SWIGLU_ALPHA: f32 = 1.702;
 const SWIGLU_LIMIT: f32 = 7.0;
 
-/// Force the process-wide NVRTC compiles of the three block modules, once.
+/// Force the process-wide NVRTC compile of the decode module, once.
 /// Extraction has no runtime stream, so this binds the device's primary
 /// context itself; if no device is available the compile stays lazy (first
 /// execute will pay it, as before).
@@ -62,130 +64,8 @@ fn ensure_kernels_compiled() {
         if let Ok(ctx) = crate::cudarc::driver::CudaContext::new(0) {
             let stream = ctx.default_stream();
             decode::warm(&stream);
-            super::moe_ops::warm(&stream);
-            super::align::warm(&stream);
-            super::moe_gemm::warm(&stream);
         }
     });
-}
-
-/// Above this many (token, expert) pairs `execute` leaves the per-token
-/// GEMV for the expert-grouped (tokens-to-weights) GEMM chain — the bench
-/// crossover: r4 GEMV 2.43ms vs grouped-MMA 3.69 at 256 pairs; mma 4.36 vs
-/// r4 4.85 at 512. (Pre-row-blocking the crossover was 64 pairs.)
-const MOE_GEMM_MIN_PAIRS: usize = 256;
-
-/// The expert-grouped (tokens-to-weights) chain: cast x to bf16, sort
-/// (token, expert) pairs by expert on-GPU, gate_up GEMM (bias in epilogue),
-/// SwiGLU, down GEMM (routing weight in epilogue), top-k sum. All
-/// stream-ordered; no DtoH, no mid-execute sync. Requires
-/// hidden % 64 == 0 && intermediate % 64 == 0 (the GEMMs' K % BK contract);
-/// the mma kernel additionally needs K <= moe_gemm::MMA_MAX_K (both K's are
-/// 2880 for gpt-oss). Standalone fn (not a method) so tests drive it
-/// directly regardless of the num_pairs dispatch threshold.
-#[allow(clippy::too_many_arguments)]
-pub(crate) fn execute_grouped(
-    stream: &Arc<CudaStream>,
-    x_ptr: u64,
-    gu_blocks: u64,
-    gu_scales: u64,
-    gu_bias: u64,
-    dn_blocks: u64,
-    dn_scales: u64,
-    dn_bias: u64,
-    topk_idx: u64,
-    topk_vals: u64,
-    out_ptr: u64,
-    hidden: usize,
-    intermediate: usize,
-    top_k: usize,
-    seq: usize,
-    num_experts: usize,
-    idx_row_stride: usize,
-) -> anyhow::Result<()> {
-    let num_pairs = seq * top_k;
-    let gate_up_n = 2 * intermediate;
-    let bm = moe_gemm::BM_MMA;
-
-    // Scratch (freed at end of execute; arena packing via extra_buffer_nodes
-    // is a later refinement).
-    let x_bf16 = unsafe { stream.alloc::<u8>(seq * hidden * 2)? };
-    let align_bufs = align::MoeAlignBuffers::alloc(stream, num_pairs, num_experts, bm)?;
-    let gu_out = unsafe { stream.alloc::<u8>(num_pairs * gate_up_n * 2)? };
-    let hid = unsafe { stream.alloc::<u8>(num_pairs * intermediate * 2)? };
-    let dn_out = unsafe { stream.alloc::<u8>(num_pairs * hidden * 2)? };
-
-    let sptr = |b: &crate::cudarc::driver::CudaSlice<u8>| -> u64 {
-        use crate::cudarc::driver::DevicePtr;
-        b.device_ptr(stream).0
-    };
-
-    moe_ops::f32_to_bf16(stream, x_ptr, sptr(&x_bf16), seq * hidden)?;
-
-    align::moe_align_block_size(
-        stream,
-        topk_idx,
-        num_pairs,
-        top_k,
-        idx_row_stride,
-        num_experts,
-        bm,
-        &align_bufs,
-    )?;
-
-    let em = align_bufs.max_num_tokens_padded;
-    moe_gemm::fused_moe_mxfp4_gemm_mma(
-        stream,
-        sptr(&x_bf16),
-        gu_blocks,
-        gu_scales,
-        sptr(&gu_out),
-        gu_bias,
-        topk_vals,
-        sptr(&align_bufs.sorted_token_ids),
-        sptr(&align_bufs.expert_ids),
-        sptr(&align_bufs.num_tokens_post_pad),
-        gate_up_n,
-        hidden,
-        em,
-        num_pairs,
-        top_k,
-        false,
-    )?;
-
-    moe_ops::swiglu_interleaved(
-        stream,
-        sptr(&gu_out),
-        sptr(&hid),
-        num_pairs,
-        intermediate,
-        SWIGLU_ALPHA,
-        SWIGLU_LIMIT,
-    )?;
-
-    // Down GEMM consumes per-pair rows (top_k=1 indexing) and applies the
-    // routing weight in its epilogue.
-    moe_gemm::fused_moe_mxfp4_gemm_mma(
-        stream,
-        sptr(&hid),
-        dn_blocks,
-        dn_scales,
-        sptr(&dn_out),
-        dn_bias,
-        topk_vals,
-        sptr(&align_bufs.sorted_token_ids),
-        sptr(&align_bufs.expert_ids),
-        sptr(&align_bufs.num_tokens_post_pad),
-        hidden,
-        intermediate,
-        em,
-        num_pairs,
-        1,
-        true,
-    )?;
-
-    moe_ops::moe_sum(stream, sptr(&dn_out), out_ptr, seq, top_k, hidden)?;
-    Ok(())
 }
 
 #[derive(Debug, Clone, Default)]
@@ -245,9 +125,9 @@ impl EgglogOp for FusedMoE {
             intermediate,
             top_k,
         };
-        // Compile the block kernels now (flashinfer precedent: JIT at extract,
-        // not first execute) so the ~650ms of NVRTC — align.cu's CUB headers
-        // dominate at ~390ms — never lands inside a timed profiling trial.
+        // Compile the decode kernels now (flashinfer precedent: JIT at
+        // extract, not first execute) so the NVRTC cost never lands inside a
+        // timed profiling trial.
         ensure_kernels_compiled();
         (
             LLIROp::new::<dyn HostOp>(Box::new(extracted) as Box<dyn HostOp>),
@@ -408,44 +288,6 @@ impl HostOp for FusedMoE {
         );
         let _guard = span.enter();
 
-        // Path history: the ORIGINAL tiled GEMM chain (SIMT f32 inner loop,
-        // fixed BM=64) lost a forced-path A/B at 36L (decode TPOT 43.2 vs
-        // 87.5 ms; 35-token prefill 295 vs 400 ms) and was deleted.
-        // nsys measurement (2026-07-16) then showed the GEMV costs
-        // ~112-122us/token at ALL batch sizes (no cross-token weight reuse,
-        // ~445GB/s) — 71% of a 64-token prefill tick — so the grouped chain
-        // is restored as the prefill path, with a tensor-core inner loop
-        // replacing the SIMT one that actually lost that A/B.
-        // Both grouped GEMMs need K % 64 and K <= MMA_MAX_K (gate_up
-        // K=hidden, down K=inter); shapes outside that stay on the GEMV
-        // path rather than failing mid-chain.
-        if num_pairs > MOE_GEMM_MIN_PAIRS
-            && hidden % 64 == 0
-            && intermediate % 64 == 0
-            && hidden <= moe_gemm::MMA_MAX_K
-            && intermediate <= moe_gemm::MMA_MAX_K
-        {
-            return execute_grouped(
-                stream,
-                x_buf.ptr(),
-                gu_blocks_buf.ptr(),
-                gu_scales_buf.ptr(),
-                gu_bias_buf.ptr(),
-                dn_blocks_buf.ptr(),
-                dn_scales_buf.ptr(),
-                dn_bias_buf.ptr(),
-                topk_idx_buf.ptr(),
-                topk_vals_buf.ptr(),
-                output_buf.ptr(),
-                hidden,
-                intermediate,
-                top_k,
-                seq,
-                num_experts,
-                idx_row_stride,
-            );
-        }
-
         let hidden_scratch = unsafe { stream.alloc::<u8>(num_pairs * intermediate * 4)? };
         let hs_ptr = {
             use crate::cudarc::driver::DevicePtr;
@@ -493,8 +335,7 @@ impl HostOp for FusedMoE {
 #[cfg(test)]
 mod tests {
     use super::super::test_ref::{
-        ChainWeights, Lcg, assert_close, host_chain_reference, host_chain_reference_f32,
-        to_bf16_bytes,
+        ChainWeights, Lcg, assert_close, host_chain_reference_f32, to_bf16_bytes,
     };
     use super::*;
     use crate::cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
@@ -505,171 +346,17 @@ mod tests {
     /// exercise the row-stride derivation the graph binding relies on.
     #[test]
     fn fused_moe_op_tiny() {
-        run_op_case(13, false);
+        run_op_case(13);
     }
 
     #[test]
     fn fused_moe_op_large_batch() {
         // 40 tokens x top_k 2 = 80 pairs: grid-strides past one resident
         // wave (the old tiled regime), same kernel.
-        run_op_case(40, false);
+        run_op_case(40);
     }
 
-    /// The undirected op boundary ABOVE the dispatch threshold: 160 tokens x
-    /// top_k 2 = 320 pairs > MOE_GEMM_MIN_PAIRS, so `execute` itself routes
-    /// to the grouped chain — covering the buffer-derived idx_row_stride and
-    /// ensure chain the direct execute_grouped tests bypass.
-    #[test]
-    fn fused_moe_op_dispatches_grouped() {
-        run_op_case(160, false);
-    }
-
-    /// T2: the restored expert-grouped chain at the op boundary — 40 tokens
-    /// (80 pairs, multiple BM blocks) and 13 tokens (single ragged block).
-    #[test]
-    fn fused_moe_op_grouped_tiny() {
-        run_op_case(40, true);
-        run_op_case(13, true);
-    }
-
-    /// Build device buffers for a synthetic MoE of the given dims; returns
-    /// (host copies for oracles, device slices in fused-op input order).
-    #[allow(clippy::type_complexity)]
-    fn synth_moe(
-        stream: &Arc<CudaStream>,
-        rng: &mut Lcg,
-        tokens: usize,
-        top_k: usize,
-        e_cnt: usize,
-        hidden: usize,
-        inter: usize,
-    ) -> (
-        (
-            Vec<f32>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<f32>,
-            Vec<u8>,
-            Vec<u8>,
-            Vec<f32>,
-            Vec<i32>,
-            Vec<f32>,
-        ),
-        Vec<CudaSlice<u8>>,
-    ) {
-        let gate_up_n = 2 * inter;
-        let x: Vec<f32> = (0..tokens * hidden)
-            .map(|_| (rng.below(200) as f32 - 100.0) / 50.0)
-            .collect();
-        let gu_q: Vec<u8> = (0..e_cnt * gate_up_n * hidden / 2)
-            .map(|_| rng.below(256) as u8)
-            .collect();
-        let gu_s: Vec<u8> = (0..e_cnt * gate_up_n * hidden / 32)
-            .map(|_| 121 + rng.below(8) as u8)
-            .collect();
-        let gu_bias: Vec<f32> = (0..e_cnt * gate_up_n)
-            .map(|_| (rng.below(100) as f32 - 50.0) / 25.0)
-            .collect();
-        let dn_q: Vec<u8> = (0..e_cnt * hidden * inter / 2)
-            .map(|_| rng.below(256) as u8)
-            .collect();
-        let dn_s: Vec<u8> = (0..e_cnt * hidden * inter / 32)
-            .map(|_| 121 + rng.below(8) as u8)
-            .collect();
-        let dn_bias: Vec<f32> = (0..e_cnt * hidden)
-            .map(|_| (rng.below(100) as f32 - 50.0) / 25.0)
-            .collect();
-        let mut topk_ids = Vec::with_capacity(tokens * top_k);
-        let mut topk_w = Vec::with_capacity(tokens * top_k);
-        for _ in 0..tokens {
-            let mut picked = [usize::MAX; 8];
-            let mut wsum = 0.0f32;
-            let mut ws = [0.0f32; 8];
-            for k in 0..top_k {
-                let mut e = rng.below(e_cnt);
-                while picked[..k].contains(&e) {
-                    e = rng.below(e_cnt);
-                }
-                picked[k] = e;
-                ws[k] = 0.1 + (rng.below(90) as f32) / 100.0;
-                wsum += ws[k];
-            }
-            for k in 0..top_k {
-                topk_ids.push(picked[k] as i32);
-                topk_w.push(ws[k] / wsum);
-            }
-        }
-        let up = |bytes: &[u8]| stream.clone_htod(bytes).unwrap();
-        let dev = vec![
-            up(bytemuck::cast_slice::<f32, u8>(&x)),
-            up(bytemuck::cast_slice::<i32, u8>(&topk_ids)),
-            up(bytemuck::cast_slice::<f32, u8>(&topk_w)),
-            up(&gu_q),
-            up(&gu_s),
-            up(&to_bf16_bytes(&gu_bias)),
-            up(&dn_q),
-            up(&dn_s),
-            up(&to_bf16_bytes(&dn_bias)),
-        ];
-        (
-            (
-                x, gu_q, gu_s, gu_bias, dn_q, dn_s, dn_bias, topk_ids, topk_w,
-            ),
-            dev,
-        )
-    }
-
-    /// T5: the mma chain at the real contraction size (K = 2880 on both
-    /// GEMMs, 45 BK steps, 90-byte scale rows) — the tiny cases can't see
-    /// scale-strip indexing bugs past group 2.
-    #[test]
-    fn moe_mma_real_k() {
-        let Ok(ctx) = CudaContext::new(0) else { return };
-        let stream = ctx.default_stream();
-        let ptr = |b: &CudaSlice<u8>| b.device_ptr(&stream).0;
-        let (tokens, top_k, e_cnt, hidden, inter) = (16usize, 4usize, 8usize, 2880usize, 2880usize);
-        let mut rng = Lcg(97);
-        let (host, dev) = synth_moe(&stream, &mut rng, tokens, top_k, e_cnt, hidden, inter);
-        let (x, gu_q, gu_s, gu_bias, dn_q, dn_s, dn_bias, topk_ids, topk_w) = host;
-        let d_out = stream.alloc_zeros::<u8>(tokens * hidden * 4).unwrap();
-        super::execute_grouped(
-            &stream,
-            ptr(&dev[0]),
-            ptr(&dev[3]),
-            ptr(&dev[4]),
-            ptr(&dev[5]),
-            ptr(&dev[6]),
-            ptr(&dev[7]),
-            ptr(&dev[8]),
-            ptr(&dev[1]),
-            ptr(&dev[2]),
-            ptr(&d_out),
-            hidden,
-            inter,
-            top_k,
-            tokens,
-            e_cnt,
-            top_k,
-        )
-        .unwrap();
-        stream.synchronize().unwrap();
-        let got_b = stream.clone_dtoh(&d_out).unwrap();
-        let got: &[f32] = bytemuck::cast_slice(&got_b);
-        let weights = ChainWeights {
-            gu_q: &gu_q,
-            gu_s: &gu_s,
-            gu_bias: &gu_bias,
-            dn_q: &dn_q,
-            dn_s: &dn_s,
-            dn_bias: &dn_bias,
-        };
-        let want = host_chain_reference(
-            &weights, &x, &topk_ids, &topk_w, tokens, top_k, hidden, inter,
-        );
-        assert_close(got, &want, 0.05, "mma real-K chain");
-    }
-
-    fn run_op_case(tokens: usize, grouped: bool) {
+    fn run_op_case(tokens: usize) {
         let Ok(ctx) = CudaContext::new(0) else { return };
         let stream = ctx.default_stream();
 
@@ -747,33 +434,8 @@ mod tests {
         };
         let mut dyn_map = FxHashMap::default();
         dyn_map.insert('s', tokens);
-        if grouped {
-            // Drive the grouped chain directly: env-var path forcing would
-            // race other tests (process-global).
-            super::execute_grouped(
-                &stream,
-                d_x.device_ptr(&stream).0,
-                d_gu_q.device_ptr(&stream).0,
-                d_gu_s.device_ptr(&stream).0,
-                d_gu_b.device_ptr(&stream).0,
-                d_dn_q.device_ptr(&stream).0,
-                d_dn_s.device_ptr(&stream).0,
-                d_dn_b.device_ptr(&stream).0,
-                d_ids.device_ptr(&stream).0,
-                d_w.device_ptr(&stream).0,
-                d_out.device_ptr(&stream).0,
-                hidden,
-                inter,
-                top_k,
-                tokens,
-                e_cnt,
-                idx_row_stride,
-            )
+        op.execute(&stream, self_node, &inputs, &buffers, &dyn_map)
             .unwrap();
-        } else {
-            op.execute(&stream, self_node, &inputs, &buffers, &dyn_map)
-                .unwrap();
-        }
         stream.synchronize().unwrap();
 
         let got_b = stream.clone_dtoh(&d_out).unwrap();
@@ -786,22 +448,10 @@ mod tests {
             dn_s: &dn_s,
             dn_bias: &dn_bias,
         };
-        // The GEMV path keeps f32 internally; the grouped chain rounds
-        // through bf16 between stages — each gets the matching oracle. An
-        // undirected op.execute call routes by the num_pairs threshold, so
-        // large batches are expected to take the grouped path (this is the
-        // dispatch's op-boundary coverage).
-        let expect_grouped = grouped || tokens * 2 > super::MOE_GEMM_MIN_PAIRS;
-        if expect_grouped {
-            let want = host_chain_reference(
-                &weights, &x, &topk_ids, &topk_w, tokens, top_k, hidden, inter,
-            );
-            assert_close(got, &want, 0.05, "fused_moe_op_grouped");
-        } else {
-            let want = host_chain_reference_f32(
-                &weights, &x, &topk_ids, &topk_w, tokens, top_k, hidden, inter,
-            );
-            assert_close(got, &want, 0.01, "fused_moe_op");
-        }
+        // The GEMV path keeps f32 internally, so the pure-f32 oracle applies.
+        let want = host_chain_reference_f32(
+            &weights, &x, &topk_ids, &topk_w, tokens, top_k, hidden, inter,
+        );
+        assert_close(got, &want, 0.01, "fused_moe_op");
     }
 }

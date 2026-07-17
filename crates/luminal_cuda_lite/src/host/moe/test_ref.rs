@@ -7,14 +7,6 @@
 pub fn f32_to_bf16_bits(v: f32) -> u16 {
     half::bf16::from_f32(v).to_bits()
 }
-pub fn bf16_bits_to_f32(b: u16) -> f32 {
-    half::bf16::from_bits(b).to_f32()
-}
-pub fn from_bf16_bytes(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(2)
-        .map(|c| bf16_bits_to_f32(u16::from_le_bytes([c[0], c[1]])))
-        .collect()
-}
 pub fn to_bf16_bytes(v: &[f32]) -> Vec<u8> {
     v.iter()
         .flat_map(|&f| f32_to_bf16_bits(f).to_le_bytes())
@@ -106,49 +98,6 @@ pub fn host_chain_reference_f32(
 /// internal precision (bf16 A and intermediates, f32 accumulate). The f32
 /// variant above is the reference for the fused decode path.
 #[allow(clippy::too_many_arguments)]
-pub fn host_chain_reference(
-    w: &ChainWeights<'_>,
-    x: &[f32],
-    topk_ids: &[i32],
-    topk_w: &[f32],
-    tokens: usize,
-    top_k: usize,
-    hidden: usize,
-    inter: usize,
-) -> Vec<f32> {
-    let gate_up_n = 2 * inter;
-    let bf = |v: f32| bf16_bits_to_f32(f32_to_bf16_bits(v));
-    let mut want = vec![0.0f32; tokens * hidden];
-    for t in 0..tokens {
-        for slot in 0..top_k {
-            let e = topk_ids[t * top_k + slot] as usize;
-            let rw = topk_w[t * top_k + slot];
-            let mut gu = vec![0.0f32; gate_up_n];
-            for (nn, g) in gu.iter_mut().enumerate() {
-                let mut acc = 0.0f32;
-                for kk in 0..hidden {
-                    acc += bf(x[t * hidden + kk])
-                        * host_weight(w.gu_q, w.gu_s, e, gate_up_n, hidden, nn, kk);
-                }
-                *g = bf(acc + bf(w.gu_bias[e * gate_up_n + nn]));
-            }
-            let mut hid = vec![0.0f32; inter];
-            for (j, h) in hid.iter_mut().enumerate() {
-                let gate = gu[2 * j].min(7.0);
-                let up = gu[2 * j + 1].clamp(-7.0, 7.0);
-                *h = bf((up + 1.0) * (gate / (1.0 + (-1.702f32 * gate).exp())));
-            }
-            for nn in 0..hidden {
-                let mut acc = 0.0f32;
-                for (kk, h) in hid.iter().enumerate() {
-                    acc += h * host_weight(w.dn_q, w.dn_s, e, hidden, inter, nn, kk);
-                }
-                want[t * hidden + nn] += bf((acc + bf(w.dn_bias[e * hidden + nn])) * rw);
-            }
-        }
-    }
-    want
-}
 
 pub fn assert_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
     assert_eq!(got.len(), want.len(), "{label}: length");
