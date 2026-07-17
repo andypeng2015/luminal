@@ -669,9 +669,10 @@ mod tests {
         assert_close(got, &want, 0.05, "mma real-K chain");
     }
 
-    /// T6: the decision bench — GEMV vs SIMT-grouped vs MMA-grouped at real
-    /// dims across the seq range the engine actually produces. Prints
-    /// ms/call and effective weight-streaming GB/s. Not an assertion.
+    /// T6: the decision bench — GEMV (r4) vs MMA-grouped at real dims across
+    /// the seq range the engine actually produces; the source of the
+    /// MOE_GEMM_MIN_PAIRS crossover. Prints ms/call and effective
+    /// weight-streaming GB/s. Not an assertion.
     #[test]
     #[ignore = "benchmark, run explicitly"]
     fn moe_bench_gemv_vs_grouped() {
