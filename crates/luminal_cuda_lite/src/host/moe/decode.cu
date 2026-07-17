@@ -136,11 +136,14 @@ __device__ __forceinline__ void phase1_body(
     const int gate_up_n = 2 * inter;
     const long long total = (long long)seq * top_k * jblocks;
     for (long long task = warp_global; task < total; task += total_warps) {
+        // ── routing: which expert this (token, k) pair goes to ──
         const int pair = (int)(task / jblocks);
         const int j0 = (int)(task % jblocks) * R;
         const int t = pair / top_k;
         const long long e = topk_ids[(long long)t * idx_row_stride + pair % top_k];
         const float* xt = x + (long long)t * hidden_dim;
+
+        // ── gate & up dots: 2R interleaved rows of W_gu[e] · x[t] ──
         float acc[2 * R];
 #pragma unroll
         for (int r = 0; r < 2 * R; ++r) acc[r] = 0.0f;
@@ -150,6 +153,8 @@ __device__ __forceinline__ void phase1_body(
         }
 #pragma unroll
         for (int r = 0; r < 2 * R; ++r) acc[r] = warp_reduce_sum(acc[r]);
+
+        // ── bias + clamp + SwiGLU epilogue → hidden[pair][j] ──
         if (lane == 0) {
 #pragma unroll
             for (int jj = 0; jj < R; ++jj) {
@@ -193,10 +198,14 @@ __device__ __forceinline__ void phase2_body(
         float mix[R];
 #pragma unroll
         for (int r = 0; r < R; ++r) mix[r] = 0.0f;
+
+        // ── one pass per routed expert of token t ──
         for (int kk = 0; kk < top_k; ++kk) {
             const long long e = topk_ids[(long long)t * idx_row_stride + kk];
             const int pair = t * top_k + kk;
             const float* hv = hidden + (long long)pair * inter;
+
+            // ── down dots: R rows of W_dn[e] · hidden[pair] ──
             float acc[R];
 #pragma unroll
             for (int r = 0; r < R; ++r) acc[r] = 0.0f;
@@ -205,6 +214,8 @@ __device__ __forceinline__ void phase2_body(
             }
 #pragma unroll
             for (int r = 0; r < R; ++r) acc[r] = warp_reduce_sum(acc[r]);
+
+            // ── bias, then accumulate weighted by the routing score ──
             if (lane == 0) {
                 const float w = topk_w[(long long)t * top_k + kk];
 #pragma unroll
@@ -212,6 +223,8 @@ __device__ __forceinline__ void phase2_body(
                     mix[r] = fmaf(w, acc[r] + __bfloat162float(dn_bias[e * hidden_dim + r0 + r]), mix[r]);
             }
         }
+
+        // ── routed sum over the top_k experts → out[t] ──
         if (lane == 0) {
 #pragma unroll
             for (int r = 0; r < R; ++r) out[(long long)t * hidden_dim + r0 + r] = mix[r];
