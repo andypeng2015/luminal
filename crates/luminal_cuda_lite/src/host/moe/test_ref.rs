@@ -46,9 +46,9 @@ pub fn host_weight(
     FP4_LUT[nib as usize] * (2.0f32).powi(sc as i32 - 127)
 }
 
-/// f32 end-to-end variant (no bf16 rounding): the reference for the
-/// fused decode path, which keeps f32 internally. The bf16-rounding
-/// variant below matches the tiled kernel's internal precision.
+/// The full MoE block in naive scalar loops, f32 end-to-end (no bf16
+/// rounding): the reference for the fused decode path, which keeps f32
+/// internally.
 #[allow(clippy::too_many_arguments)]
 pub fn host_chain_reference_f32(
     w: &ChainWeights<'_>,
@@ -91,14 +91,9 @@ pub fn host_chain_reference_f32(
     want
 }
 
-/// Magnitude-aware comparison (bf16 accumulation-order variance makes
-/// near-zero elements of large-scale outputs meaningless in pure relative
-/// terms — the lesson from the earlier MoE test work).
-/// bf16-rounding end-to-end variant: matches the tiled/grouped GEMM chain's
-/// internal precision (bf16 A and intermediates, f32 accumulate). The f32
-/// variant above is the reference for the fused decode path.
-#[allow(clippy::too_many_arguments)]
-
+/// Magnitude-aware comparison (accumulation-order variance makes near-zero
+/// elements of large-scale outputs meaningless in pure relative terms —
+/// the lesson from the earlier MoE test work).
 pub fn assert_close(got: &[f32], want: &[f32], tol: f32, label: &str) {
     assert_eq!(got.len(), want.len(), "{label}: length");
     let scale = want.iter().map(|w| w.abs()).fold(0.0f32, f32::max);
