@@ -14,8 +14,8 @@
 // Weight layout/decode math identical to moe.cu: blocks [E, N, K/2]
 // (lo nibble = even k), e8m0 scales [E, N, K/32], bf16 biases.
 //
-// Work mapping: warp-per-R-output-elements (R=4), grid-stride over flat
-// task ids.
+// Work mapping: warp-per-R-output-elements (R=4), one task per warp (the
+// launcher sizes the grid to the task count).
 //   phase 1: task = (pair, j-block)  -> hidden[pair][j0..j0+R]
 //   phase 2: task = (token, r-block) -> out[t][r0..r0+R]
 // x is read as f32 directly (the op's input dtype — the cast kernel is not
@@ -131,11 +131,12 @@ __device__ __forceinline__ void phase1_body(
     STAGE_LUT(slut)
     const int lane = threadIdx.x % 32;
     const int warp_global = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    const int total_warps = (gridDim.x * blockDim.x) / 32;
     const int jblocks = inter / R;
     const int gate_up_n = 2 * inter;
     const long long total = (long long)seq * top_k * jblocks;
-    for (long long task = warp_global; task < total; task += total_warps) {
+    // One warp per task: the launcher sizes the grid to the task count.
+    const long long task = warp_global;
+    if (task < total) {
         // ── routing: which expert this (token, k) pair goes to ──
         const int pair = (int)(task / jblocks);
         const int j0 = (int)(task % jblocks) * R;
@@ -189,10 +190,11 @@ __device__ __forceinline__ void phase2_body(
     STAGE_LUT(slut)
     const int lane = threadIdx.x % 32;
     const int warp_global = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
-    const int total_warps = (gridDim.x * blockDim.x) / 32;
     const int rblocks = hidden_dim / R;
     const long long total = (long long)seq * rblocks;
-    for (long long task = warp_global; task < total; task += total_warps) {
+    // One warp per task: the launcher sizes the grid to the task count.
+    const long long task = warp_global;
+    if (task < total) {
         const int t = (int)(task / rblocks);
         const int r0 = (int)(task % rblocks) * R;
         float mix[R];
