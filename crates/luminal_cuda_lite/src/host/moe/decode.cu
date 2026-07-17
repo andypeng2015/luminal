@@ -1,25 +1,10 @@
-// Fused MoE decode path: phase 1 gate_up GEMV + clamped interleaved SwiGLU,
-// phase 2 down GEMV + routed-weight sum — two regular stream-ordered
-// launches per step.
-//
-// At decode (s*top_k pairs small) the MoE degenerates to per-expert
-// matrix-vector products with a hard global dependency in the middle: every
-// down-row dot reads the ENTIRE hidden vector, so down work cannot start
-// until all gate/up dots finished across all blocks. The launch boundary
-// between the two phases is that barrier.
-//
-// Replaces, per step: f32->bf16 cast, both align kernels, both grouped
-// GEMMs, swiglu and moe_sum — and their padding waste (grouped tiles carry
-// few live rows at s=1); here every weight byte read feeds a real output.
-// Weight layout/decode math identical to moe.cu: blocks [E, N, K/2]
-// (lo nibble = even k), e8m0 scales [E, N, K/32], bf16 biases.
-//
-// Work mapping: warp-per-R-output-elements (R=4), one task per warp (the
-// launcher sizes the grid to the task count).
+// Fused MoE decode: phase 1 gate_up GEMV + clamped SwiGLU, phase 2 down
+// GEMV + routed sum. Two launches; the boundary is the barrier (every down
+// dot needs the pair's ENTIRE hidden vector).
+// Weights: fp4 blocks [E, N, K/2] (lo nibble = even k), e8m0 scales
+// [E, N, K/32], bf16 biases. One warp per task, R=4 outputs per warp:
 //   phase 1: task = (pair, j-block)  -> hidden[pair][j0..j0+R]
 //   phase 2: task = (token, r-block) -> out[t][r0..r0+R]
-// x is read as f32 directly (the op's input dtype — the cast kernel is not
-// needed on this path); x/hidden stay L2-hot (KBs vs the ~52MB weight sweep).
 
 #include <cuda_bf16.h>
 
@@ -29,9 +14,7 @@ __constant__ float FP4_LUT[16] = {
     -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
 };
 
-// Stage the LUT into shared memory once per block: reading FP4_LUT from
-// __constant__ directly would serialize on divergent per-nibble indices
-// (up to 32-way replay per read).
+// __constant__ serializes on divergent nibble indices; stage LUT in smem.
 #define STAGE_LUT(name)                       \
     __shared__ float name[16];                \
     if (threadIdx.x < 16) {                   \
@@ -47,24 +30,11 @@ __device__ __forceinline__ float warp_reduce_sum(float v) {
     return v;
 }
 
-// ─────────────────────────────────────────────────────────────────────────
-// Two regular launches, phase order enforced by stream order. This replaced
-// a single cooperative kernel with a grid.sync() between the phases: the
-// barrier required every block to be co-resident, capping the grid and
-// forcing multi-wave grid-strides — measured 5-16% slower across seq 1..16
-// (406 -> 466 GB/s weight-read at seq=16).
-//
-// Row-blocked (R=4): R output elements per warp sharing ONE activation
-// read. ncu on the original R=1 kernels (seq=1 real dims, deleted after
-// losing the bench at every seq 1..128 by 2-3x) showed DRAM at 11% while
-// the L1/TEX pipe sat at 96%: each warp re-read 128 activation bytes per
-// 16 weight bytes (8:1), so the LSU pipe saturated serving L1 hits and
-// throttled the DRAM weight stream. Blocking R rows per warp cuts the
-// activation traffic R-fold and runs R independent weight streams.
-// ─────────────────────────────────────────────────────────────────────────
+// History (bench data in git): split launches beat one cooperative kernel
+// with grid.sync (5-16%); R=4 row-blocking beat R=1 (2-3x, which was
+// L1-bound re-reading activations 8:1 vs weight bytes).
 
-// One scale-group step for R rows: activation float4s loaded ONCE into
-// registers, dotted against R packed weight rows.
+// One scale-group (32 cols): activation float4s loaded once, dotted vs R rows.
 template <int R>
 __device__ __forceinline__ void mxfp4_group_dot_rows(
     const unsigned char* __restrict__ b_q,
@@ -86,9 +56,7 @@ __device__ __forceinline__ void mxfp4_group_dot_rows(
         const long long row = row0 + r;
         const unsigned char* qrow = b_q + (expert * n_dim + row) * (long long)(k_dim / 2);
         const unsigned char* srow = b_scale + (expert * n_dim + row) * (long long)(k_dim / 32);
-        // e8m0 IS the IEEE-754 exponent field: 2^(byte-127) == bits(byte<<23).
-        // Exact for byte in [1,254] (real gpt-oss scales sit near 124-130);
-        // avoids an SFU exp2f per group.
+        // e8m0 == IEEE-754 exponent field: 2^(sc-127) = bits(sc<<23).
         const float scale = __uint_as_float((unsigned int)srow[g] << 23);
         const uint4 q = *reinterpret_cast<const uint4*>(qrow + g * 16);
         const unsigned int words[4] = {q.x, q.y, q.z, q.w};
@@ -112,8 +80,7 @@ __device__ __forceinline__ void mxfp4_group_dot_rows(
     }
 }
 
-// Phase 1, row-blocked: warp task = (pair, j-block of R hidden columns);
-// 2R weight rows (gate/up interleaved) share each activation read.
+// Phase 1: 2R gate/up-interleaved rows per warp task.
 template <int R>
 __device__ __forceinline__ void phase1_body(
     unsigned long long x_ptr, unsigned long long gu_q_ptr,
@@ -134,7 +101,6 @@ __device__ __forceinline__ void phase1_body(
     const int jblocks = inter / R;
     const int gate_up_n = 2 * inter;
     const long long total = (long long)seq * top_k * jblocks;
-    // One warp per task: the launcher sizes the grid to the task count.
     const long long task = warp_global;
     if (task < total) {
         // ── routing: which expert this (token, k) pair goes to ──
@@ -170,8 +136,7 @@ __device__ __forceinline__ void phase1_body(
     }
 }
 
-// Phase 2, row-blocked: warp task = (token, r-block of R output rows);
-// each of the top_k hidden vectors is read once per group for R rows.
+// Phase 2: R output rows per warp task; top_k expert loop inside.
 template <int R>
 __device__ __forceinline__ void phase2_body(
     unsigned long long dn_q_ptr, unsigned long long dn_scale_ptr,
@@ -192,7 +157,6 @@ __device__ __forceinline__ void phase2_body(
     const int warp_global = (blockIdx.x * blockDim.x + threadIdx.x) / 32;
     const int rblocks = hidden_dim / R;
     const long long total = (long long)seq * rblocks;
-    // One warp per task: the launcher sizes the grid to the task count.
     const long long task = warp_global;
     if (task < total) {
         const int t = (int)(task / rblocks);
