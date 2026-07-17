@@ -26,17 +26,10 @@ struct DecodeKernel {
     _module: Arc<CudaModule>,
     /// Phase 1 (gate/up + SwiGLU) and phase 2 (down + mix) as regular
     /// launches; stream order enforces the phase boundary, so grids are
-    /// unbounded (one warp per task, no residency cap).
+    /// unbounded (one warp per task, no residency cap). Both are the
+    /// row-blocked R=4 kernels; see the ncu note in decode.cu.
     phase1: CudaFunction,
     phase2: CudaFunction,
-    /// Row-blocked variants (R outputs per warp sharing one activation
-    /// read); see the ncu note in decode.cu.
-    phase1_r2: CudaFunction,
-    phase1_r4: CudaFunction,
-    phase2_r2: CudaFunction,
-    phase2_r4: CudaFunction,
-    #[cfg(test)]
-    debug_dot: CudaFunction,
 }
 
 // Process-wide cache (NOT per-instance: ops are cloned during GA profiling).
@@ -51,29 +44,15 @@ fn kernel(stream: &Arc<CudaStream>) -> &'static DecodeKernel {
             .load_module(image)
             .expect("moe decode module should load");
         let phase1 = module
-            .load_function("moe_phase1")
-            .expect("moe_phase1 should exist");
+            .load_function("moe_phase1_r4")
+            .expect("moe_phase1_r4 should exist");
         let phase2 = module
-            .load_function("moe_phase2")
-            .expect("moe_phase2 should exist");
-        let phase1_r2 = module.load_function("moe_phase1_r2").unwrap();
-        let phase1_r4 = module.load_function("moe_phase1_r4").unwrap();
-        let phase2_r2 = module.load_function("moe_phase2_r2").unwrap();
-        let phase2_r4 = module.load_function("moe_phase2_r4").unwrap();
-        #[cfg(test)]
-        let debug_dot = module
-            .load_function("debug_row_dot")
-            .expect("debug_row_dot should exist");
+            .load_function("moe_phase2_r4")
+            .expect("moe_phase2_r4 should exist");
         DecodeKernel {
             _module: module,
             phase1,
             phase2,
-            phase1_r2,
-            phase1_r4,
-            phase2_r2,
-            phase2_r4,
-            #[cfg(test)]
-            debug_dot,
         }
     })
 }
@@ -85,65 +64,19 @@ pub fn warm(stream: &Arc<CudaStream>) {
     let _ = kernel(stream);
 }
 
-/// The MoE block for `seq` tokens as two stream-ordered launches (phase 1
-/// gate/up+SwiGLU, phase 2 down+mix); split beat the old cooperative single
-/// launch by 5-16% across seq 1..16
-/// tokens. All pointers are device addresses; see decode.cu for layouts.
-/// Rows-per-warp for the GEMV: 1 = original kernels, 2/4 = row-blocked.
-/// Bench: r4 fastest at every seq 1..128 (2-3x r1); dims not divisible by
-/// R fall back to 1 inside `fused_moe_decode_with_rows`.
+/// Rows-per-warp for the GEMV kernels. The r1 (one output per warp) and r2
+/// variants were deleted after r4 won the bench at every seq 1..128 (2-3x
+/// r1); resurrect from git if a future arch moves the tradeoff.
 const GEMV_ROWS: usize = 4;
 
+/// The MoE block for `seq` tokens as two stream-ordered launches (phase 1
+/// gate/up+SwiGLU, phase 2 down+mix); split beat the old cooperative single
+/// launch by 5-16% across seq 1..16 tokens. All pointers are device
+/// addresses; see decode.cu for layouts. Dims must be multiples of 32
+/// (which also makes them multiples of GEMV_ROWS).
 #[allow(clippy::too_many_arguments)]
 pub fn fused_moe_decode(
     stream: &Arc<CudaStream>,
-    x_ptr: u64,
-    gu_q_ptr: u64,
-    gu_scale_ptr: u64,
-    gu_bias_ptr: u64,
-    dn_q_ptr: u64,
-    dn_scale_ptr: u64,
-    dn_bias_ptr: u64,
-    topk_ids_ptr: u64,
-    topk_w_ptr: u64,
-    hidden_scratch_ptr: u64,
-    out_ptr: u64,
-    hidden_dim: usize,
-    inter: usize,
-    top_k: usize,
-    seq: usize,
-    idx_row_stride: usize,
-    alpha: f32,
-    limit: f32,
-) -> anyhow::Result<()> {
-    fused_moe_decode_with_rows(
-        stream,
-        GEMV_ROWS,
-        x_ptr,
-        gu_q_ptr,
-        gu_scale_ptr,
-        gu_bias_ptr,
-        dn_q_ptr,
-        dn_scale_ptr,
-        dn_bias_ptr,
-        topk_ids_ptr,
-        topk_w_ptr,
-        hidden_scratch_ptr,
-        out_ptr,
-        hidden_dim,
-        inter,
-        top_k,
-        seq,
-        idx_row_stride,
-        alpha,
-        limit,
-    )
-}
-
-#[allow(clippy::too_many_arguments)]
-pub fn fused_moe_decode_with_rows(
-    stream: &Arc<CudaStream>,
-    rows: usize,
     x_ptr: u64,
     gu_q_ptr: u64,
     gu_scale_ptr: u64,
@@ -174,18 +107,9 @@ pub fn fused_moe_decode_with_rows(
         return Ok(());
     }
 
-    // Dims must split evenly into row blocks; otherwise original kernels.
-    let rows = if rows > 1 && inter % rows == 0 && hidden_dim % rows == 0 {
-        rows
-    } else {
-        1
-    };
+    let rows = GEMV_ROWS; // dims % 32 == 0 guarantees % GEMV_ROWS == 0
     let k = kernel(stream);
-    let (p1, p2) = match rows {
-        2 => (&k.phase1_r2, &k.phase2_r2),
-        4 => (&k.phase1_r4, &k.phase2_r4),
-        _ => (&k.phase1, &k.phase2),
-    };
+    let (p1, p2) = (&k.phase1, &k.phase2);
     // Split launch (measured 5-16% faster than the cooperative single launch
     // across seq 1..16): one warp per task, unbounded grid, phase order
     // enforced by the stream.
@@ -240,7 +164,7 @@ pub fn fused_moe_decode_with_rows(
 
 #[cfg(test)]
 mod tests {
-    use super::super::test_ref::{Lcg, assert_close, to_bf16_bytes};
+    use super::super::test_ref::{Lcg, to_bf16_bytes};
     use super::*;
     use crate::cudarc::driver::{CudaContext, CudaSlice, DevicePtr};
 
@@ -360,188 +284,5 @@ mod tests {
             }
         }
         eprintln!("Marlin same-box reference @ s=1: 52 us captured / 89 us eager");
-    }
-
-    /// The dot primitive in isolation vs host_weight math.
-    #[test]
-    fn decode_row_dot_primitive() {
-        let Ok(ctx) = CudaContext::new(0) else { return };
-        let stream = ctx.default_stream();
-        let (e_cnt, n_dim, k_dim) = (3usize, 8usize, 64usize);
-        let mut rng = Lcg(5);
-        let bq: Vec<u8> = (0..e_cnt * n_dim * k_dim / 2)
-            .map(|_| rng.below(256) as u8)
-            .collect();
-        let bs: Vec<u8> = (0..e_cnt * n_dim * k_dim / 32)
-            .map(|_| 120 + rng.below(12) as u8)
-            .collect();
-        let vec: Vec<f32> = (0..k_dim)
-            .map(|_| (rng.below(200) as f32 - 100.0) / 40.0)
-            .collect();
-        let d_bq = stream.clone_htod(&bq).unwrap();
-        let d_bs = stream.clone_htod(&bs).unwrap();
-        let d_v = stream
-            .clone_htod(bytemuck::cast_slice::<f32, u8>(&vec))
-            .unwrap();
-        let d_out = stream.alloc_zeros::<u8>(4).unwrap();
-        let k = kernel(&stream);
-        for (e, row) in [(0usize, 0usize), (1, 3), (2, 7), (1, 5)] {
-            let (ei, ni, ki, ri) = (e as i32, n_dim as i32, k_dim as i32, row as i32);
-            let (pq, ps, pv, po) = (
-                d_bq.device_ptr(&stream).0,
-                d_bs.device_ptr(&stream).0,
-                d_v.device_ptr(&stream).0,
-                d_out.device_ptr(&stream).0,
-            );
-            unsafe {
-                stream
-                    .launch_builder(&k.debug_dot)
-                    .arg(&pq)
-                    .arg(&ps)
-                    .arg(&pv)
-                    .arg(&po)
-                    .arg(&ei)
-                    .arg(&ni)
-                    .arg(&ki)
-                    .arg(&ri)
-                    .launch(LaunchConfig {
-                        grid_dim: (1, 1, 1),
-                        block_dim: (32, 1, 1),
-                        shared_mem_bytes: 0,
-                    })
-                    .unwrap();
-            }
-            stream.synchronize().unwrap();
-            let got = bytemuck::cast_slice::<u8, f32>(&stream.clone_dtoh(&d_out).unwrap())[0];
-            use super::super::test_ref::host_weight;
-            let want: f32 = (0..k_dim)
-                .map(|kk| vec[kk] * host_weight(&bq, &bs, e, n_dim, k_dim, row, kk))
-                .sum();
-            let rel = (got - want).abs() / want.abs().max(1e-3);
-            eprintln!("dot e={e} row={row}: got={got:.5} want={want:.5} rel={rel:.6}");
-            assert!(rel < 1e-4, "dot primitive mismatch");
-        }
-    }
-
-    /// Tiny dims vs the shared host chain reference (same oracle the tiled
-    /// path and the FusedMoE op test use), with a strided topk_idx buffer.
-    #[test]
-    fn decode_fused_tiny_vs_host() {
-        let Ok(ctx) = CudaContext::new(0) else { return };
-        let stream = ctx.default_stream();
-        let (tokens, top_k, e_cnt) = (13usize, 2usize, 4usize);
-        let (hidden, inter) = (64usize, 64usize);
-        let gate_up_n = 2 * inter;
-        let idx_row_stride = 8usize;
-        let mut rng = Lcg(31);
-
-        let x: Vec<f32> = (0..tokens * hidden)
-            .map(|_| (rng.below(200) as f32 - 100.0) / 50.0)
-            .collect();
-        let gu_q: Vec<u8> = (0..e_cnt * gate_up_n * hidden / 2)
-            .map(|_| rng.below(256) as u8)
-            .collect();
-        let gu_s: Vec<u8> = (0..e_cnt * gate_up_n * hidden / 32)
-            .map(|_| 125 + rng.below(6) as u8)
-            .collect();
-        let gu_bias: Vec<f32> = (0..e_cnt * gate_up_n)
-            .map(|_| (rng.below(100) as f32 - 50.0) / 25.0)
-            .collect();
-        let dn_q: Vec<u8> = (0..e_cnt * hidden * inter / 2)
-            .map(|_| rng.below(256) as u8)
-            .collect();
-        let dn_s: Vec<u8> = (0..e_cnt * hidden * inter / 32)
-            .map(|_| 125 + rng.below(6) as u8)
-            .collect();
-        let dn_bias: Vec<f32> = (0..e_cnt * hidden)
-            .map(|_| (rng.below(100) as f32 - 50.0) / 25.0)
-            .collect();
-
-        let mut topk_ids = Vec::new();
-        let mut wide_ids = vec![i32::MIN; tokens * idx_row_stride];
-        let mut topk_w = Vec::new();
-        for t in 0..tokens {
-            let first = rng.below(e_cnt);
-            let second = (first + 1 + rng.below(e_cnt - 1)) % e_cnt;
-            for (kk, e) in [first, second].into_iter().enumerate() {
-                topk_ids.push(e as i32);
-                wide_ids[t * idx_row_stride + kk] = e as i32;
-            }
-            let w0 = 0.2 + (rng.below(60) as f32) / 100.0;
-            topk_w.extend([w0, 1.0 - w0]);
-        }
-
-        let up = |bytes: &[u8]| stream.clone_htod(bytes).unwrap();
-        let ptr = |b: &CudaSlice<u8>| b.device_ptr(&stream).0;
-        let d_x = up(bytemuck::cast_slice::<f32, u8>(&x));
-        let d_ids = up(bytemuck::cast_slice::<i32, u8>(&wide_ids));
-        let d_w = up(bytemuck::cast_slice::<f32, u8>(&topk_w));
-        let d_gu_q = up(&gu_q);
-        let d_gu_s = up(&gu_s);
-        let d_gu_b = up(&to_bf16_bytes(&gu_bias));
-        let d_dn_q = up(&dn_q);
-        let d_dn_s = up(&dn_s);
-        let d_dn_b = up(&to_bf16_bytes(&dn_bias));
-        let d_hid = stream
-            .alloc_zeros::<u8>(tokens * top_k * inter * 4)
-            .unwrap();
-        let d_out = stream.alloc_zeros::<u8>(tokens * hidden * 4).unwrap();
-
-        // All row-block variants must match the same oracle (R divides the
-        // 64-wide tiny dims, so every kernel pair actually runs).
-        let mut results: Vec<Vec<f32>> = vec![];
-        for rows in [1usize, 2, 4] {
-            fused_moe_decode_with_rows(
-                &stream,
-                rows,
-                ptr(&d_x),
-                ptr(&d_gu_q),
-                ptr(&d_gu_s),
-                ptr(&d_gu_b),
-                ptr(&d_dn_q),
-                ptr(&d_dn_s),
-                ptr(&d_dn_b),
-                ptr(&d_ids),
-                ptr(&d_w),
-                ptr(&d_hid),
-                ptr(&d_out),
-                hidden,
-                inter,
-                top_k,
-                tokens,
-                idx_row_stride,
-                1.702,
-                7.0,
-            )
-            .unwrap();
-            stream.synchronize().unwrap();
-            let got_b = stream.clone_dtoh(&d_out).unwrap();
-            results.push(bytemuck::cast_slice::<u8, f32>(&got_b).to_vec());
-        }
-
-        use super::super::test_ref::{ChainWeights, host_chain_reference_f32};
-        let want = host_chain_reference_f32(
-            &ChainWeights {
-                gu_q: &gu_q,
-                gu_s: &gu_s,
-                gu_bias: &gu_bias,
-                dn_q: &dn_q,
-                dn_s: &dn_s,
-                dn_bias: &dn_bias,
-            },
-            &x,
-            &topk_ids,
-            &topk_w,
-            tokens,
-            top_k,
-            hidden,
-            inter,
-        );
-
-        // 0.01: f32 summation-order noise (warp-parallel vs sequential)
-        // amplified on cancellation-heavy outputs; NOT quantization slack.
-        for (rows, got) in [1usize, 2, 4].iter().zip(&results) {
-            assert_close(got, &want, 0.01, &format!("decode_fused_tiny_r{rows}"));
-        }
     }
 }

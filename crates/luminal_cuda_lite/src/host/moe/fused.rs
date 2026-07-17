@@ -718,11 +718,10 @@ mod tests {
                     floor_gb / (ms / 1e3),
                 );
             };
-            for rows in [1usize, 2, 4] {
-                run(&format!("gemv_r{rows}"), &|| {
-                    decode::fused_moe_decode_with_rows(
+            {
+                run("gemv", &|| {
+                    decode::fused_moe_decode(
                         &stream,
-                        rows,
                         ptr(&dev[0]),
                         ptr(&dev[3]),
                         ptr(&dev[4]),
