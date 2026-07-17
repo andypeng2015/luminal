@@ -1,12 +1,6 @@
-//! Fused MoE decode path (see decode.cu): two regular stream-ordered
-//! launches — phase 1 gate_up GEMV + SwiGLU, phase 2 down GEMV + routed
-//! sum — for the small-batch regime where the grouped GEMM chain is
-//! padding-dominated.
-//!
-//! Output contract: writes `out` f32 `[seq, hidden]` = the complete MoE block
-//! output (bias + routed-weight sum applied). Needs only one scratch buffer:
-//! `hidden` f32 `[seq*top_k, inter]`. Reads x as f32 directly (no cast
-//! kernel) and the routing tensors in place (no align kernels).
+//! Launchers for decode.cu: the full MoE block as two stream-ordered
+//! launches. Writes `out` f32 [seq, hidden]; needs one scratch buffer,
+//! `hidden` f32 [seq*top_k, inter].
 
 use std::sync::{Arc, OnceLock};
 
@@ -17,17 +11,10 @@ use crate::{
 
 const SOURCE: &str = include_str!("decode.cu");
 const BLOCK_THREADS: u32 = 256;
-// A block-cooperative split-K variant was built, benched, and removed:
-// warp-per-row won at every pair count once the __constant__-LUT replay
-// serialization was fixed (131.6 vs 151.2 us at s=1; 1875 vs 2161 at
-// pairs=64).
 
 struct DecodeKernel {
     _module: Arc<CudaModule>,
-    /// Phase 1 (gate/up + SwiGLU) and phase 2 (down + mix) as regular
-    /// launches; stream order enforces the phase boundary, so grids are
-    /// unbounded (one warp per task, no residency cap). Both are the
-    /// row-blocked R=4 kernels; see the ncu note in decode.cu.
+    /// The two phase kernels (R=4 row-blocked).
     phase1: CudaFunction,
     phase2: CudaFunction,
 }
@@ -57,23 +44,18 @@ fn kernel(stream: &Arc<CudaStream>) -> &'static DecodeKernel {
     })
 }
 
-/// Force the process-wide NVRTC compile of this module (idempotent). Called
-/// from FusedMoE's extract-time warmup so the compile cost lands outside
-/// timed profiling trials.
+/// Force the NVRTC compile (idempotent); called at extract time so the
+/// cost lands outside timed profiling trials.
 pub fn warm(stream: &Arc<CudaStream>) {
     let _ = kernel(stream);
 }
 
-/// Rows-per-warp for the GEMV kernels. The r1 (one output per warp) and r2
-/// variants were deleted after r4 won the bench at every seq 1..128 (2-3x
-/// r1); resurrect from git if a future arch moves the tradeoff.
+/// Outputs per warp; must match the kernels' template instantiation.
 const GEMV_ROWS: usize = 4;
 
-/// The MoE block for `seq` tokens as two stream-ordered launches (phase 1
-/// gate/up+SwiGLU, phase 2 down+mix); split beat the old cooperative single
-/// launch by 5-16% across seq 1..16 tokens. All pointers are device
-/// addresses; see decode.cu for layouts. Dims must be multiples of 32
-/// (which also makes them multiples of GEMV_ROWS).
+/// The MoE block for `seq` tokens as two stream-ordered launches. All
+/// pointers are device addresses; see decode.cu for layouts. Dims must be
+/// multiples of 32.
 #[allow(clippy::too_many_arguments)]
 pub fn fused_moe_decode(
     stream: &Arc<CudaStream>,
@@ -96,8 +78,7 @@ pub fn fused_moe_decode(
     alpha: f32,
     limit: f32,
 ) -> anyhow::Result<()> {
-    // 32-aligned dims are also exactly what the kernel's uint4 weight loads
-    // need: row stride k/2 bytes divisible by 16.
+    // %32 (the e8m0 group width) also gives the 16B rows uint4 loads need.
     anyhow::ensure!(
         hidden_dim.is_multiple_of(32) && inter.is_multiple_of(32),
         "decode GEMV requires 32-aligned dims (e8m0 group width): hidden={hidden_dim}, inter={inter}"
@@ -110,9 +91,7 @@ pub fn fused_moe_decode(
     let rows = GEMV_ROWS; // dims % 32 == 0 guarantees % GEMV_ROWS == 0
     let k = kernel(stream);
     let (p1, p2) = (&k.phase1, &k.phase2);
-    // Split launch (measured 5-16% faster than the cooperative single launch
-    // across seq 1..16): one warp per task, unbounded grid, phase order
-    // enforced by the stream.
+    // One warp per task, unbounded grid; stream order is the phase barrier.
     let warps_per_block = (BLOCK_THREADS / 32) as usize;
     let grid = |tasks: usize| LaunchConfig {
         grid_dim: (tasks.div_ceil(warps_per_block).max(1) as u32, 1, 1),
