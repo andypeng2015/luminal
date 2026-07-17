@@ -1,7 +1,5 @@
 pub mod decode;
 pub mod fused;
-#[cfg(test)]
-pub(crate) mod test_ref;
 
 use std::sync::{Arc, OnceLock};
 
