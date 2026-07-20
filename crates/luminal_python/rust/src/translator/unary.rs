@@ -133,6 +133,44 @@ impl<'a> Translator<'a> {
         Ok(result)
     }
 
+    /// Translate `aten._fused_rms_norm.default`.
+    ///
+    /// Schema: `_fused_rms_norm(Tensor input, int[] normalized_shape, Tensor? weight,
+    /// float? eps) -> (Tensor, Tensor)`. The second output is the reciprocal-std saved
+    /// for backward and is never consumed by inference graphs, so (like
+    /// `translate_layer_norm`) we return only the normalized tensor and let the
+    /// dispatcher bind it to output[0] while the unused rstd is DCE'd.
+    ///
+    /// RMSNorm normalizes over the last `len(normalized_shape)` dims without mean
+    /// subtraction: `x * rsqrt(mean(x^2) + eps) * weight`. FLUX applies it to the
+    /// per-head query/key projections (QK-norm) inside attention.
+    pub(crate) fn translate_rms_norm(&mut self, node: &Node) -> Result<GraphTensor> {
+        let input = self.get_input_tensor(node, 0)?;
+        let normalized_shape = self.get_ints_arg(node, 1)?;
+
+        let ndim = input.shape.len();
+        let num_norm_dims = normalized_shape.len();
+        let axes: Vec<usize> = ((ndim - num_norm_dims)..ndim).collect();
+
+        // eps is arg 3 (after input, normalized_shape, weight); default matches
+        // torch.nn.RMSNorm's 1e-6-ish behaviour but PyTorch passes it explicitly.
+        let eps = self.get_float_arg(node, 3).unwrap_or(1e-5) as f32;
+
+        let ms = (input * input).mean(axes.clone());
+        let rstd = (ms + eps).sqrt().reciprocal();
+        let rstd = rstd.expand_to_shape_on_axes(input.shape, axes);
+        let mut result = input * rstd;
+
+        // Apply weight (arg 2) if present and not None.
+        if let Some(weight_name) = node.inputs.get(2).and_then(|i| i.arg.as_tensor_name()) {
+            let w = self.get_tensor(weight_name)?;
+            let (r, w) = broadcast_binary(result, w);
+            result = r * w;
+        }
+
+        Ok(result)
+    }
+
     /// Translate `aten.native_group_norm.default`.
     ///
     /// Schema: `native_group_norm(input, weight?, bias?, N, C, HxW, num_groups, eps)

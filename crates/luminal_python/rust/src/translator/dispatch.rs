@@ -167,6 +167,9 @@ impl<'a> Translator<'a> {
             // LayerNorm
             "torch.ops.aten.native_layer_norm.default" => self.translate_layer_norm(node)?,
 
+            // RMSNorm (fused). FLUX uses this for attention QK-norm.
+            "torch.ops.aten._fused_rms_norm.default" => self.translate_rms_norm(node)?,
+
             // GroupNorm
             "torch.ops.aten.native_group_norm.default" => self.translate_group_norm(node)?,
 
@@ -190,6 +193,14 @@ impl<'a> Translator<'a> {
                 let b = self.get_input_tensor(node, 1)?;
                 let (a, b) = broadcast_binary(a, b);
                 (b * a.log2()).exp2()
+            }
+            // Scalar base raised to a tensor exponent: `base ** x`. FLUX's RoPE
+            // position embedding computes `theta ** (arange(0, dim, 2) / dim)`.
+            // Lower as `exp2(x * log2(base))`.
+            "torch.ops.aten.pow.Scalar" => {
+                let base = self.get_float_arg(node, 0)?;
+                let x = self.get_input_tensor(node, 1)?;
+                (x * (base as f32).log2()).exp2()
             }
 
             // Creation ops

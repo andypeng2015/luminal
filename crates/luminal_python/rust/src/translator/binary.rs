@@ -23,6 +23,36 @@ fn normalize_equal_dims(
     }
 }
 
+/// PyTorch `aten.div.Tensor` / `div.Scalar` are *true* division: integer
+/// operands are promoted to floating point and the result is float (e.g.
+/// `tensor([3]) / tensor([2]) -> 1.5`). Luminal lowers `a / b` to
+/// `a * b.reciprocal()`, and `Recip` has no integer implementation, so an
+/// integer divisor panics the search ("Recip does not support dtype Int").
+/// Promote any integer operand to F32 before dividing. FLUX hits this in its
+/// RoPE / patch-index arithmetic (integer `arange` divided by a dim).
+fn is_integer_dtype(dt: DType) -> bool {
+    matches!(
+        dt,
+        DType::Int
+            | DType::I64
+            | DType::I4
+            | DType::U4
+            | DType::I8
+            | DType::U8
+            | DType::I16
+            | DType::U16
+            | DType::Bool
+    )
+}
+
+fn promote_for_true_div(t: GraphTensor) -> GraphTensor {
+    if is_integer_dtype(t.dtype) {
+        t.cast(DType::F32)
+    } else {
+        t
+    }
+}
+
 fn same_dims(
     lhs: &[Expression],
     rhs: &[Expression],
@@ -58,7 +88,7 @@ impl<'a> Translator<'a> {
                 BinaryOp::Add => a + b,
                 BinaryOp::Mul => a * b,
                 BinaryOp::Sub => a - b,
-                BinaryOp::Div => a / b,
+                BinaryOp::Div => promote_for_true_div(a) / promote_for_true_div(b),
             })
         } else {
             if let Some(f) = arg1.as_float() {
@@ -95,6 +125,20 @@ impl<'a> Translator<'a> {
         val: f32,
         op: BinaryOp,
     ) -> GraphTensor {
+        // This path only fires for a genuine *float* scalar (the `as_float`
+        // branch of the callers; integer scalars go through
+        // `apply_symbolic_scalar_op`). PyTorch type promotion makes
+        // `Tensor(int) <op> Scalar(float)` produce a *float* result, so the
+        // integer tensor must be promoted to float. Without this the scalar is
+        // instead cast DOWN to the tensor's int dtype, truncating the constant
+        // (e.g. FLUX's timestep-embedding frequency exponent
+        // `-log(10000) * arange(...)` collapses -9.21034 -> -9, scrambling the
+        // sinusoidal embedding and every layer's AdaLayerNorm modulation).
+        let a = if is_integer_dtype(a.dtype) {
+            a.cast(DType::F32)
+        } else {
+            a
+        };
         let scalar = self
             .graph
             .constant_float(val)
@@ -118,7 +162,12 @@ impl<'a> Translator<'a> {
             BinaryOp::Add => a + val,
             BinaryOp::Mul => a * val,
             BinaryOp::Sub => a - val,
-            BinaryOp::Div => a / val,
+            // True division: promote an integer dividend to float. `a / val`
+            // lowers (via `Div<Expression>`) to `a * recip(const(val).cast(a.dtype))`,
+            // so an Int `a` produces a `Recip` on an Int constant, which the CUDA
+            // fusion codegen refuses. FLUX divides integer index tensors by a
+            // symbolic dim here.
+            BinaryOp::Div => promote_for_true_div(a) / val,
         }
     }
 }
