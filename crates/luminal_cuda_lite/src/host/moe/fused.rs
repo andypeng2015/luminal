@@ -2,9 +2,8 @@
 //! of GEMV launches (see `decode.cu`) at every batch size: phase 1 gate_up
 //! dequant-GEMV + clamped SwiGLU, phase 2 down projection + top-k weighted
 //! mix. (An expert-grouped tensor-core chain for large prefill batches was
-//! removed in a simplification pass; post-row-blocking it only beat the
-//! GEMV by ~10% at 512 pairs. Resurrect from this commit's parent if
-//! prefill MoE becomes the wall again.)
+//! built and benched during bring-up but removed before upstreaming:
+//! post-row-blocking, it only beat the GEMV by ~10% at 512 pairs.)
 //!
 //! Installed by the union-only rewrite in `fused_moe_rewrite.egg`, whose LHS
 //! is the model's dense reference spelling (`moe_naive`). Enforcement of the
@@ -27,8 +26,9 @@
 //!
 //! `num_experts` is derived from the weight buffer lengths (not op metadata).
 //! No host readback, no mid-execute synchronize: every launch is
-//! stream-ordered, and the kernels live in process-wide caches (the blocks'
-//! statics), so cloning this op during GA profiling costs nothing.
+//! stream-ordered, and the kernels live in a process-wide cache
+//! (decode.rs's static), so cloning this op during GA profiling costs
+//! nothing.
 
 use std::sync::Arc;
 
