@@ -1,13 +1,7 @@
 ; AUTO-GENERATED from an LLIR dump of the naive (unfused) MoE spelling — if
 ; that spelling drifts, regenerate this pattern from a fresh dump rather
 ; than editing the match by hand.
-; Fuses the DENSE reference MoE spelling (moe_naive) into the FusedMoE host
-; op. Staged marker rules, union-only (no subsume: the raw naive spelling is
-; unviable under the memory filter, which is the enforcement). The clamped
-; SwiGLU region is deliberately unmatched (activation-free); the op computes
-; a hardcoded clamp-SwiGLU (alpha=1.702, limit=7.0) in-kernel — a graph with
-; a different activation but the same surrounding spelling would be fused
-; incorrectly; the fixed dims below are what keeps the match gpt-oss-shaped.
+; Fuses the DENSE reference MoE spelling (moe_naive) into the FusedMoE host op.
 ; Dims fixed: hidden=2880, intermediate=2880, top_k=4.
 
 (datatype*
@@ -106,6 +100,15 @@
         (= ?t413 (Op (Add ?w1030 ?w1031 ?w1032 ?w1033) (ICons ?t412 (ICons ?t50 (INil)))))
         (= ?t414 (Op (Cast ?w1034 (F32)) (ICons ?t413 (INil))))
         (= ?t415 (Op (Mul ?w1035 ?w1036 ?w1037 ?w1038) (ICons ?t414 (ICons ?t296 (INil)))))
+        (= ?t378 (Op (Mul ?w1317 ?w1318 ?w1319 ?w1320) (ICons ?t337 (ICons ?t377 (INil)))))
+        (= ?t381 (Op (Mul ?w1321 ?w1322 ?w1323 ?w1324) (ICons ?t378 (ICons ?t380 (INil)))))
+        (= ?t384 (Op (Mul ?w1325 ?w1326 ?w1327 ?w1328) (ICons ?t381 (ICons ?t383 (INil)))))
+        (= ?t385 (Op (Exp2 ?w1329 ?w1330 ?w1331) (ICons ?t384 (INil))))
+        (= ?t388 (Op (Add ?w1332 ?w1333 ?w1334 ?w1335) (ICons ?t385 (ICons ?t387 (INil)))))
+        (= ?t389 (Op (Recip ?w1336 ?w1337 ?w1338) (ICons ?t388 (INil))))
+        (= ?t390 (Op (Mul ?w1339 ?w1340 ?w1341 ?w1342) (ICons ?t337 (ICons ?t389 (INil)))))
+        (= ?t393 (Op (Add ?w1343 ?w1344 ?w1345 ?w1346) (ICons ?t375 (ICons ?t392 (INil)))))
+        (= ?t394 (Op (Mul ?w1347 ?w1348 ?w1349 ?w1350) (ICons ?t393 (ICons ?t390 (INil)))))
         (= ?t416 (Op (Sum ?w1039 ?w1040 ?w1041 ?w1042 ?w1043) (ICons ?t415 (INil))))
     )
     (
