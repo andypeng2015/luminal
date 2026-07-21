@@ -1,3 +1,6 @@
+; AUTO-GENERATED from an LLIR dump of the paged reference attention spelling
+; (gptoss-serve's dump_egglog bin) — if that spelling drifts, regenerate this
+; pattern from a fresh dump rather than editing the match by hand.
 ; SinkAttention rewrite: paged sink-attention (gpt-oss) -> FA3 host op.
 ;
 ; Matches the paged GQA attention chain WITH attention sinks:
