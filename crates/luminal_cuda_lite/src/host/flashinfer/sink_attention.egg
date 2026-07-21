@@ -1,35 +1,20 @@
 ; AUTO-GENERATED from an LLIR dump of the paged reference attention spelling
-; (gptoss-serve's dump_egglog bin) — if that spelling drifts, regenerate this
-; pattern from a fresh dump rather than editing the match by hand.
-; SinkAttention rewrite: paged sink-attention (gpt-oss) -> FA3 host op.
+; (gptoss-serve's dump_egglog bin) — regenerate from a fresh dump, don't edit.
 ;
-; Matches the paged GQA attention chain WITH attention sinks:
-;   Scatter(K,V bf16 pools) -> Gather(context) -> cast F32 -> Q.K^T -> scale ->
-;   masked add -> row-max -> max(row_max, sink) (lt-select spelling) ->
-;   exp2 / sum -> denominator + exp2(sink - max) -> P.V -> (nheads, s, hd) out
+; Paged gpt-oss sink attention (GQA + sink-augmented softmax) -> FA3 host op.
 ;
-; Masking design (hybrid):
-; - Causal + cross-sequence isolation arrive as ONE host-built mask Input,
-;   captured as a PROOF-ONLY anchor (its semantics are pinned by the engine
-;   building mask and qo/kv indptrs from the same batch entries, plus an
-;   engine test).
-; - The sliding window is IN-GRAPH (LessThan(k_pos, q_abs - (W-1)) * -1e30
-;   added on top of the base mask): the window constant is read out of the
-;   graph, so sliding-vs-full is STRUCTURALLY proven, and sliding layers
-;   differ structurally from full layers -- which drives loop rolling to the
-;   two-layer block, keeping per-slot masks loop-invariant (they inline via
-;   LoopInputStatic) so this rule matches inside rolled bodies. NOTE: the
-;   period-2 roll needs >= 3 block occurrences, i.e. >= 6 layers; tests below
-;   that depth see different rolling regimes.
-; - qo_indptr / kv_indptr are free-floating named Inputs (single instance
-;   each -- a size-1 join), wired into the op as runtime inputs.
+; Masking is hybrid: causal + cross-sequence isolation is a host mask Input,
+; matched as a PROOF-ONLY anchor; the sliding window is in-graph
+; (k_pos vs q_abs-(W-1)), so sliding-vs-full is structurally proven AND the
+; layer bodies differ, driving the period-2 loop roll that keeps per-slot
+; masks loop-invariant — this rule matches inside rolled bodies. (The roll
+; needs >= 6 layers; shallower tests see different rolling regimes.)
+; qo/kv_indptr are free-floating named Inputs (size-1 joins) wired through
+; as runtime inputs.
 ;
-; Staging (rulesets run once each, in order: _pre -> late x3 -> late2):
-;   sa_masked producers (_pre) -> sa_island fact (kernel_fuse_late) ->
-;   op rule (kernel_fuse_late2).
-;
-; Depends on relations declared in flashinfer_attention.egg (always loaded):
-; const_like, flashinfer_head_dim_ok_16bit.
+; Staging (run order: _pre -> late x3 -> late2): sa_masked (_pre) ->
+; sa_island (late) -> op rule (late2). Depends on flashinfer_attention.egg's
+; const_like / flashinfer_head_dim_ok_16bit.
 
 ; (masked, scores, scale_val, window_left): the masked-scores node, the raw
 ; scores it was built from, the softmax scale constant, and the window
