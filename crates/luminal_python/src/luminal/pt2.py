@@ -631,7 +631,7 @@ def _eager_pt2_compile(gm, user_inputs, user_indices, dynamic_shapes, factory):
         return _save_and_compile(
             pt2_path,
             factory,
-            10,
+            int(os.environ.get("LUMINAL_PT2_SEARCH_ITERS", "10")),
             user_indices=user_indices,
             input_device_ptrs=input_device_ptrs,
         )

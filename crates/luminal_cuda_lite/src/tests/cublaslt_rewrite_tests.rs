@@ -486,6 +486,135 @@ fn cublaslt_rewrites_cover_batched_row_order_layout_pairs() {
     }
 }
 
+/// Reference for attention-style BMM chains over head-interleaved projection
+/// views: q/k/v are [batch, seq, heads*dk] projections; per (b, h) matrix
+/// out = (q_h × k_h^T) × v_h, laid out [batch, heads, seq, dk] contiguous.
+fn reference_interleaved_attention_bmms(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    batch: usize,
+    heads: usize,
+    seq: usize,
+    dk: usize,
+) -> Vec<f32> {
+    let hd = heads * dk;
+    let mut out = vec![0.0; batch * heads * seq * dk];
+    for b in 0..batch {
+        for h in 0..heads {
+            for i in 0..seq {
+                let mut score_row = vec![0.0f32; seq];
+                for (j, score) in score_row.iter_mut().enumerate() {
+                    for x in 0..dk {
+                        *score += q[b * seq * hd + i * hd + h * dk + x]
+                            * k[b * seq * hd + j * hd + h * dk + x];
+                    }
+                }
+                for x in 0..dk {
+                    let mut acc = 0.0;
+                    for (j, score) in score_row.iter().enumerate() {
+                        acc += score * v[b * seq * hd + j * hd + h * dk + x];
+                    }
+                    out[((b * heads + h) * seq + i) * dk + x] = acc;
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Head-interleaved attention BMMs (QK^T then attn·V) as 3-D strided views:
+/// [heads, seq, dk] carved from a [seq, heads*dk] projection, so per-head ld
+/// is heads*dk and the head batch stride is dk. The free-ld batched rules
+/// must cover both with single-level strided-batch descriptors and match a
+/// dense reference.
+#[test]
+fn cublaslt_covers_interleaved_head_attention_bmms() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream) {
+        return;
+    }
+
+    let (heads, seq, dk) = (3usize, 5usize, 4usize);
+    let mut cx = Graph::new();
+    let q_proj = cx.tensor((seq, heads * dk));
+    let k_proj = cx.tensor((seq, heads * dk));
+    let v_proj = cx.tensor((seq, heads * dk));
+    let q = q_proj.split_dims(1, dk).permute(&[1, 0, 2]);
+    let k = k_proj.split_dims(1, dk).permute(&[1, 0, 2]);
+    let v = v_proj.split_dims(1, dk).permute(&[1, 0, 2]);
+    let out = q.matmul(k.transpose(1, 2)).matmul(v).output();
+
+    let llir = extract_forced_distinct_cublaslt_classes_llir_where(
+        &mut cx,
+        "interleaved-head attention BMM chain",
+        |_| true,
+    );
+
+    let q_data = random_f32_vec(seq * heads * dk, 0xA77E_0001, -0.08, 0.08);
+    let k_data = random_f32_vec(seq * heads * dk, 0xA77E_0002, -0.08, 0.08);
+    let v_data = random_f32_vec(seq * heads * dk, 0xA77E_0003, -0.08, 0.08);
+    let expected = reference_interleaved_attention_bmms(&q_data, &k_data, &v_data, 1, heads, seq, dk);
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(q_proj.id, q_data);
+    rt.set_data(k_proj.id, k_data);
+    rt.set_data(v_proj.id, v_data);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+}
+
+/// batch>1 version of the interleaved-head BMMs: the (batch, head) offsets
+/// are not collapsible into one uniform stride, so these must lower through
+/// the two-level cublaslt_b2 sort and the runtime's outer pointer-offset
+/// loop. Wrong or missing outer-batch handling corrupts every batch index
+/// past the first, which the dense reference comparison catches.
+#[test]
+fn cublaslt_b2_covers_batched_interleaved_head_attention_bmms() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if !cublaslt_available_for_runtime(&stream) {
+        return;
+    }
+
+    let (batch, heads, seq, dk) = (2usize, 3usize, 5usize, 4usize);
+    let mut cx = Graph::new();
+    let q_proj = cx.tensor((batch, seq, heads * dk));
+    let k_proj = cx.tensor((batch, seq, heads * dk));
+    let v_proj = cx.tensor((batch, seq, heads * dk));
+    let q = q_proj.split_dims(2, dk).permute(&[0, 2, 1, 3]);
+    let k = k_proj.split_dims(2, dk).permute(&[0, 2, 1, 3]);
+    let v = v_proj.split_dims(2, dk).permute(&[0, 2, 1, 3]);
+    let out = q.matmul(k.transpose(2, 3)).matmul(v).output();
+
+    let llir = extract_forced_distinct_cublaslt_classes_llir_where(
+        &mut cx,
+        "batched interleaved-head attention BMM chain",
+        |_| true,
+    );
+
+    let len = batch * seq * heads * dk;
+    let q_data = random_f32_vec(len, 0xB2B2_0001, -0.08, 0.08);
+    let k_data = random_f32_vec(len, 0xB2B2_0002, -0.08, 0.08);
+    let v_data = random_f32_vec(len, 0xB2B2_0003, -0.08, 0.08);
+    let expected =
+        reference_interleaved_attention_bmms(&q_data, &k_data, &v_data, batch, heads, seq, dk);
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(q_proj.id, q_data);
+    rt.set_data(k_proj.id, k_data);
+    rt.set_data(v_proj.id, v_data);
+    rt.execute(&cx.dyn_map);
+
+    assert_close(&rt.get_f32(out.id), &expected, 1e-5, 1e-5);
+}
+
 #[test]
 fn cublaslt_rewrites_cover_flux2_qk_transposed_matmul() {
     let mut cx = Graph::new();
@@ -723,8 +852,15 @@ fn cublaslt_rank4_matmuls_do_not_drop_leading_batch_axes() {
 
     cx.build_search_space::<CudaRuntime>(CompileOptions::default());
     let egraph = cx.egraph().expect("search space should have an e-graph");
-    assert!(
-        cublaslt_ir_nodes(egraph).is_empty(),
+    // Rank-4 batched matmuls may lower through the two-level cublaslt_b2
+    // sort (outer level looped by the host op); only the ONE-axis descriptors
+    // are unsound here because they would drop the leading batch axis.
+    let single_level_nodes = op_ir_nodes(egraph, "cublaslt")
+        .into_iter()
+        .chain(op_ir_nodes(egraph, "cublaslt_scaled"))
+        .count();
+    assert_eq!(
+        single_level_nodes, 0,
         "a one-axis strided-batch descriptor must not represent rank-4 matmul by dropping the leading batch axis"
     );
     assert!(
@@ -3697,6 +3833,7 @@ fn cublaslt_ir_nodes(egraph: &SerializedEGraph) -> Vec<&NodeId> {
     op_ir_nodes(egraph, "cublaslt")
         .into_iter()
         .chain(op_ir_nodes(egraph, "cublaslt_scaled"))
+        .chain(op_ir_nodes(egraph, "cublaslt_b2"))
         .collect()
 }
 

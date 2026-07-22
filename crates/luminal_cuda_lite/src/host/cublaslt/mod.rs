@@ -7,7 +7,7 @@ use half::{bf16, f16};
 use luminal::{
     dtype::DType,
     egglog_utils::{
-        api::{Rule, SortDef, sort},
+        api::{Rule, SortClass, SortDef, sort},
         base::{DTYPE, EXPRESSION, F64, OP_KIND, STRING},
         extract_dtype, extract_expr,
     },
@@ -76,6 +76,19 @@ pub struct CuBlasLt {
     stride_b: Expression,
     stride_c: Expression,
     stride_d: Expression,
+    // Second (outer) batch level for two-level strided-batched matmuls —
+    // e.g. attention BMMs over [batch, heads, m, n] views whose (batch, head)
+    // offsets are NOT collapsible into one uniform stride (heads interleaved
+    // inside projection rows). cuBLASLt strided batch takes a single stride,
+    // so the runtime issues `batch2_count` strided-batch calls, offsetting
+    // each matrix pointer by `stride2_* * o` elements per outer step o.
+    // batch2_count == 1 (the default and every legacy rule) is the plain
+    // single-level behavior.
+    batch2_count: Expression,
+    stride2_a: Expression,
+    stride2_b: Expression,
+    stride2_c: Expression,
+    stride2_d: Expression,
     a_dtype: DType,
     b_dtype: DType,
     c_dtype: DType,
@@ -112,6 +125,11 @@ impl Default for CuBlasLt {
             stride_b: 0.into(),
             stride_c: 0.into(),
             stride_d: 0.into(),
+            batch2_count: 1.into(),
+            stride2_a: 0.into(),
+            stride2_b: 0.into(),
+            stride2_c: 0.into(),
+            stride2_d: 0.into(),
             a_dtype: DType::F32,
             b_dtype: DType::F32,
             c_dtype: DType::F32,
@@ -131,45 +149,208 @@ impl Default for CuBlasLt {
 #[derive(Debug, Default)]
 pub struct CuBlasLtScaled;
 
+/// Two-level strided-batched cuBLASLt matmul.
+///
+/// A second egglog sort that extracts into the same [`CuBlasLt`] host op with
+/// `batch2_count > 1` (the runtime loops strided-batch calls over the outer
+/// level, offsetting pointers by `stride2_*`). Kept as a separate sort so the
+/// 100+ positional `(cublaslt ...)` constructor/pattern sites in the existing
+/// rewrite files stay untouched — mirrors the `CuBlasLtScaled` pattern.
+///
+/// Motivation (LUM-631): batch>1 diffusion attention BMMs are 4-D
+/// `[batch, heads, m, n]` over head-interleaved projection views, so their
+/// (batch, head) offsets are not collapsible into the single uniform stride
+/// cuBLASLt strided batch accepts; without this they fall back to naive
+/// generated matmul kernels (~200x slower at 512px shapes). The batch==1
+/// case squeezes to 3-D and is covered by the single-level free-ld batched
+/// rules in `cublaslt_{RmCm,RmRm}_rewrite.egg`.
+#[derive(Debug, Default)]
+pub struct CuBlasLtB2;
+
+fn cublaslt_sort_b2(name: &'static str) -> SortDef {
+    let mut fields = CUBLASLT_SORT_FIELDS.to_vec();
+    fields.extend_from_slice(&[
+        ("batch2_count", EXPRESSION),
+        ("stride2_a", EXPRESSION),
+        ("stride2_b", EXPRESSION),
+        ("stride2_c", EXPRESSION),
+        ("stride2_d", EXPRESSION),
+    ]);
+    sort(OP_KIND, name, &fields)
+}
+
+impl EgglogOp for CuBlasLtB2 {
+    fn sort(&self) -> SortDef {
+        cublaslt_sort_b2("cublaslt_b2")
+    }
+
+    fn seed_priority(&self) -> u8 {
+        1
+    }
+
+    fn n_inputs(&self) -> usize {
+        2
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![Rule::raw(include_str!["cublaslt_batched2_rewrite.egg"])]
+    }
+
+    #[allow(unused_variables)]
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a luminal::egglog_utils::SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let extracted_state = CuBlasLt {
+            batch2_count: extract_expr(egraph, kind_children[27], expr_cache).unwrap(),
+            stride2_a: extract_expr(egraph, kind_children[28], expr_cache).unwrap(),
+            stride2_b: extract_expr(egraph, kind_children[29], expr_cache).unwrap(),
+            stride2_c: extract_expr(egraph, kind_children[30], expr_cache).unwrap(),
+            stride2_d: extract_expr(egraph, kind_children[31], expr_cache).unwrap(),
+            ..parse_cublaslt_kind_children(egraph, kind_children, expr_cache)
+        };
+        trace!(?extracted_state);
+
+        let extracted = LLIROp::new::<dyn HostOp>(Box::new(extracted_state) as Box<dyn HostOp>);
+
+        (extracted, input_enodes)
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+}
+
+/// The 27 positional fields shared by every cuBLASLt egglog sort
+/// (`cublaslt_b2` appends the outer batch level).
+const CUBLASLT_SORT_FIELDS: [(&str, SortClass); 27] = [
+    ("m", EXPRESSION),
+    ("n", EXPRESSION),
+    ("k", EXPRESSION),
+    ("a_layout", STRING),
+    ("b_layout", STRING),
+    ("a_order", STRING),
+    ("b_order", STRING),
+    ("c_order", STRING),
+    ("d_order", STRING),
+    ("lda", EXPRESSION),
+    ("ldb", EXPRESSION),
+    ("ldc", EXPRESSION),
+    ("ldd", EXPRESSION),
+    ("batch_count", EXPRESSION),
+    ("stride_a", EXPRESSION),
+    ("stride_b", EXPRESSION),
+    ("stride_c", EXPRESSION),
+    ("stride_d", EXPRESSION),
+    ("a_dtype", DTYPE),
+    ("b_dtype", DTYPE),
+    ("c_dtype", DTYPE),
+    ("d_dtype", DTYPE),
+    ("compute_type", STRING),
+    ("scale_dtype", STRING),
+    ("alpha", F64),
+    ("beta", F64),
+    ("epilogue", STRING),
+];
+
 fn cublaslt_sort(name: &'static str) -> SortDef {
-    sort(
-        OP_KIND,
-        name,
-        &[
-            ("m", EXPRESSION),
-            ("n", EXPRESSION),
-            ("k", EXPRESSION),
-            ("a_layout", STRING),
-            ("b_layout", STRING),
-            ("a_order", STRING),
-            ("b_order", STRING),
-            ("c_order", STRING),
-            ("d_order", STRING),
-            ("lda", EXPRESSION),
-            ("ldb", EXPRESSION),
-            ("ldc", EXPRESSION),
-            ("ldd", EXPRESSION),
-            ("batch_count", EXPRESSION),
-            ("stride_a", EXPRESSION),
-            ("stride_b", EXPRESSION),
-            ("stride_c", EXPRESSION),
-            ("stride_d", EXPRESSION),
-            ("a_dtype", DTYPE),
-            ("b_dtype", DTYPE),
-            ("c_dtype", DTYPE),
-            ("d_dtype", DTYPE),
-            ("compute_type", STRING),
-            ("scale_dtype", STRING),
-            ("alpha", F64),
-            ("beta", F64),
-            ("epilogue", STRING),
-        ],
-    )
+    sort(OP_KIND, name, &CUBLASLT_SORT_FIELDS)
+}
+
+/// Parse the 27 shared positional cuBLASLt sort fields (see
+/// [`CUBLASLT_SORT_FIELDS`]) into a single-level [`CuBlasLt`] with the
+/// batch2/scale-input fields at their defaults. Variant extracts override
+/// what differs via struct update.
+fn parse_cublaslt_kind_children<'a>(
+    egraph: &'a luminal::egglog_utils::SerializedEGraph,
+    kind_children: &[&'a ENodeId],
+    expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+) -> CuBlasLt {
+    let m = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
+    let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
+    let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
+
+    let a_layout = parse_cublas_op(&egraph.enodes[kind_children[3]].0);
+    let b_layout = parse_cublas_op(&egraph.enodes[kind_children[4]].0);
+    let a_order = parse_cublaslt_order(&egraph.enodes[kind_children[5]].0);
+    let b_order = parse_cublaslt_order(&egraph.enodes[kind_children[6]].0);
+    let c_order = parse_cublaslt_order(&egraph.enodes[kind_children[7]].0);
+    let d_order = parse_cublaslt_order(&egraph.enodes[kind_children[8]].0);
+
+    let lda = extract_expr(egraph, kind_children[9], expr_cache).unwrap();
+    let ldb = extract_expr(egraph, kind_children[10], expr_cache).unwrap();
+    let ldc = extract_expr(egraph, kind_children[11], expr_cache).unwrap();
+    let ldd = extract_expr(egraph, kind_children[12], expr_cache).unwrap();
+
+    let batch_count = extract_expr(egraph, kind_children[13], expr_cache).unwrap();
+    let stride_a = extract_expr(egraph, kind_children[14], expr_cache).unwrap();
+    let stride_b = extract_expr(egraph, kind_children[15], expr_cache).unwrap();
+    let stride_c = extract_expr(egraph, kind_children[16], expr_cache).unwrap();
+    let stride_d = extract_expr(egraph, kind_children[17], expr_cache).unwrap();
+
+    // Existing rewrites emit the same dtype for A/B/C/D, but keeping these
+    // fields separate lets later rewrites model mixed-input and mixed-output
+    // matmuls without changing the host launch helper again.
+    let a_dtype = extract_dtype(egraph, kind_children[18]);
+    let b_dtype = extract_dtype(egraph, kind_children[19]);
+    let c_dtype = extract_dtype(egraph, kind_children[20]);
+    let d_dtype = extract_dtype(egraph, kind_children[21]);
+    let compute_type = parse_cublaslt_compute_type(&egraph.enodes[kind_children[22]].0, a_dtype);
+    let scale_dtype = parse_cublaslt_scale_dtype(&egraph.enodes[kind_children[23]].0, a_dtype);
+    let alpha = parse_cublaslt_scalar(&egraph.enodes[kind_children[24]].0);
+    let beta = parse_cublaslt_scalar(&egraph.enodes[kind_children[25]].0);
+    let epilogue = parse_cublaslt_epilogue(&egraph.enodes[kind_children[26]].0);
+
+    CuBlasLt {
+        m,
+        n,
+        k,
+        a_layout,
+        b_layout,
+        a_order,
+        b_order,
+        c_order,
+        d_order,
+        lda,
+        ldb,
+        ldc,
+        ldd,
+        batch_count,
+        stride_a,
+        stride_b,
+        stride_c,
+        stride_d,
+        batch2_count: 1.into(),
+        stride2_a: 0.into(),
+        stride2_b: 0.into(),
+        stride2_c: 0.into(),
+        stride2_d: 0.into(),
+        a_dtype,
+        b_dtype,
+        c_dtype,
+        d_dtype,
+        compute_type,
+        scale_dtype,
+        alpha,
+        beta,
+        epilogue,
+        a_scale_input: false,
+        b_scale_input: false,
+        cublaslt: OnceLock::new(),
+    }
 }
 
 impl EgglogOp for CuBlasLt {
     fn sort(&self) -> SortDef {
         cublaslt_sort("cublaslt")
+    }
+
+    fn seed_priority(&self) -> u8 {
+        1
     }
 
     fn n_inputs(&self) -> usize {
@@ -227,82 +408,7 @@ impl EgglogOp for CuBlasLt {
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        // Extract dimensions from egglog
-        let m = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
-        let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
-        let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
-
-        // Extract transpose/layout strings from egglog
-        let a_layout_str = &egraph.enodes[kind_children[3]].0;
-        let b_layout_str = &egraph.enodes[kind_children[4]].0;
-        let a_layout = parse_cublas_op(a_layout_str);
-        let b_layout = parse_cublas_op(b_layout_str);
-        let a_order = parse_cublaslt_order(&egraph.enodes[kind_children[5]].0);
-        let b_order = parse_cublaslt_order(&egraph.enodes[kind_children[6]].0);
-        let c_order = parse_cublaslt_order(&egraph.enodes[kind_children[7]].0);
-        let d_order = parse_cublaslt_order(&egraph.enodes[kind_children[8]].0);
-
-        // Extract leading dimensions from egglog
-        let lda = extract_expr(egraph, kind_children[9], expr_cache).unwrap();
-        let ldb = extract_expr(egraph, kind_children[10], expr_cache).unwrap();
-        let ldc = extract_expr(egraph, kind_children[11], expr_cache).unwrap();
-        let ldd = extract_expr(egraph, kind_children[12], expr_cache).unwrap();
-
-        // Extract batch parameters
-        let batch_count = extract_expr(egraph, kind_children[13], expr_cache).unwrap();
-        let stride_a = extract_expr(egraph, kind_children[14], expr_cache).unwrap();
-        let stride_b = extract_expr(egraph, kind_children[15], expr_cache).unwrap();
-        let stride_c = extract_expr(egraph, kind_children[16], expr_cache).unwrap();
-        let stride_d = extract_expr(egraph, kind_children[17], expr_cache).unwrap();
-
-        // Extract cuBLASLt type tuple from egglog. Existing rewrites emit the
-        // same dtype for A/B/C/D, but keeping these fields separate lets later
-        // rewrites model mixed-input and mixed-output matmuls without changing
-        // the host launch helper again.
-        let a_dtype = extract_dtype(egraph, kind_children[18]);
-        let b_dtype = extract_dtype(egraph, kind_children[19]);
-        let c_dtype = extract_dtype(egraph, kind_children[20]);
-        let d_dtype = extract_dtype(egraph, kind_children[21]);
-        let compute_type_str = &egraph.enodes[kind_children[22]].0;
-        let scale_dtype_str = &egraph.enodes[kind_children[23]].0;
-        let compute_type = parse_cublaslt_compute_type(compute_type_str, a_dtype);
-        let scale_dtype = parse_cublaslt_scale_dtype(scale_dtype_str, a_dtype);
-        let alpha = parse_cublaslt_scalar(&egraph.enodes[kind_children[24]].0);
-        let beta = parse_cublaslt_scalar(&egraph.enodes[kind_children[25]].0);
-        let epilogue = parse_cublaslt_epilogue(&egraph.enodes[kind_children[26]].0);
-
-        let extracted_state = Self {
-            m,
-            n,
-            k,
-            a_layout,
-            b_layout,
-            a_order,
-            b_order,
-            c_order,
-            d_order,
-            lda,
-            ldb,
-            ldc,
-            ldd,
-            batch_count,
-            stride_a,
-            stride_b,
-            stride_c,
-            stride_d,
-            a_dtype,
-            b_dtype,
-            c_dtype,
-            d_dtype,
-            compute_type,
-            scale_dtype,
-            alpha,
-            beta,
-            epilogue,
-            a_scale_input: false,
-            b_scale_input: false,
-            cublaslt: OnceLock::new(),
-        };
+        let extracted_state = parse_cublaslt_kind_children(egraph, kind_children, expr_cache);
         trace!(?extracted_state);
 
         let extracted = LLIROp::new::<dyn HostOp>(Box::new(extracted_state) as Box<dyn HostOp>);
@@ -320,6 +426,10 @@ impl EgglogOp for CuBlasLtScaled {
         cublaslt_sort("cublaslt_scaled")
     }
 
+    fn seed_priority(&self) -> u8 {
+        1
+    }
+
     fn n_inputs(&self) -> usize {
         4
     }
@@ -333,71 +443,10 @@ impl EgglogOp for CuBlasLtScaled {
         list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
         expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
     ) -> (LLIROp, Vec<&'a ENodeId>) {
-        let m = extract_expr(egraph, kind_children[0], expr_cache).unwrap();
-        let n = extract_expr(egraph, kind_children[1], expr_cache).unwrap();
-        let k = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
-
-        let a_layout = parse_cublas_op(&egraph.enodes[kind_children[3]].0);
-        let b_layout = parse_cublas_op(&egraph.enodes[kind_children[4]].0);
-        let a_order = parse_cublaslt_order(&egraph.enodes[kind_children[5]].0);
-        let b_order = parse_cublaslt_order(&egraph.enodes[kind_children[6]].0);
-        let c_order = parse_cublaslt_order(&egraph.enodes[kind_children[7]].0);
-        let d_order = parse_cublaslt_order(&egraph.enodes[kind_children[8]].0);
-
-        let lda = extract_expr(egraph, kind_children[9], expr_cache).unwrap();
-        let ldb = extract_expr(egraph, kind_children[10], expr_cache).unwrap();
-        let ldc = extract_expr(egraph, kind_children[11], expr_cache).unwrap();
-        let ldd = extract_expr(egraph, kind_children[12], expr_cache).unwrap();
-
-        let batch_count = extract_expr(egraph, kind_children[13], expr_cache).unwrap();
-        let stride_a = extract_expr(egraph, kind_children[14], expr_cache).unwrap();
-        let stride_b = extract_expr(egraph, kind_children[15], expr_cache).unwrap();
-        let stride_c = extract_expr(egraph, kind_children[16], expr_cache).unwrap();
-        let stride_d = extract_expr(egraph, kind_children[17], expr_cache).unwrap();
-
-        let a_dtype = extract_dtype(egraph, kind_children[18]);
-        let b_dtype = extract_dtype(egraph, kind_children[19]);
-        let c_dtype = extract_dtype(egraph, kind_children[20]);
-        let d_dtype = extract_dtype(egraph, kind_children[21]);
-        let compute_type_str = &egraph.enodes[kind_children[22]].0;
-        let scale_dtype_str = &egraph.enodes[kind_children[23]].0;
-        let compute_type = parse_cublaslt_compute_type(compute_type_str, a_dtype);
-        let scale_dtype = parse_cublaslt_scale_dtype(scale_dtype_str, a_dtype);
-        let alpha = parse_cublaslt_scalar(&egraph.enodes[kind_children[24]].0);
-        let beta = parse_cublaslt_scalar(&egraph.enodes[kind_children[25]].0);
-        let epilogue = parse_cublaslt_epilogue(&egraph.enodes[kind_children[26]].0);
-
         let extracted_state = CuBlasLt {
-            m,
-            n,
-            k,
-            a_layout,
-            b_layout,
-            a_order,
-            b_order,
-            c_order,
-            d_order,
-            lda,
-            ldb,
-            ldc,
-            ldd,
-            batch_count,
-            stride_a,
-            stride_b,
-            stride_c,
-            stride_d,
-            a_dtype,
-            b_dtype,
-            c_dtype,
-            d_dtype,
-            compute_type,
-            scale_dtype,
-            alpha,
-            beta,
-            epilogue,
             a_scale_input: true,
             b_scale_input: true,
-            cublaslt: OnceLock::new(),
+            ..parse_cublaslt_kind_children(egraph, kind_children, expr_cache)
         };
         trace!(?extracted_state);
 
@@ -656,6 +705,22 @@ pub(crate) struct LtMatmulPointers {
 }
 
 impl LtMatmulPointers {
+    /// Pointers for outer-batch step `o` of a two-level strided-batched
+    /// matmul: each matrix pointer advances by its per-step BYTE stride.
+    /// bias/scale pointers are shared across outer steps (the batched2 rules
+    /// never attach them, but stay correct if they ever do).
+    pub(crate) fn offset_for_outer_batch(self, o: i64, byte_strides: [i64; 4]) -> Self {
+        Self {
+            a: (self.a as i64 + o * byte_strides[0]) as u64,
+            b: (self.b as i64 + o * byte_strides[1]) as u64,
+            c: (self.c as i64 + o * byte_strides[2]) as u64,
+            d: (self.d as i64 + o * byte_strides[3]) as u64,
+            bias: self.bias,
+            a_scale: self.a_scale,
+            b_scale: self.b_scale,
+        }
+    }
+
     pub(crate) fn changed_fields(self, other: Self) -> Vec<&'static str> {
         let mut fields = Vec::new();
         if self.a != other.a {
@@ -1560,6 +1625,23 @@ impl CuBlasLt {
         self.n_inputs()
     }
 
+    /// Resolve the outer batch level: (batch2_count, per-outer-step BYTE
+    /// strides for a/b/c/d). Element strides are scaled by each matrix's own
+    /// dtype size. batch2_count == 1 means single-level (all legacy rules).
+    pub(crate) fn resolved_batch2(&self, dyn_map: &FxHashMap<char, usize>) -> (i64, [i64; 4]) {
+        let resolve = |e: &Expression| -> i64 {
+            e.substitute('z', Expression::from(1)).exec(dyn_map).unwrap() as i64
+        };
+        let count = resolve(&self.batch2_count).max(1);
+        let strides = [
+            resolve(&self.stride2_a) * (self.a_dtype.bits() / 8) as i64,
+            resolve(&self.stride2_b) * (self.b_dtype.bits() / 8) as i64,
+            resolve(&self.stride2_c) * (self.c_dtype.bits() / 8) as i64,
+            resolve(&self.stride2_d) * (self.d_dtype.bits() / 8) as i64,
+        ];
+        (count, strides)
+    }
+
     pub(crate) fn graph_spec_dyn_vars(&self) -> FxHashSet<char> {
         [
             &self.m,
@@ -1574,6 +1656,11 @@ impl CuBlasLt {
             &self.stride_b,
             &self.stride_c,
             &self.stride_d,
+            &self.batch2_count,
+            &self.stride2_a,
+            &self.stride2_b,
+            &self.stride2_c,
+            &self.stride2_d,
         ]
         .into_iter()
         .flat_map(|expr| expr.dyn_vars())
@@ -1739,7 +1826,13 @@ impl HostOp for CuBlasLt {
 
         let cublaslt = self.get_cublaslt(stream)?;
 
-        run_cublaslt_matmul(stream, &cublaslt, &spec, ptrs)?;
+        // Outer batch level: issue one strided-batch call per outer step,
+        // offsetting each matrix pointer (batch2_count == 1 = legacy behavior).
+        let (batch2, byte_strides2) = self.resolved_batch2(dyn_map);
+        for o in 0..batch2 {
+            let step_ptrs = ptrs.offset_for_outer_batch(o, byte_strides2);
+            run_cublaslt_matmul(stream, &cublaslt, &spec, step_ptrs)?;
+        }
 
         // No stream.synchronize() here — CUDA stream ordering guarantees
         // sequential execution. The runtime syncs once at the end of execute().
@@ -1748,7 +1841,7 @@ impl HostOp for CuBlasLt {
 
     fn output_size(&self) -> Expression {
         let resolve = |e: &Expression| -> Expression { e.substitute('z', Expression::from(1)) };
-        resolve(&self.batch_count) * resolve(&self.m) * resolve(&self.n)
+        resolve(&self.batch2_count) * resolve(&self.batch_count) * resolve(&self.m) * resolve(&self.n)
     }
 
     fn output_bytes(&self) -> Expression {

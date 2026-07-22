@@ -1,0 +1,196 @@
+; Two-level strided-batched cuBLASLt matmuls (cublaslt_b2).
+;
+; Targets 4-D batched matmuls C[b2, b1, m, n] = A[b2, b1, m, k] x B[b2, b1, k, n]
+; whose two batch levels are NOT collapsible into one uniform stride — e.g.
+; batch>1 diffusion attention BMMs over head-interleaved projection views
+; (LUM-631: [batch, heads, seq, head_dim] with head stride << batch stride).
+; cuBLASLt strided batch takes a single batch stride, so the host op loops
+; `batch2_count` strided-batch calls, offsetting pointers by `stride2_*`.
+; The batch==1 case squeezes to 3-D (matmul_flatten) and is covered by the
+; single-level free-ld batched rules in cublaslt_{RmCm,RmRm}_rewrite.egg.
+;
+; Like those rules, per-matrix leading dimensions and both batch strides are
+; FREE (taken from the actual strides): attention operands are strided views
+; whose rows are wider than the matrices they carve out (heads share rows).
+
+; 4-D analogue of generic_matmul_exact_{2d,3d}: prove the reduction reads the
+; materialized Mul canonically and writes a contiguous row-major output.
+; Operand broadcast strides alone are not a sufficient witness — a
+; movement-only view between Mul and Sum can permute the reduction's
+; surviving axes while leaving both operand strides unchanged.
+(relation generic_matmul_exact_4d
+    (IR Expression Expression Expression Expression Expression DType))
+
+(rule
+    (
+        (= ?sum (Op (GenericMatmul
+            (ECons ?b2 (ECons ?b1 (ECons ?m (ECons ?n (ENil)))))
+            (ECons ?b2 (ECons ?b1 (ECons ?m (ECons ?n (ECons ?k (ENil))))))
+            ?k
+            ?lhs_strides ?rhs_strides
+            (ECons
+                (MMul (MMul (MMul (MMul (MIter) ?k) ?n) ?m) ?b1)
+                (ECons
+                    (MMul (MMul (MMul (MIter) ?k) ?n) ?m)
+                    (ECons
+                        (MMul (MMul (MIter) ?k) ?n)
+                        (ECons (MMul (MIter) ?k) (ENil)))))
+            (MIter)
+            (ECons
+                (MMul (MMul (MMul (MIter) ?n) ?m) ?b1)
+                (ECons
+                    (MMul (MMul (MIter) ?n) ?m)
+                    (ECons (MMul (MIter) ?n) (ECons (MIter) (ENil)))))
+            ?dt)
+            ?inputs))
+    )
+    ((generic_matmul_exact_4d ?sum ?b2 ?b1 ?m ?n ?k ?dt))
+    :ruleset matmul_backend
+    :name "prove exact materialized 4d matmul reduction"
+)
+
+; ── Row-major x Column-major (attention QK^T: B is K^T, a [n, k] row-major
+;    view => column-major B[k, n]) ─────────────────────────────────────────
+; Per (b2, b1): C[m,n] = A[m,k] x B[k,n]
+;   A row-major, free lda:  a_k = MIter, a_n = 0, a_m = lda (free)
+;   B col-major,  free ldb: b_k = MIter, b_m = 0, b_n = ldb (free)
+; cuBLAS swap trick (see cublaslt_RmCm_rewrite.egg):
+;   cublas(OP_T, OP_N, n, m, k, alpha, B, ldb, A, lda, beta, C, n)
+(rule
+    (
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_4d ?sum ?b2 ?b1 ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
+
+        ; Exactly 4-D output [b2, b1, m, n]
+        (= ?out_shape (ECons ?b2 (ECons ?b1 (ECons ?m (ECons ?n (ENil))))))
+        (!= ?b2 (MNum 0))
+        (!= ?b1 (MNum 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        ; Exactly 5-D operand strides in [b2, b1, m, n, k] space
+        (= ?a_stride (ECons ?a_b2 (ECons ?a_b1 (ECons ?a_m (ECons ?a_n (ECons ?a_k (ENil)))))))
+        (= ?b_stride (ECons ?b_b2 (ECons ?b_b1 (ECons ?b_m (ECons ?b_n (ECons ?b_k (ENil)))))))
+
+        ; Contiguous k on the reduction
+        (= ?k_stride (MIter))
+
+        ; A row-major per matrix: k contiguous, n broadcast, lda free (?a_m)
+        (= ?a_k (MIter))
+        (= ?a_n (MNum 0))
+
+        ; B column-major per matrix: k contiguous, m broadcast, ldb free (?b_n)
+        (= ?b_k (MIter))
+        (= ?b_m (MNum 0))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt_b2
+            ?n ?m ?k
+            "T" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_n                    ; lda = B's column stride (free ldb of our B)
+            ?a_m                    ; ldb = A's row stride (free lda of our A)
+            ?n                      ; ldc
+            ?n                      ; ldd
+            ?b1                     ; batch_count (inner level)
+            ?b_b1                   ; stride_a (cuBLAS A = our B)
+            ?a_b1                   ; stride_b (cuBLAS B = our A)
+            (MMul ?m ?n)            ; stride_c (contiguous, from the witness)
+            (MMul ?m ?n)            ; stride_d
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT"
+            ?b2                     ; batch2_count (outer level)
+            ?b_b2                   ; stride2_a (cuBLAS A = our B)
+            ?a_b2                   ; stride2_b (cuBLAS B = our A)
+            (MMul (MMul ?m ?n) ?b1) ; stride2_c
+            (MMul (MMul ?m ?n) ?b1)); stride2_d
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched2 row-major x column-major"
+)
+
+; ── Row-major x Row-major (attention attn·V: B is V, a [k, n] row-major
+;    strided view) ─────────────────────────────────────────────────────────
+; Per (b2, b1): C[m,n] = A[m,k] x B[k,n]
+;   A row-major, free lda: a_k = MIter, a_n = 0, a_m = lda (free)
+;   B row-major, free ldb: b_n = MIter, b_m = 0, b_k = ldb (free)
+; cuBLAS swap trick (see cublaslt_RmRm_rewrite.egg):
+;   cublas(OP_N, OP_N, n, m, k, alpha, B, ldb, A, lda, beta, C, n)
+(rule
+    (
+        (= ?sum (Op (GenericMatmul
+            ?out_shape ?mul_shape ?k
+            ?a_stride ?b_stride
+            ?sum_in_stride ?k_stride ?sum_out_stride
+            ?matmul_dtype)
+            (ICons ?a (ICons ?b (INil)))))
+        (generic_matmul_exact_4d ?sum ?b2 ?b1 ?m ?n ?k ?dt)
+        (= ?matmul_dtype ?dt)
+
+        ; Exactly 4-D output [b2, b1, m, n]
+        (= ?out_shape (ECons ?b2 (ECons ?b1 (ECons ?m (ECons ?n (ENil))))))
+        (!= ?b2 (MNum 0))
+        (!= ?b1 (MNum 0))
+        (!= ?m (MNum 0))
+        (!= ?n (MNum 0))
+        (!= ?k (MNum 1))
+
+        ; Exactly 5-D operand strides in [b2, b1, m, n, k] space
+        (= ?a_stride (ECons ?a_b2 (ECons ?a_b1 (ECons ?a_m (ECons ?a_n (ECons ?a_k (ENil)))))))
+        (= ?b_stride (ECons ?b_b2 (ECons ?b_b1 (ECons ?b_m (ECons ?b_n (ECons ?b_k (ENil)))))))
+
+        ; Contiguous k on the reduction
+        (= ?k_stride (MIter))
+
+        ; A row-major per matrix: k contiguous, n broadcast, lda free (?a_m)
+        (= ?a_k (MIter))
+        (= ?a_n (MNum 0))
+
+        ; B row-major per matrix: n contiguous, m broadcast, ldb free (?b_k)
+        (= ?b_n (MIter))
+        (= ?b_m (MNum 0))
+
+        (= ?dt (dtype ?a))
+        (= ?dt (dtype ?b))
+        (cublaslt_base_dtype ?dt)
+    )
+    (
+        (let ?sgemm (Op (cublaslt_b2
+            ?n ?m ?k
+            "N" "N"
+            "COL" "COL" "COL" "COL"
+            ?b_k                    ; lda = B's row stride (free ldb of our B)
+            ?a_m                    ; ldb = A's row stride (free lda of our A)
+            ?n                      ; ldc
+            ?n                      ; ldd
+            ?b1                     ; batch_count (inner level)
+            ?b_b1                   ; stride_a (cuBLAS A = our B)
+            ?a_b1                   ; stride_b (cuBLAS B = our A)
+            (MMul ?m ?n)            ; stride_c (contiguous, from the witness)
+            (MMul ?m ?n)            ; stride_d
+            ?dt ?dt ?dt ?dt "default" "default" 1.0 0.0 "DEFAULT"
+            ?b2                     ; batch2_count (outer level)
+            ?b_b2                   ; stride2_a (cuBLAS A = our B)
+            ?a_b2                   ; stride2_b (cuBLAS B = our A)
+            (MMul (MMul ?m ?n) ?b1) ; stride2_c
+            (MMul (MMul ?m ?n) ?b1)); stride2_d
+            (ICons ?b (ICons ?a (INil)))))
+        (union ?sum ?sgemm)
+        (set (dtype ?sgemm) ?dt)
+    )
+    :ruleset matmul_backend
+    :name "cublaslt batched2 row-major x row-major"
+)

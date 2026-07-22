@@ -283,6 +283,20 @@ impl std::fmt::Display for ExecutionStats {
 pub trait EgglogOp: Debug {
     fn sort(&self) -> crate::egglog_utils::api::SortDef;
 
+    /// Library-backed ops (cuBLASLt, attention libraries, …) that should seed
+    /// the initial search genome whenever their e-class offers them. A tuned
+    /// library kernel is nearly always faster than a generated fallback, but
+    /// the profiled search's small candidate budget cannot rediscover that
+    /// per e-class from random starts on graphs with many such choices. The
+    /// search still profiles and mutates freely — this only biases the seed.
+    ///
+    /// 0 = not preferred (default). When an e-class offers several preferred
+    /// kinds, the highest priority wins the seed (e.g. a fused attention
+    /// island over the cuBLASLt matmul inside it).
+    fn seed_priority(&self) -> u8 {
+        0
+    }
+
     /// Shared egglog declarations required by this op's rewrites. These are
     /// emitted once, before any rewrite text, so relations/functions shared by
     /// multiple ops do not depend on tuple registration order. Identical

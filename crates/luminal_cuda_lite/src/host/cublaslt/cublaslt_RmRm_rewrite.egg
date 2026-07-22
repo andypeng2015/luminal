@@ -80,7 +80,12 @@
 ; In broadcast [batch, m, n, k] space:
 ;   A row-major per batch: a_k_stride=MIter, a_n_stride=0
 ;   B row-major per batch: b_n_stride=MIter, b_m_stride=0
-; Leading dimensions may differ from k/n when batch slices are non-contiguous.
+; Leading dimensions and batch strides are FREE (taken from the actual
+; strides, not required to equal k/n / their contiguous products): attention
+; operands are strided views whose rows are wider than the matrices they
+; carve out — e.g. attn·V over [heads, seq, head_dim] carved from
+; [seq, heads*head_dim] projections, where the head (batch) stride is
+; head_dim, far smaller than seq*ld.
 (rule
     (
         (= ?sum (Op (GenericMatmul
@@ -106,19 +111,13 @@
 
         (= ?k_stride (MIter))
 
-        ; A row-major: k=MIter, n=0, m_stride=k*MIter
+        ; A row-major: k=MIter, n=0, m_stride (lda) free
         (= ?a_k_stride (MIter))
         (= ?a_n_stride (MNum 0))
-        (= ?a_m_stride (MMul (MIter) ?k))
 
-        ; B row-major: n=MIter, m=0, k_stride=n*MIter
+        ; B row-major: n=MIter, m=0, k_stride (ldb) free
         (= ?b_n_stride (MIter))
         (= ?b_m_stride (MNum 0))
-        (= ?b_k_stride (MMul (MIter) ?n))
-
-        ; Uniform batch strides (contiguous per batch, no GQA-style repetition)
-        (= ?a_batch_stride (MMul ?m ?a_m_stride))
-        (= ?b_batch_stride (MMul ?k ?b_k_stride))
 
         (= ?dt (dtype ?a))
         (= ?dt (dtype ?b))

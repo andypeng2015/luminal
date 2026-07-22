@@ -1,7 +1,7 @@
 use crate::egglog_utils::{
-    EGraphChoiceSet, count_choice_sets_up_to, egglog_to_llir, extract_reachable_generation,
-    hash_choice_set, hlir_to_egglog, log_channel_enabled, random_initial_choice,
-    run_egglog_with_late_passes_interval_analysis_and_log,
+    EGraphChoiceSet, biased_initial_choice, count_choice_sets_up_to, egglog_to_llir,
+    extract_reachable_generation, hash_choice_set, hlir_to_egglog, log_channel_enabled,
+    random_initial_choice, run_egglog_with_late_passes_interval_analysis_and_log,
 };
 use crate::shape::{DimInterval, DynDimIntervals};
 use crate::{
@@ -1933,10 +1933,30 @@ impl Graph {
                 .saturating_mul(100)
                 .max(10_000);
 
+            // Seed the first attempt with library-preferred ops (see
+            // EgglogOp::seed_priority): on graphs with many independent
+            // matmul e-classes, random starts leave most of them on generated
+            // fallbacks and the mutation budget cannot recover. Falls back to
+            // random genomes if the seed is filtered or fails profiling.
+            let preferred_kinds: FxHashMap<String, u8> = ops
+                .iter()
+                .filter(|op| op.seed_priority() > 0)
+                .map(|op| (op.sort().name, op.seed_priority()))
+                .collect();
+            let mut biased_seed = (!preferred_kinds.is_empty())
+                .then(|| biased_initial_choice(egraph, &preferred_kinds, rng))
+                .filter(|genome| prev_selected.insert(hash_choice_set(genome)));
+
             loop {
-                let mut generation = random_choice_generation(egraph, 1, &mut prev_selected, rng);
-                let Some(genome) = generation.pop() else {
-                    panic_initial_filter_limit(filter_fails, last_filter_rejection.as_deref());
+                let genome = if let Some(seed) = biased_seed.take() {
+                    seed
+                } else {
+                    let mut generation =
+                        random_choice_generation(egraph, 1, &mut prev_selected, rng);
+                    let Some(genome) = generation.pop() else {
+                        panic_initial_filter_limit(filter_fails, last_filter_rejection.as_deref());
+                    };
+                    genome
                 };
 
                 list_cache.clear();

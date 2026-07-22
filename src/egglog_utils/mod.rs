@@ -2203,6 +2203,50 @@ pub fn random_initial_choice<'a>(
     choices
 }
 
+/// Draw a random genome, then override every IR e-class that offers an Op of
+/// a `seed_priority > 0` kind (see [`crate::op::EgglogOp::seed_priority`]) to
+/// select the highest-priority one, pinning the matching OpKind choice
+/// alongside. Everything else (including cycle repair) matches
+/// [`random_initial_choice`].
+pub fn biased_initial_choice<'a>(
+    egraph: &'a SerializedEGraph,
+    preferred_kinds: &FxHashMap<String, u8>,
+    rng: &mut impl Rng,
+) -> EGraphChoiceSet<'a> {
+    let mut choices = random_initial_choice(egraph, rng);
+    for (eclass, (label, enodes)) in &egraph.eclasses {
+        if label != "IR" {
+            continue;
+        }
+        let preferred_pick = enodes
+            .iter()
+            .filter_map(|node| {
+                let (op_label, children) = egraph.enodes.get(node)?;
+                if op_label != "Op" {
+                    return None;
+                }
+                let kind_class = children.first()?;
+                let (kind_node, priority) = egraph.eclasses[kind_class]
+                    .1
+                    .iter()
+                    .filter_map(|kind_node| {
+                        let priority = *preferred_kinds.get(&egraph.enodes[kind_node].0)?;
+                        opkind_metadata_consistent(egraph, kind_node)
+                            .then_some((kind_node, priority))
+                    })
+                    .max_by_key(|(_, priority)| *priority)?;
+                Some((node, kind_class, kind_node, priority))
+            })
+            .max_by_key(|(_, _, _, priority)| *priority);
+        if let Some((node, kind_class, kind_node, _)) = preferred_pick {
+            choices.insert(eclass, node);
+            choices.insert(kind_class, kind_node);
+        }
+    }
+    repair_choice_cycles(egraph, &mut choices, rng);
+    choices
+}
+
 /// Validate that a choice set is complete and consistent.
 /// Returns Ok(()) if valid, Err with description if invalid.
 pub fn validate_choice_set<'a>(

@@ -1637,6 +1637,7 @@ impl CudaGraphOp {
                     profile.graph_take += timer.elapsed();
                     let capture_stream = self.capture_stream()?;
                     for (idx, recapture) in pending_recaptures {
+                        let batch2 = state.cublaslt_ops[idx].cublaslt().resolved_batch2(dyn_map);
                         let (op_node, exit_node) = {
                             let op = &mut state.cublaslt_ops[idx];
                             profile.recapture_count += 1;
@@ -1646,6 +1647,7 @@ impl CudaGraphOp {
                                 &capture_stream,
                                 op,
                                 recapture,
+                                batch2,
                                 Some(&mut profile),
                             )?;
                             (op.node, op.exit_node.unwrap())
@@ -1898,6 +1900,7 @@ impl CudaGraphOp {
         entry_node: CUgraphNode,
         prepared: &PreparedCuBlasLtMatmul,
         ptrs: LtMatmulPointers,
+        batch2: (i64, [i64; 4]),
         mut profile: Option<&mut RecaptureProfile>,
     ) -> anyhow::Result<(Vec<CUgraphNode>, Vec<CUgraphNode>)> {
         let timer = Instant::now();
@@ -1915,7 +1918,16 @@ impl CudaGraphOp {
             profile.capture_begin += timer.elapsed();
         }
         let timer = Instant::now();
-        let enqueue_result = prepared.enqueue(capture_stream, ptrs);
+        // Outer batch level (two-level strided-batched matmul): capture one
+        // strided-batch enqueue per outer step with offset pointers. The
+        // common batch2.0 == 1 case is the legacy single-enqueue capture.
+        let mut enqueue_result = Ok(());
+        for o in 0..batch2.0.max(1) {
+            enqueue_result = prepared.enqueue(capture_stream, ptrs.offset_for_outer_batch(o, batch2.1));
+            if enqueue_result.is_err() {
+                break;
+            }
+        }
         if let Some(profile) = profile.as_deref_mut() {
             profile.capture_enqueue += timer.elapsed();
         }
@@ -1954,6 +1966,7 @@ impl CudaGraphOp {
         Ok((captured_nodes, exit_deps))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn capture_cublaslt_island(
         graph: &mut CudaGraphHandle,
         stream: &Arc<CudaStream>,
@@ -1961,6 +1974,7 @@ impl CudaGraphOp {
         entry_node: CUgraphNode,
         prepared: &PreparedCuBlasLtMatmul,
         ptrs: LtMatmulPointers,
+        batch2: (i64, [i64; 4]),
         mut profile: Option<&mut RecaptureProfile>,
     ) -> anyhow::Result<(Vec<CUgraphNode>, CUgraphNode)> {
         let (captured_nodes, exit_deps) = Self::capture_cublaslt_island_nodes(
@@ -1970,6 +1984,7 @@ impl CudaGraphOp {
             entry_node,
             prepared,
             ptrs,
+            batch2,
             profile.as_deref_mut(),
         )?;
         let timer = Instant::now();
@@ -2069,12 +2084,14 @@ impl CudaGraphOp {
         Ok(seen.into_iter().collect())
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn recapture_cublaslt_island(
         graph: &mut CudaGraphHandle,
         stream: &Arc<CudaStream>,
         capture_stream: &Arc<CudaStream>,
         op: &mut CompiledCuBlasLt,
         recapture: PendingCuBlasLtRecapture,
+        batch2: (i64, [i64; 4]),
         mut profile: Option<&mut RecaptureProfile>,
     ) -> anyhow::Result<()> {
         let recapture_timer = Instant::now();
@@ -2127,6 +2144,7 @@ impl CudaGraphOp {
             entry_node,
             prepared_ref,
             ptrs,
+            batch2,
             profile.as_deref_mut(),
         )?;
 
@@ -2517,6 +2535,7 @@ impl CudaGraphOp {
                     };
 
                     let capture_stream = self.capture_stream()?;
+                    let batch2 = state.cublaslt_ops[idx].cublaslt().resolved_batch2(dyn_map);
                     let (captured_nodes, exit_node) = Self::capture_cublaslt_island(
                         &mut graph,
                         stream,
@@ -2524,6 +2543,7 @@ impl CudaGraphOp {
                         entry_node,
                         &prepared,
                         ptrs,
+                        batch2,
                         None,
                     )?;
 

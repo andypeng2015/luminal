@@ -79,6 +79,11 @@
 ; Batched Row-major × Column-major: C[batch,m,n] = A[batch,m,k] × B[batch,k,n]
 ; A row-major per batch: a_k_stride=MIter, a_n_stride=0
 ; B column-major per batch: b_k_stride=MIter, b_m_stride=0
+; Leading dimensions and batch strides are FREE (taken from the actual
+; strides, not required to equal k / m*lda): attention operands are strided
+; views whose rows are wider than the matrices they carve out — e.g. QK^T
+; over [heads, seq, head_dim] carved from [seq, heads*head_dim] projections,
+; where the head (batch) stride is head_dim, far smaller than seq*ld.
 (rule
     (
         (= ?sum (Op (GenericMatmul
@@ -103,19 +108,13 @@
 
         (= ?k_stride (MIter))
 
-        ; A row-major: k=MIter, n=0, m_stride=k*MIter
+        ; A row-major: k=MIter, n=0, m_stride (lda) free
         (= ?a_k_stride (MIter))
         (= ?a_n_stride (MNum 0))
-        (= ?a_m_stride (MMul (MIter) ?k))
 
-        ; B column-major: k=MIter, m=0, n_stride=k*MIter
+        ; B column-major: k=MIter, m=0, n_stride (ldb) free
         (= ?b_k_stride (MIter))
         (= ?b_m_stride (MNum 0))
-        (= ?b_n_stride (MMul (MIter) ?k))
-
-        ; Uniform batch strides (contiguous per batch)
-        (= ?a_batch_stride (MMul ?m ?a_m_stride))
-        (= ?b_batch_stride (MMul ?n ?b_n_stride))
 
         (= ?dt (dtype ?a))
         (= ?dt (dtype ?b))

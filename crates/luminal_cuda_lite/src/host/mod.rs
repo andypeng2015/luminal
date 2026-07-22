@@ -11,6 +11,7 @@ pub mod moe;
 pub type Ops = (
     cublaslt::CuBlasLt,
     cublaslt::CuBlasLtScaled,
+    cublaslt::CuBlasLtB2,
     moe::GLUMoE,
     moe::fused::FusedMoE,
     flashinfer::FlashInferAttention,
