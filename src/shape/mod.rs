@@ -19,6 +19,33 @@ pub fn flatten_strides(range: &[Expression], strides: &[Expression]) -> Expressi
     flat_stride.simplify()
 }
 
+/// Probe whether a flattened index expression behaves as `c * z` over the
+/// whole domain `[0, n)`, returning `c`. Real stride expressions are either
+/// linear monomials or piecewise (`%`-wrapped) forms; probing small values
+/// plus mid/end-of-domain points rejects any wrap that falls inside the
+/// domain. Used by kernel codegen to prove an access contiguous (`c == 1`)
+/// before emitting vectorized loads/stores — a `None` only costs the scalar
+/// fallback.
+pub fn flat_index_linear_coeff(expr: &Expression, n: usize) -> Option<usize> {
+    if n == 0 || !expr.dyn_vars().is_empty() {
+        return None;
+    }
+    let at = |z: usize| {
+        expr.substitute('z', z)
+            .exec(&crate::prelude::FxHashMap::default())
+    };
+    if at(0)? != 0 {
+        return None;
+    }
+    let c = at(1)?;
+    for z in [2, 3, 17, (n / 2).saturating_sub(1), n / 2, n - 1] {
+        if z < n && at(z)? != c * z {
+            return None;
+        }
+    }
+    Some(c)
+}
+
 fn get_start_bound<D: Into<Expression> + Copy>(bound: Bound<D>) -> Expression {
     match bound {
         Bound::Included(x) => x.into(),

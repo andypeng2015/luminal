@@ -837,7 +837,7 @@ pub(crate) fn plan_static_llir_resources(
             CompileUnit::Region(region) => Some(region),
         })
         .map(|region| {
-            let (source, output_size) = region_codegen::region_kernel_source(&region, llir);
+            let (source, output_size, _) = region_codegen::region_kernel_source(&region, llir);
             let output_size =
                 eval_resource_expression(output_size, dyn_map, "fused-region output size")?;
             let has_dyn_dims = source.contains("dyn_dims");

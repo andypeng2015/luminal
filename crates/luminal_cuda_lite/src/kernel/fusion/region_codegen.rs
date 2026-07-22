@@ -1431,7 +1431,7 @@ pub(crate) struct CompiledRegion {
 pub(crate) fn region_kernel_source(
     region: &RegionUnit,
     llir_graph: &LLIRGraph,
-) -> (String, Expression) {
+) -> (String, Expression, usize) {
     // Resolve FE: shape, strides (for the write), dtype.
     let fe_op = llir_graph[region.fe_node]
         .to_dialect::<dyn KernelOp>()
@@ -1529,23 +1529,65 @@ pub(crate) fn region_kernel_source(
     }
     let local_name = |n: NodeIndex| format!("v_{}", local_idx_map[&n]);
 
+    // 32-bit indexing when the element count is statically below 2^31:
+    // region index math is dominated by constant divide/modulo chains from
+    // flattened strides, which nvcc strength-reduces to multiply-shifts at
+    // 32-bit width but leaves as slow wide divides at 64-bit. When the
+    // output is additionally proven contiguous, process 4 elements per
+    // thread and write one 8/16-byte vector instead of scalar 2/4-byte
+    // stores.
+    let out_size_static = out_shape
+        .iter()
+        .copied()
+        .product::<Expression>()
+        .to_usize();
+    let idx32 = out_size_static.is_some_and(|n| n < i32::MAX as usize);
+    let z_ty = if idx32 { "int" } else { "long long" };
+    let out_linear = out_size_static.is_some_and(|n| {
+        luminal::shape::flat_index_linear_coeff(&flatten_strides(out_shape, out_strides), n)
+            == Some(1)
+    });
+    let vec: usize = if idx32 && out_linear && matches!(dtype.bits(), 16 | 32) {
+        4
+    } else {
+        1
+    };
     let mut body = String::new();
-    body.push_str(&format!(
-        "        long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;\n\
-         \x20       if (const_z >= {n_elements}) return;\n"
-    ));
 
     // FS leaves: each reads from its corresponding `in_i` parameter using
-    // its own strides.
+    // its own strides. In the vectorized wrapper the reads sit inside the
+    // per-element loop; inputs proven contiguous are instead pre-loaded as
+    // one 8/16-byte vector before the loop (`vec_preload`), restoring read
+    // coalescing that 4-adjacent-per-thread scalar loads would break.
+    let mut vec_preload = String::new();
     for (i, &fs_idx) in region.fs_nodes.iter().enumerate() {
         let fs_op = llir_graph[fs_idx].to_dialect::<dyn KernelOp>().unwrap();
         let fs_struct: &FusionStart = (***fs_op).downcast_ref::<FusionStart>().unwrap();
         let fs_ty = cuda_dtype(fs_struct.dtype);
-        let read_idx = flatten_strides(out_shape, &fs_struct.strides).to_kernel();
-        body.push_str(&format!(
-            "        {fs_ty} {name} = in{i}[{read_idx}];\n",
-            name = local_name(fs_idx),
-        ));
+        let flat = flatten_strides(out_shape, &fs_struct.strides);
+        let name = local_name(fs_idx);
+        let vec_linear = vec > 1
+            && matches!(fs_struct.dtype.bits(), 16 | 32)
+            && out_size_static.is_some_and(|n| {
+                luminal::shape::flat_index_linear_coeff(&flat, n) == Some(1)
+            });
+        if vec_linear {
+            let in_vec_ty = if fs_struct.dtype.bits() == 16 { "uint2" } else { "uint4" };
+            vec_preload.push_str(&format!(
+                "        {fs_ty} {name}_arr[{vec}];
+        if (base + {vec} <= {n_elements}) {{
+            *reinterpret_cast<{in_vec_ty}*>({name}_arr) = *reinterpret_cast<const {in_vec_ty}*>(in{i} + base);
+        }} else {{
+            for (int u = 0; u < {vec} && base + u < {n_elements}; ++u) {name}_arr[u] = in{i}[base + u];
+        }}\n",
+            ));
+            body.push_str(&format!("        {fs_ty} {name} = {name}_arr[u];\n"));
+        } else {
+            body.push_str(&format!(
+                "        {fs_ty} {name} = in{i}[{read_idx}];\n",
+                read_idx = flat.to_kernel(),
+            ));
+        }
     }
 
     // Elementwise ops in topo order. Each looks up its predecessor locals
@@ -1598,8 +1640,32 @@ pub(crate) fn region_kernel_source(
         .next()
         .expect("FusionEnd with no predecessor");
     let fe_input_local = local_name(fe_input);
-    let write_idx = flatten_strides(out_shape, out_strides).to_kernel();
-    body.push_str(&format!("        out[{write_idx}] = {fe_input_local};\n"));
+    let body = if vec > 1 {
+        let vec_ty = if dtype.bits() == 16 { "uint2" } else { "uint4" };
+        format!(
+            "        int base = ((int)((long long)blockIdx.x * blockDim.x + threadIdx.x)) * {vec};
+        if (base >= {n_elements}) return;
+{vec_preload}        {cuda_ty} rvals[{vec}];
+        #pragma unroll
+        for (int u = 0; u < {vec}; ++u) {{
+            int const_z = base + u;
+            if (const_z >= {n_elements}) {{ rvals[u] = ({cuda_ty})0.0f; continue; }}
+{body}            rvals[u] = {fe_input_local};
+        }}
+        if (base + {vec} <= {n_elements}) {{
+            *reinterpret_cast<{vec_ty}*>(out + base) = *reinterpret_cast<const {vec_ty}*>(rvals);
+        }} else {{
+            for (int u = 0; base + u < {n_elements}; ++u) out[base + u] = rvals[u];
+        }}\n",
+        )
+    } else {
+        let write_idx = flatten_strides(out_shape, out_strides).to_kernel();
+        format!(
+            "        {z_ty} const_z = ({z_ty})((long long)blockIdx.x * blockDim.x + threadIdx.x);
+        if (const_z >= {n_elements}) return;
+{body}        out[{write_idx}] = {fe_input_local};\n"
+        )
+    };
 
     let kernel = format!(
         "{includes}\n\
@@ -1612,7 +1678,7 @@ pub(crate) fn region_kernel_source(
     );
 
     let out_size = out_shape.iter().copied().product::<Expression>();
-    (kernel, out_size)
+    (kernel, out_size, vec)
 }
 
 #[allow(clippy::type_complexity)]
@@ -1622,7 +1688,7 @@ pub(crate) fn compile_region(
     stream: &Arc<CudaStream>,
     compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
 ) -> CompiledRegion {
-    let (kernel, out_size) = region_kernel_source(region, llir_graph);
+    let (kernel, out_size, vec) = region_kernel_source(region, llir_graph);
 
     let (module, function) = if let Some((m, f)) = compile_cache.get(&kernel) {
         (m.clone(), f.clone())
@@ -1644,8 +1710,8 @@ pub(crate) fn compile_region(
         function,
         module,
         kernel_str: kernel,
-        grid: (out_size.ceil_div(256), 1.into(), 1.into()),
-        block: (out_size.min(256), 1.into(), 1.into()),
+        grid: (out_size.ceil_div(vec as i32).ceil_div(256), 1.into(), 1.into()),
+        block: (out_size.ceil_div(vec as i32).min(256), 1.into(), 1.into()),
         shared_mem: 0.into(),
         constants: FxHashMap::default(),
     }
@@ -2041,7 +2107,7 @@ mod tests {
                 _ => None,
             })
             .expect("no region built");
-        let (kernel, _) = region_kernel_source(region, g);
+        let (kernel, _, _) = region_kernel_source(region, g);
         // Producer identity per input slot, via the producer's unary op
         // name (Sqrt / Sin / Exp).
         let producers = region

@@ -52,6 +52,8 @@ pub type Ops = (
     KernelLessThan,
     KernelIota,
     KernelGather,
+    KernelGatherIota,
+    KernelGatherIotaPair,
     KernelScatter,
     KernelSumReduce,
     KernelCastSumReduce,
@@ -1003,6 +1005,740 @@ extern \"C\" {{
 
     fn kernel_name(&self) -> &'static str {
         "Gather"
+    }
+}
+
+/// Gather whose index input is a [`KernelIota`]: the index is a pure function
+/// of the output position, so it is computed inline instead of materializing
+/// an int32 index tensor and reading it back. The frontend's `pad`/`concat`
+/// lowering (`gather(iota(index_expr)) * iota(mask_expr)`) hits this on every
+/// concat — at diffusion sizes each such gather otherwise writes and re-reads
+/// a ~4·N-byte index buffer plus an extra kernel launch.
+#[derive(Default, Debug, Clone)]
+pub struct KernelGatherIota {
+    out_shape: Vec<Expression>,
+    index_expr: Expression,
+    /// Inline pad mask (1 = unmasked): out-of-range positions read as zero
+    /// instead of multiplying by a materialized `iota(mask) cast` tensor.
+    mask_expr: Expression,
+    mask_stride: Vec<Expression>,
+    index_stride: Vec<Expression>,
+    data_shape: Vec<Expression>,
+    data_stride: Vec<Expression>,
+    out_stride: Vec<Expression>,
+    dtype: DType,
+}
+
+impl EgglogOp for KernelGatherIota {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelGatherIota",
+            &[
+                ("out_shape", ELIST),
+                ("index_expr", EXPRESSION),
+                ("mask_expr", EXPRESSION),
+                ("mask_strides", ELIST),
+                ("index_strides", ELIST),
+                ("data_shape", ELIST),
+                ("data_strides", ELIST),
+                ("out_strides", ELIST),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        1
+    }
+
+    fn seed_priority(&self) -> u8 {
+        // Strictly dominates KernelGather + KernelIota in the same e-class
+        // (same result, one fewer kernel, no index-buffer traffic); seed it
+        // so the small profiled search does not have to rediscover that per
+        // gather e-class.
+        1
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?g (Op (KernelGather ?out_shape ?index_strides ?data_shape ?data_strides ?out_strides ?dt)
+                            (ICons ?idx (ICons ?data ?tail))))
+                        (= ?idx (Op (KernelIota ?e ?range) ?iota_inputs))
+                    )
+                    (
+                        (let ?gi (Op (KernelGatherIota ?out_shape ?e (MNum 1) ?index_strides ?index_strides ?data_shape ?data_strides ?out_strides ?dt)
+                            (ICons ?data (INil))))
+                        (union ?g ?gi)
+                        (set (dtype ?gi) ?dt)
+                    )
+                    :ruleset kernel_lower
+                    :name \"gather of iota computes indices inline\"
+                )",
+            ),
+            // The frontend's pad lowering multiplies the gathered tensor by a
+            // `cast(iota(mask))` 0/1 tensor. Fold that multiply into the
+            // gather: out-of-range positions become predicated zero writes,
+            // which also skips their data reads. Alignment is guaranteed by
+            // reusing the gather's out_strides as the Mul's a_strides.
+            Rule::raw(
+                "(rule
+                    (
+                        (= ?m (Op (Mul ?out_shape ?g_out_strides ?mask_strides ?mul_out_strides)
+                            (ICons ?g (ICons ?mask (INil)))))
+                        (= ?g (Op (KernelGatherIota ?out_shape ?ie (MNum 1) ?ms0 ?index_strides ?data_shape ?data_strides ?g_out_strides ?dt)
+                            (ICons ?data (INil))))
+                        (= ?mask (Op (Cast ?csize ?dt) (ICons ?mi (INil))))
+                        (= ?mi (Op (KernelIota ?me ?mr) ?iota_inputs))
+                    )
+                    (
+                        (let ?gm (Op (KernelGatherIota ?out_shape ?ie ?me ?mask_strides ?index_strides ?data_shape ?data_strides ?mul_out_strides ?dt)
+                            (ICons ?data (INil))))
+                        (union ?m ?gm)
+                        (set (dtype ?gm) ?dt)
+                    )
+                    :ruleset kernel_lower
+                    :name \"fold pad mask into gather-iota\"
+                )",
+            ),
+        ]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                out_shape: extract_expr_list(egraph, kind_children[0], list_cache, expr_cache)
+                    .unwrap(),
+                index_expr: extract_expr(egraph, kind_children[1], expr_cache).unwrap(),
+                mask_expr: extract_expr(egraph, kind_children[2], expr_cache).unwrap(),
+                mask_stride: extract_expr_list(egraph, kind_children[3], list_cache, expr_cache)
+                    .unwrap(),
+                index_stride: extract_expr_list(egraph, kind_children[4], list_cache, expr_cache)
+                    .unwrap(),
+                data_shape: extract_expr_list(egraph, kind_children[5], list_cache, expr_cache)
+                    .unwrap(),
+                data_stride: extract_expr_list(egraph, kind_children[6], list_cache, expr_cache)
+                    .unwrap(),
+                out_stride: extract_expr_list(egraph, kind_children[7], list_cache, expr_cache)
+                    .unwrap(),
+                dtype: extract_dtype(egraph, kind_children[8]),
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl KernelOp for KernelGatherIota {
+    fn compile(
+        &self,
+        stream: &Arc<CudaStream>,
+        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<char, CudaSlice<u8>>,
+    ) {
+        // The iota buffer at position p holds index_expr(p); the gather reads
+        // it at flatten(index_strides)(z), so the inline index is the
+        // composition index_expr(flatten(index_strides)(z)).
+        let idx_read = flatten_strides(&self.out_shape, &self.index_stride);
+        let composed = self.index_expr.substitute('z', idx_read).simplify();
+        let mask = (self.mask_expr != Expression::from(1)).then(|| {
+            let mask_read = flatten_strides(&self.out_shape, &self.mask_stride);
+            self.mask_expr.substitute('z', mask_read).simplify()
+        });
+
+        let vars = self
+            .out_shape
+            .iter()
+            .flat_map(|e| e.dyn_vars())
+            .chain(composed.dyn_vars())
+            .chain(mask.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.data_shape.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.data_stride.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.out_stride.iter().flat_map(|e| e.dyn_vars()))
+            .collect::<FxHashSet<_>>();
+        let dtype = cuda_dtype(self.dtype);
+        let includes = dtype_includes(&[self.dtype]);
+        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
+        let dyn_dims_param = if vars.is_empty() {
+            ""
+        } else {
+            ", const int* dyn_dims"
+        };
+        let n_elements = self
+            .out_shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .to_kernel();
+        let out_idx = flatten_strides(&self.out_shape, &self.out_stride).to_kernel();
+        let data_idx = flatten_strides(&self.data_shape, &self.data_stride).to_kernel();
+        // Fast path: static sizes below 2^31 and a contiguous output let the
+        // kernel run 32-bit index math (nvcc strength-reduces constant
+        // division to multiply-shift; 64-bit division is the bottleneck of
+        // the scalar path) and write 16-byte vectors.
+        let out_size_static = self
+            .out_shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .to_usize();
+        let data_size_static = self
+            .data_shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .to_usize();
+        let out_contiguous = out_size_static.is_some_and(|n| {
+            luminal::shape::flat_index_linear_coeff(
+                &flatten_strides(&self.out_shape, &self.out_stride),
+                n,
+            ) == Some(1)
+        });
+        let vec = (16 / self.dtype.bits().div_ceil(8)).min(8);
+        let fast = out_size_static.is_some_and(|n| n < i32::MAX as usize)
+            && data_size_static.is_some_and(|n| n < i32::MAX as usize)
+            && out_contiguous
+            && matches!(self.dtype.bits(), 16 | 32);
+
+        let kernel = if fast {
+            let guarded = if let Some(mask) = &mask {
+                format!(
+                    "if ({}) {{ const_z = {}; v = data[{data_idx}]; }}",
+                    mask.to_kernel(),
+                    composed.to_kernel(),
+                )
+            } else {
+                format!(
+                    "{{ const_z = {}; v = data[{data_idx}]; }}",
+                    composed.to_kernel(),
+                )
+            };
+            format!(
+                "{includes}
+{dyn_defines}
+extern \"C\" {{
+    __global__ void gather_iota({dtype} *C, const {dtype} *data{dyn_dims_param}) {{
+        long long base = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * {vec};
+        if (base >= {n_elements}) return;
+        {dtype} vals[{vec}];
+        #pragma unroll
+        for (int i = 0; i < {vec}; ++i) {{
+            int const_z = (int)base + i;
+            {dtype} v = ({dtype})0.0f;
+            if (const_z < {n_elements}) {guarded}
+            vals[i] = v;
+        }}
+        if (base + {vec} <= {n_elements}) {{
+            *reinterpret_cast<uint4*>(C + base) = *reinterpret_cast<const uint4*>(vals);
+        }} else {{
+            for (int i = 0; base + i < {n_elements}; ++i) C[base + i] = vals[i];
+        }}
+    }}
+}}",
+            )
+        } else {
+            let body = if let Some(mask) = &mask {
+                format!(
+                    "if (!({})) {{ *out = ({dtype})0.0f; return; }}
+        const_z = {};
+        *out = data[{data_idx}];",
+                    mask.to_kernel(),
+                    composed.to_kernel(),
+                )
+            } else {
+                format!(
+                    "const_z = {};
+        *out = data[{data_idx}];",
+                    composed.to_kernel(),
+                )
+            };
+            format!(
+                "{includes}
+{dyn_defines}
+extern \"C\" {{
+    __global__ void gather_iota({dtype} *C, const {dtype} *data{dyn_dims_param}) {{
+        long long const_z = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        if (const_z >= {n_elements}) return;
+        {dtype}* out = C + {out_idx};
+        {body}
+    }}
+}}",
+            )
+        };
+        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
+            (module.clone(), func.clone())
+        } else {
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
+            let module = stream.context().load_module(ptx).unwrap();
+            let func = module.load_function("gather_iota").unwrap();
+            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+            (module, func)
+        };
+        let out_size = self.out_shape.iter().copied().product::<Expression>();
+        let threads = if fast {
+            out_size.ceil_div(vec as i32)
+        } else {
+            out_size
+        };
+        (
+            func,
+            module,
+            kernel,
+            (threads.ceil_div(256), 1.into(), 1.into()),
+            (threads.min(256), 1.into(), 1.into()),
+            0.into(),
+            FxHashMap::default(),
+        )
+    }
+
+    fn output_size(&self) -> Expression {
+        self.out_shape.iter().copied().product()
+    }
+
+    fn all_dyn_vars(&self) -> FxHashSet<char> {
+        self.out_shape
+            .iter()
+            .flat_map(|e| e.dyn_vars())
+            .chain(self.index_expr.dyn_vars())
+            .chain(self.mask_expr.dyn_vars())
+            .chain(self.mask_stride.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.index_stride.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.data_shape.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.data_stride.iter().flat_map(|e| e.dyn_vars()))
+            .chain(self.out_stride.iter().flat_map(|e| e.dyn_vars()))
+            .collect()
+    }
+
+    fn output_bytes(&self) -> Expression {
+        (self.output_size() * self.dtype.bits()).ceil_div(8)
+    }
+
+    fn bytes_loaded(&self) -> Expression {
+        // Data only — the index is computed, not read.
+        (self.output_size() * self.dtype.bits()).ceil_div(8)
+    }
+
+    fn bytes_stored(&self) -> Expression {
+        self.output_bytes()
+    }
+
+    fn flops(&self) -> Expression {
+        0.into()
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn kernel_name(&self) -> &'static str {
+        "GatherIota"
+    }
+}
+
+/// Addition of two mask-folded [`KernelGatherIota`]s — the frontend's
+/// `concat_along` (pad + pad + add). One kernel, predicated reads: each
+/// thread reads only the side(s) whose pad mask covers its position, so a
+/// concat costs one data read plus one write instead of two gather kernels,
+/// two mask tensors, and an add region.
+#[derive(Default, Debug, Clone)]
+pub struct KernelGatherIotaPair {
+    out_shape: Vec<Expression>,
+    out_stride: Vec<Expression>,
+    a_index_expr: Expression,
+    a_mask_expr: Expression,
+    a_mask_stride: Vec<Expression>,
+    a_index_stride: Vec<Expression>,
+    a_data_shape: Vec<Expression>,
+    a_data_stride: Vec<Expression>,
+    b_index_expr: Expression,
+    b_mask_expr: Expression,
+    b_mask_stride: Vec<Expression>,
+    b_index_stride: Vec<Expression>,
+    b_data_shape: Vec<Expression>,
+    b_data_stride: Vec<Expression>,
+    dtype: DType,
+}
+
+impl EgglogOp for KernelGatherIotaPair {
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "KernelGatherIotaPair",
+            &[
+                ("out_shape", ELIST),
+                ("out_strides", ELIST),
+                ("a_index_expr", EXPRESSION),
+                ("a_mask_expr", EXPRESSION),
+                ("a_mask_strides", ELIST),
+                ("a_index_strides", ELIST),
+                ("a_data_shape", ELIST),
+                ("a_data_strides", ELIST),
+                ("b_index_expr", EXPRESSION),
+                ("b_mask_expr", EXPRESSION),
+                ("b_mask_strides", ELIST),
+                ("b_index_strides", ELIST),
+                ("b_data_shape", ELIST),
+                ("b_data_strides", ELIST),
+                ("dtype", DTYPE),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        2
+    }
+
+    fn seed_priority(&self) -> u8 {
+        // Strictly dominates the two masked gathers plus the add region it
+        // replaces (see KernelGatherIota::seed_priority).
+        1
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        vec![Rule::raw(
+            "(rule
+                (
+                    (= ?s (Op (Add ?out_shape ?sa ?sb ?so) (ICons ?ga (ICons ?gb (INil)))))
+                    (= ?ga (Op (KernelGatherIota ?out_shape ?iea ?mea ?msa ?isa ?dsha ?dstra ?sa ?dt)
+                        (ICons ?da (INil))))
+                    (= ?gb (Op (KernelGatherIota ?out_shape ?ieb ?meb ?msb ?isb ?dshb ?dstrb ?sb ?dt)
+                        (ICons ?db (INil))))
+                    (!= ?mea (MNum 1))
+                    (!= ?meb (MNum 1))
+                )
+                (
+                    (let ?cat (Op (KernelGatherIotaPair ?out_shape ?so
+                        ?iea ?mea ?msa ?isa ?dsha ?dstra
+                        ?ieb ?meb ?msb ?isb ?dshb ?dstrb ?dt)
+                        (ICons ?da (ICons ?db (INil)))))
+                    (union ?s ?cat)
+                    (set (dtype ?cat) ?dt)
+                )
+                :ruleset kernel_lower
+                :name \"fold concat pad-add into one dual gather\"
+            )",
+        )]
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let el = |i: usize, lc: &mut FxHashMap<&'a ENodeId, Vec<Expression>>, ec: &mut FxHashMap<&'a ENodeId, Expression>| {
+            extract_expr_list(egraph, kind_children[i], lc, ec).unwrap()
+        };
+        let out_shape = el(0, list_cache, expr_cache);
+        let out_stride = el(1, list_cache, expr_cache);
+        let a_index_expr = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
+        let a_mask_expr = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
+        let a_mask_stride = el(4, list_cache, expr_cache);
+        let a_index_stride = el(5, list_cache, expr_cache);
+        let a_data_shape = el(6, list_cache, expr_cache);
+        let a_data_stride = el(7, list_cache, expr_cache);
+        let b_index_expr = extract_expr(egraph, kind_children[8], expr_cache).unwrap();
+        let b_mask_expr = extract_expr(egraph, kind_children[9], expr_cache).unwrap();
+        let b_mask_stride = el(10, list_cache, expr_cache);
+        let b_index_stride = el(11, list_cache, expr_cache);
+        let b_data_shape = el(12, list_cache, expr_cache);
+        let b_data_stride = el(13, list_cache, expr_cache);
+        (
+            LLIROp::new::<dyn KernelOp>(Box::new(Self {
+                out_shape,
+                out_stride,
+                a_index_expr,
+                a_mask_expr,
+                a_mask_stride,
+                a_index_stride,
+                a_data_shape,
+                a_data_stride,
+                b_index_expr,
+                b_mask_expr,
+                b_mask_stride,
+                b_index_stride,
+                b_data_shape,
+                b_data_stride,
+                dtype: extract_dtype(egraph, kind_children[14]),
+            })),
+            input_enodes,
+        )
+    }
+}
+
+impl KernelOp for KernelGatherIotaPair {
+    fn compile(
+        &self,
+        stream: &Arc<CudaStream>,
+        compile_cache: &mut FxHashMap<String, (Arc<CudaModule>, CudaFunction)>,
+    ) -> (
+        CudaFunction,
+        Arc<CudaModule>,
+        String,
+        (Expression, Expression, Expression),
+        (Expression, Expression, Expression),
+        Expression,
+        FxHashMap<char, CudaSlice<u8>>,
+    ) {
+        let side = |index_expr: &Expression,
+                    mask_expr: &Expression,
+                    mask_stride: &[Expression],
+                    index_stride: &[Expression]|
+         -> (Expression, Expression) {
+            let idx_read = flatten_strides(&self.out_shape, index_stride);
+            let composed = index_expr.substitute('z', idx_read).simplify();
+            let mask_read = flatten_strides(&self.out_shape, mask_stride);
+            let mask = mask_expr.substitute('z', mask_read).simplify();
+            (composed, mask)
+        };
+        let (a_idx, a_mask) = side(
+            &self.a_index_expr,
+            &self.a_mask_expr,
+            &self.a_mask_stride,
+            &self.a_index_stride,
+        );
+        let (b_idx, b_mask) = side(
+            &self.b_index_expr,
+            &self.b_mask_expr,
+            &self.b_mask_stride,
+            &self.b_index_stride,
+        );
+
+        let vars = self
+            .out_shape
+            .iter()
+            .chain(self.out_stride.iter())
+            .chain(self.a_data_shape.iter())
+            .chain(self.a_data_stride.iter())
+            .chain(self.b_data_shape.iter())
+            .chain(self.b_data_stride.iter())
+            .flat_map(|e| e.dyn_vars())
+            .chain(a_idx.dyn_vars())
+            .chain(a_mask.dyn_vars())
+            .chain(b_idx.dyn_vars())
+            .chain(b_mask.dyn_vars())
+            .collect::<FxHashSet<_>>();
+        let dtype = cuda_dtype(self.dtype);
+        let includes = dtype_includes(&[self.dtype]);
+        let (dyn_defines, _sorted_dims) = generate_dyn_dims_defines(&vars);
+        let dyn_dims_param = if vars.is_empty() {
+            ""
+        } else {
+            ", const int* dyn_dims"
+        };
+        let n_elements = self
+            .out_shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .to_kernel();
+        let out_idx = flatten_strides(&self.out_shape, &self.out_stride).to_kernel();
+        let a_data_idx = flatten_strides(&self.a_data_shape, &self.a_data_stride).to_kernel();
+        let b_data_idx = flatten_strides(&self.b_data_shape, &self.b_data_stride).to_kernel();
+        // Same fast path as gather_iota: 32-bit index math + 16-byte stores
+        // when sizes are static and the output is contiguous.
+        let out_size_static = self
+            .out_shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .to_usize();
+        let a_size_static = self
+            .a_data_shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .to_usize();
+        let b_size_static = self
+            .b_data_shape
+            .iter()
+            .copied()
+            .product::<Expression>()
+            .to_usize();
+        let out_contiguous = out_size_static.is_some_and(|n| {
+            luminal::shape::flat_index_linear_coeff(
+                &flatten_strides(&self.out_shape, &self.out_stride),
+                n,
+            ) == Some(1)
+        });
+        let vec = (16 / self.dtype.bits().div_ceil(8)).min(8);
+        let fast = out_size_static.is_some_and(|n| n < i32::MAX as usize)
+            && a_size_static.is_some_and(|n| n < i32::MAX as usize)
+            && b_size_static.is_some_and(|n| n < i32::MAX as usize)
+            && out_contiguous
+            && matches!(self.dtype.bits(), 16 | 32);
+        let kernel = if fast {
+            format!(
+                "{includes}
+{dyn_defines}
+extern \"C\" {{
+    __global__ void gather_iota_pair({dtype} *C, const {dtype} *a, const {dtype} *b{dyn_dims_param}) {{
+        long long base = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * {vec};
+        if (base >= {n_elements}) return;
+        {dtype} vals[{vec}];
+        #pragma unroll
+        for (int i = 0; i < {vec}; ++i) {{
+            int z = (int)base + i;
+            int const_z = z;
+            float acc = 0.0f;
+            if (z < {n_elements}) {{
+                const bool in_a = {a_mask_k};
+                const bool in_b = {b_mask_k};
+                if (in_a) {{
+                    const_z = {a_idx_k};
+                    acc += (float)a[{a_data_idx}];
+                }}
+                if (in_b) {{
+                    const_z = z;
+                    const_z = {b_idx_k};
+                    acc += (float)b[{b_data_idx}];
+                }}
+            }}
+            vals[i] = ({dtype})acc;
+        }}
+        if (base + {vec} <= {n_elements}) {{
+            *reinterpret_cast<uint4*>(C + base) = *reinterpret_cast<const uint4*>(vals);
+        }} else {{
+            for (int i = 0; base + i < {n_elements}; ++i) C[base + i] = vals[i];
+        }}
+    }}
+}}",
+                a_mask_k = a_mask.to_kernel(),
+                a_idx_k = a_idx.to_kernel(),
+                b_mask_k = b_mask.to_kernel(),
+                b_idx_k = b_idx.to_kernel(),
+            )
+        } else {
+            format!(
+                "{includes}
+{dyn_defines}
+extern \"C\" {{
+    __global__ void gather_iota_pair({dtype} *C, const {dtype} *a, const {dtype} *b{dyn_dims_param}) {{
+        long long z = (long long)blockIdx.x * blockDim.x + threadIdx.x;
+        if (z >= {n_elements}) return;
+        long long const_z = z;
+        {dtype}* out = C + {out_idx};
+        const bool in_a = {a_mask_k};
+        const bool in_b = {b_mask_k};
+        float acc = 0.0f;
+        if (in_a) {{
+            const_z = {a_idx_k};
+            acc += (float)a[{a_data_idx}];
+        }}
+        if (in_b) {{
+            const_z = z;
+            const_z = {b_idx_k};
+            acc += (float)b[{b_data_idx}];
+        }}
+        *out = ({dtype})acc;
+    }}
+}}",
+                a_mask_k = a_mask.to_kernel(),
+                a_idx_k = a_idx.to_kernel(),
+                b_mask_k = b_mask.to_kernel(),
+                b_idx_k = b_idx.to_kernel(),
+            )
+        };
+        let (module, func) = if let Some((module, func)) = compile_cache.get(&kernel) {
+            (module.clone(), func.clone())
+        } else {
+            let ptx = compile_module_image_for_current_device(stream.context(), &kernel).unwrap();
+            let module = stream.context().load_module(ptx).unwrap();
+            let func = module.load_function("gather_iota_pair").unwrap();
+            compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
+            (module, func)
+        };
+        let out_size = self.out_shape.iter().copied().product::<Expression>();
+        let threads = if fast {
+            out_size.ceil_div(vec as i32)
+        } else {
+            out_size
+        };
+        (
+            func,
+            module,
+            kernel,
+            (threads.ceil_div(256), 1.into(), 1.into()),
+            (threads.min(256), 1.into(), 1.into()),
+            0.into(),
+            FxHashMap::default(),
+        )
+    }
+
+    fn output_size(&self) -> Expression {
+        self.out_shape.iter().copied().product()
+    }
+
+    fn all_dyn_vars(&self) -> FxHashSet<char> {
+        self.out_shape
+            .iter()
+            .chain(self.out_stride.iter())
+            .chain(self.a_mask_stride.iter())
+            .chain(self.a_index_stride.iter())
+            .chain(self.a_data_shape.iter())
+            .chain(self.a_data_stride.iter())
+            .chain(self.b_mask_stride.iter())
+            .chain(self.b_index_stride.iter())
+            .chain(self.b_data_shape.iter())
+            .chain(self.b_data_stride.iter())
+            .flat_map(|e| e.dyn_vars())
+            .chain(self.a_index_expr.dyn_vars())
+            .chain(self.a_mask_expr.dyn_vars())
+            .chain(self.b_index_expr.dyn_vars())
+            .chain(self.b_mask_expr.dyn_vars())
+            .collect()
+    }
+
+    fn output_bytes(&self) -> Expression {
+        (self.output_size() * self.dtype.bits()).ceil_div(8)
+    }
+
+    fn bytes_loaded(&self) -> Expression {
+        // Each position reads from exactly one side of the concat (the pad
+        // masks partition the output), so total reads ≈ one output's worth.
+        self.output_bytes()
+    }
+
+    fn bytes_stored(&self) -> Expression {
+        self.output_bytes()
+    }
+
+    fn flops(&self) -> Expression {
+        0.into()
+    }
+
+    fn output_dtype(&self) -> DType {
+        self.dtype
+    }
+
+    fn kernel_name(&self) -> &'static str {
+        "GatherIotaPair"
     }
 }
 
@@ -2079,6 +2815,33 @@ extern \"C\" {{
     }}
 }}"
             )
+        } else if matches!(self.in_dtype.bits(), 16 | 32) && matches!(self.out_dtype.bits(), 16 | 32)
+        {
+            // Flat 1:1 copy — vectorize 4 elements per thread (8/16-byte
+            // transactions) instead of scalar 2/4-byte accesses.
+            let in_dtype = cuda_dtype(self.in_dtype);
+            let in_vec = if self.in_dtype.bits() == 16 { "uint2" } else { "uint4" };
+            let out_vec = if self.out_dtype.bits() == 16 { "uint2" } else { "uint4" };
+            format!(
+                "{includes}
+{dyn_defines}
+extern \"C\" {{
+    __global__ void cast_k({out_dtype} *out, const {in_dtype} *in{dyn_dims_param}) {{
+        long long base = ((long long)blockIdx.x * blockDim.x + threadIdx.x) * 4;
+        if (base >= {size}) return;
+        if (base + 4 <= {size}) {{
+            {in_dtype} a[4];
+            {out_dtype} b[4];
+            *reinterpret_cast<{in_vec}*>(a) = *reinterpret_cast<const {in_vec}*>(in + base);
+            #pragma unroll
+            for (int i = 0; i < 4; ++i) b[i] = ({out_dtype})a[i];
+            *reinterpret_cast<{out_vec}*>(out + base) = *reinterpret_cast<const {out_vec}*>(b);
+        }} else {{
+            for (long long i = base; i < {size}; ++i) out[i] = ({out_dtype})in[i];
+        }}
+    }}
+}}"
+            )
         } else {
             let in_dtype = cuda_dtype(self.in_dtype);
             format!(
@@ -2102,11 +2865,18 @@ extern \"C\" {{
             compile_cache.insert(kernel.clone(), (module.clone(), func.clone()));
             (module, func)
         };
+        let vectorized =
+            self.in_dtype.bits() >= 8 && matches!(self.in_dtype.bits(), 16 | 32) && matches!(self.out_dtype.bits(), 16 | 32);
+        let threads = if vectorized {
+            self.size.ceil_div(4)
+        } else {
+            self.size
+        };
         (
             func,
             module,
             kernel,
-            (self.size.ceil_div(256), 1.into(), 1.into()),
+            (threads.ceil_div(256), 1.into(), 1.into()),
             (256.into(), 1.into(), 1.into()),
             0.into(),
             FxHashMap::default(),
