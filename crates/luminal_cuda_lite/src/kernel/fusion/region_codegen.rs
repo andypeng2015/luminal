@@ -1547,8 +1547,10 @@ pub(crate) fn region_kernel_source(
         luminal::shape::flat_index_linear_coeff(&flatten_strides(out_shape, out_strides), n)
             == Some(1)
     });
+    // One 16-byte vector store per thread: 8 lanes for 16-bit outputs,
+    // 4 lanes for 32-bit.
     let vec: usize = if idx32 && out_linear && matches!(dtype.bits(), 16 | 32) {
-        4
+        16 / dtype.bits().div_ceil(8)
     } else {
         1
     };
@@ -1567,12 +1569,12 @@ pub(crate) fn region_kernel_source(
         let flat = flatten_strides(out_shape, &fs_struct.strides);
         let name = local_name(fs_idx);
         let vec_linear = vec > 1
-            && matches!(fs_struct.dtype.bits(), 16 | 32)
+            && vec * fs_struct.dtype.bits().div_ceil(8) == 16
             && out_size_static.is_some_and(|n| {
                 luminal::shape::flat_index_linear_coeff(&flat, n) == Some(1)
             });
         if vec_linear {
-            let in_vec_ty = if fs_struct.dtype.bits() == 16 { "uint2" } else { "uint4" };
+            let in_vec_ty = "uint4";
             vec_preload.push_str(&format!(
                 "        {fs_ty} {name}_arr[{vec}];
         if (base + {vec} <= {n_elements}) {{
@@ -1641,7 +1643,7 @@ pub(crate) fn region_kernel_source(
         .expect("FusionEnd with no predecessor");
     let fe_input_local = local_name(fe_input);
     let body = if vec > 1 {
-        let vec_ty = if dtype.bits() == 16 { "uint2" } else { "uint4" };
+        let vec_ty = "uint4";
         format!(
             "        int base = ((int)((long long)blockIdx.x * blockDim.x + threadIdx.x)) * {vec};
         if (base >= {n_elements}) return;

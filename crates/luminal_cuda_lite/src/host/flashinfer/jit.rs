@@ -195,10 +195,34 @@ pub type SinglePrefillRunFn = unsafe extern "C" fn(
     stream: *mut c_void,
 ) -> i32;
 
+pub type Fa3DenseRunFn = unsafe extern "C" fn(
+    q: *mut c_void,
+    k: *mut c_void,
+    v: *mut c_void,
+    output: *mut c_void,
+    qo_len: i32,
+    kv_len: i32,
+    num_qo_heads: i32,
+    num_kv_heads: i32,
+    q_stride_n: i64,
+    q_stride_h: i64,
+    k_stride_n: i64,
+    k_stride_h: i64,
+    v_stride_n: i64,
+    v_stride_h: i64,
+    o_stride_n: i64,
+    o_stride_h: i64,
+    dtype: i32,
+    sm_scale: f32,
+    stream: *mut c_void,
+) -> i32;
+
 // ── Embedded CUDA sources ──
 
 const WRAPPER_CU: &str = include_str!("wrapper.cu");
 const WRAPPER_H: &str = include_str!("wrapper.h");
+const WRAPPER_FA3_DENSE_CU: &str = include_str!("wrapper_fa3_dense.cu");
+const WRAPPER_FA3_DENSE_H: &str = include_str!("wrapper_fa3_dense.h");
 
 // ── Loaded library handle ──
 
@@ -283,6 +307,138 @@ impl FlashInferLib {
             single_prefill_run,
         })
     }
+}
+
+/// FA3/Hopper (SM90) dense single-prefill wrapper. Separate .so from the FA2
+/// wrapper: the hopper kernels need -arch=sm_90a and compile without
+/// -rdc=true (relocatable device code serializes the wgmma pipeline).
+pub struct Fa3DenseLib {
+    _lib: libloading::Library,
+    pub run: Fa3DenseRunFn,
+}
+
+unsafe impl Send for Fa3DenseLib {}
+unsafe impl Sync for Fa3DenseLib {}
+
+static FA3_DENSE_LIBS: OnceLock<
+    std::sync::Mutex<std::collections::HashMap<usize, &'static Fa3DenseLib>>,
+> = OnceLock::new();
+
+/// Ensure the FA3 dense single-prefill library is compiled and loaded for the
+/// given HEAD_DIM. Callers gate on Hopper (compute major >= 9) and
+/// head_dim ∈ {64, 128, 256} before calling. Thread-safe.
+pub fn ensure_compiled_fa3_dense(head_dim: usize) -> &'static Fa3DenseLib {
+    let libs = FA3_DENSE_LIBS.get_or_init(Default::default);
+    let mut libs = libs.lock().unwrap();
+    if let Some(lib) = libs.get(&head_dim) {
+        return lib;
+    }
+    assert!(
+        matches!(head_dim, 64 | 128 | 256),
+        "FlashInfer FA3 dense: unsupported HEAD_DIM={head_dim} (must be 64, 128, or 256)"
+    );
+    let so_path = compile_or_cache_fa3_dense(head_dim);
+    let lib: &'static Fa3DenseLib = Box::leak(Box::new(unsafe {
+        Fa3DenseLib::load(&so_path)
+            .unwrap_or_else(|e| panic!("Failed to load FA3 dense FlashInfer library: {e}"))
+    }));
+    libs.insert(head_dim, lib);
+    lib
+}
+
+impl Fa3DenseLib {
+    /// # Safety
+    /// The .so must be a valid wrapper compiled from wrapper_fa3_dense.cu.
+    unsafe fn load(path: &Path) -> Result<Self, libloading::Error> {
+        let lib = unsafe { libloading::Library::new(path)? };
+        let run: Fa3DenseRunFn =
+            unsafe { *lib.get::<Fa3DenseRunFn>(b"flashinfer_fa3_dense_run ")? };
+        Ok(Self { _lib: lib, run })
+    }
+}
+
+/// Compile wrapper_fa3_dense.cu for the given HEAD_DIM, or return the cached
+/// .so. sm_90a is required — plain sm_90 will not compile the WGMMA/TMA
+/// kernels; and unlike the FA2 wrapper there is no -rdc=true.
+fn compile_or_cache_fa3_dense(head_dim: usize) -> PathBuf {
+    let cache_dir = cache_directory();
+    std::fs::create_dir_all(&cache_dir).expect("Failed to create FlashInfer cache directory");
+    let cu = cache_dir.join("wrapper_fa3_dense.cu");
+    write_if_changed(&cu, WRAPPER_FA3_DENSE_CU.as_bytes());
+    write_if_changed(
+        &cache_dir.join("wrapper_fa3_dense.h"),
+        WRAPPER_FA3_DENSE_H.as_bytes(),
+    );
+    let wrapper_hash = {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        WRAPPER_FA3_DENSE_CU.hash(&mut hasher);
+        WRAPPER_FA3_DENSE_H.hash(&mut hasher);
+        hasher.finish()
+    };
+    let so_name = format!("libflashinfer_fa3dense_hd{head_dim}_sm_90a_w{wrapper_hash:016x}.so");
+    let so_path = cache_dir.join(&so_name);
+    if so_path.exists() {
+        eprintln!(
+            "FlashInfer FA3 dense: using cached library for HEAD_DIM={head_dim} ({})",
+            so_path.display()
+        );
+        return so_path;
+    }
+
+    let Some((flashinfer_include, cutlass_include)) = locate_flashinfer_includes() else {
+        panic!(
+            "FlashInfer: could not locate header tree. Set LUMINAL_FLASHINFER_DIR to the \
+             FlashInfer source root (the directory containing `include/` and \
+             `3rdparty/cutlass/include/`)."
+        );
+    };
+    // cutlass_utils.cuh also pulls in cutlass/util/* from the tools tree.
+    let cutlass_tools = cutlass_include.parent().unwrap().join("tools/util/include");
+
+    eprintln!(
+        "FlashInfer FA3 dense: JIT compiling for HEAD_DIM={head_dim}, arch=sm_90a (hopper templates — takes a few minutes) ..."
+    );
+    let start = std::time::Instant::now();
+    let output = Command::new("nvcc")
+        .args([
+            "-shared",
+            "-o",
+            so_path.to_str().unwrap(),
+            &format!("-DLUMINAL_HEAD_DIM={head_dim}"),
+            cu.to_str().unwrap(),
+            "-I",
+            flashinfer_include.to_str().unwrap(),
+            "-I",
+            cutlass_include.to_str().unwrap(),
+            "-I",
+            cutlass_tools.to_str().unwrap(),
+            "-I",
+            cache_dir.to_str().unwrap(),
+            "-std=c++17",
+            "-arch=sm_90a",
+            "-O3",
+            "--expt-relaxed-constexpr",
+            "-w",
+            "--compiler-options",
+            "-fPIC",
+        ])
+        .output()
+        .expect("Failed to run nvcc. Is the CUDA toolkit installed?");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let _ = std::fs::remove_file(&so_path);
+        panic!(
+            "FlashInfer FA3 dense JIT compilation failed (HEAD_DIM={head_dim}):\nstdout: {stdout}\nstderr: {stderr}"
+        );
+    }
+    eprintln!(
+        "FlashInfer FA3 dense: compiled in {:.1}s → {}",
+        start.elapsed().as_secs_f64(),
+        so_path.display()
+    );
+    so_path
 }
 
 /// Compile wrapper.cu for the given HEAD_DIM/variant, or return cached .so path.

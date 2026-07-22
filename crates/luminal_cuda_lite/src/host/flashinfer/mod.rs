@@ -587,6 +587,9 @@ impl EgglogOp for FlashInferDenseAttention {
 
         // Pay the JIT cost at extract time, not inside the GA profiling loop.
         let _ = jit::ensure_compiled(head_dim, false);
+        if crate::device_compute_major() >= 9 && matches!(head_dim, 64 | 128 | 256) {
+            let _ = jit::ensure_compiled_fa3_dense(head_dim);
+        }
 
         let op = LLIROp::new::<dyn HostOp>(Box::new(extracted) as Box<dyn HostOp>);
         (op, input_enodes)
@@ -1162,6 +1165,53 @@ impl PreparedFlashInferDecode {
         let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
 
         if self.spec.dense {
+            // FA3 (SM90) first: WGMMA/TMA kernel with free output strides, so
+            // it writes luminal's head-major output directly — no temp buffer,
+            // no transpose pass. TMA needs every stride 16-byte aligned.
+            let elem = self.spec.dtype.size_of() as i64;
+            let tma_ok = |stride: i32| (stride as i64 * elem) % 16 == 0;
+            let fa3_ok = crate::device_compute_major() >= 9
+                && matches!(self.spec.head_dim, 64 | 128 | 256)
+                && self.spec.dtype.supports_prefill()
+                && tma_ok(self.spec.q_stride_n)
+                && tma_ok(self.spec.q_stride_h)
+                && tma_ok(self.spec.k_stride_n)
+                && tma_ok(self.spec.k_stride_h)
+                && tma_ok(self.spec.v_stride_n)
+                && tma_ok(self.spec.v_stride_h);
+            if fa3_ok {
+                let lib = jit::ensure_compiled_fa3_dense(self.spec.head_dim);
+                let ret = unsafe {
+                    (lib.run)(
+                        ptrs.q as *mut std::ffi::c_void,
+                        ptrs.k_cache as *mut std::ffi::c_void,
+                        ptrs.v_cache as *mut std::ffi::c_void,
+                        ptrs.output as *mut std::ffi::c_void,
+                        self.spec.total_q_tokens as i32,
+                        self.spec.c as i32,
+                        self.spec.num_qo_heads as i32,
+                        self.spec.num_kv_heads as i32,
+                        self.spec.q_stride_n as i64,
+                        self.spec.q_stride_h as i64,
+                        self.spec.k_stride_n as i64,
+                        self.spec.k_stride_h as i64,
+                        self.spec.v_stride_n as i64,
+                        self.spec.v_stride_h as i64,
+                        self.spec.head_dim as i64,
+                        (self.spec.total_q_tokens * self.spec.head_dim) as i64,
+                        self.spec.dtype as i32,
+                        f32::from_bits(self.spec.sm_scale_bits),
+                        cu_stream,
+                    )
+                };
+                if ret == 0 {
+                    return Ok(());
+                }
+                eprintln!(
+                    "FlashInfer FA3 dense run failed with error code {ret}; falling back to FA2 single-prefill"
+                );
+            }
+
             // Plan-free single-prefill into the packed temp buffer, then the
             // shared (qo, heads, dim) → (heads, qo, dim) output transpose.
             let run_ret = unsafe {

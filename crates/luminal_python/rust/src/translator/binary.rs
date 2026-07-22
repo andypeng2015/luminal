@@ -58,7 +58,16 @@ impl<'a> Translator<'a> {
                 BinaryOp::Add => a + b,
                 BinaryOp::Mul => a * b,
                 BinaryOp::Sub => a - b,
-                BinaryOp::Div => a / b,
+                // aten.div is true division: integer inputs produce a float
+                // result (and Recip has no integer lowering).
+                BinaryOp::Div => {
+                    let (a, b) = if int_like(a.dtype) {
+                        (a.cast(DType::F32), b.cast(DType::F32))
+                    } else {
+                        (a, b)
+                    };
+                    a / b
+                }
             })
         } else {
             if let Some(f) = arg1.as_float() {
@@ -95,6 +104,17 @@ impl<'a> Translator<'a> {
         val: f32,
         op: BinaryOp,
     ) -> GraphTensor {
+        // This entry point is only reached for genuinely-float scalars
+        // (integer scalars route through the symbolic path), and torch
+        // promotes int-tensor ⊕ float-scalar to a float result for every
+        // binary op. Casting the scalar DOWN to the int dtype instead
+        // silently truncates it (e.g. sinusoidal timestep embeddings
+        // multiply an int arange by -ln(10000) ≈ -9.21, not -9).
+        let a = if int_like(a.dtype) {
+            a.cast(DType::F32)
+        } else {
+            a
+        };
         let scalar = self
             .graph
             .constant_float(val)
@@ -114,6 +134,12 @@ impl<'a> Translator<'a> {
         val: Expression,
         op: BinaryOp,
     ) -> GraphTensor {
+        // aten.div is true division: integer inputs produce a float result.
+        let a = if matches!(op, BinaryOp::Div) && int_like(a.dtype) {
+            a.cast(DType::F32)
+        } else {
+            a
+        };
         match op {
             BinaryOp::Add => a + val,
             BinaryOp::Mul => a * val,
@@ -121,6 +147,11 @@ impl<'a> Translator<'a> {
             BinaryOp::Div => a / val,
         }
     }
+}
+
+/// Integer-family dtypes for aten.div's true-division promotion.
+fn int_like(dtype: DType) -> bool {
+    matches!(dtype, DType::Int | DType::I64 | DType::Bool)
 }
 
 #[cfg(test)]
