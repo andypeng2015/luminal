@@ -1,0 +1,104 @@
+; FlashInfer dense bidirectional attention (no KV cache, no mask):
+;   softmax((Q @ K^T) * scale) @ V
+; — diffusion-transformer (MMDiT/FLUX) attention over materialized
+; [heads, seq, head_dim] tensors. batch==1 graphs squeeze to this 3-D form
+; via matmul_flatten; batch>1 stays on the decomposed chain for now.
+;
+; Anchors on the two GenericMatmul nodes with their exact-3d witnesses (the
+; reduction reads the materialized Mul canonically and writes contiguous
+; row-major output — the layout the runtime's output transpose assumes), and
+; the same softmax skeleton as the paged island rules
+; (max → -max → add → ×log2e → exp2 → sum → recip → mul).
+;
+; Layouts: Q/K/V per-token and per-head strides are all FREE and passed
+; through to the kernel (like the free-ld cuBLASLt rules) — the single-prefill
+; runtime reads each tensor through its own strides, so both materialized
+; tensors and head-interleaved projection views match. Only head_dim must be
+; contiguous (the (MIter) constraints below; FlashInfer uses vector loads).
+
+(rule
+    (
+        ; ── Q @ K^T: out [h, s, kv], reduction over head_dim d ──
+        (= ?qk (Op (GenericMatmul
+            ?qk_out_shape ?qk_mul_shape ?d
+            ?q_stride ?k_stride
+            ?qk_sum_in ?qk_k_stride ?qk_sum_out
+            ?qk_dtype)
+            (ICons ?q (ICons ?k (INil)))))
+        (generic_matmul_exact_3d ?qk ?h ?s ?kv ?d ?dt)
+        (= ?qk_dtype ?dt)
+        (= ?qk_out_shape (ECons ?h (ECons ?s (ECons ?kv (ENil)))))
+        (!= ?s (MNum 1))
+        (!= ?kv (MNum 1))
+
+        ; Operand strides in [h, s(m), kv(n), d(k)] space; token/head strides
+        ; free (passed through), head_dim contiguous.
+        (= ?q_stride (ECons ?q_h (ECons ?q_n (ECons (MNum 0) (ECons (MIter) (ENil))))))
+        (= ?k_stride (ECons ?k_h (ECons (MNum 0) (ECons ?k_n (ECons (MIter) (ENil))))))
+        (= ?qk_k_stride (MIter))
+
+        ; ── scores * scale (the SDPA lowering multiplies by a broadcast
+        ;    constant; const_like also covers the constant(v).cast(dt) form) ──
+        (= ?scaled (Op (Mul ?scm_shape ?scm_a ?scm_b ?scm_o)
+            (ICons ?qk (ICons ?scale_c (INil)))))
+        (const_like ?scale_c ?scale_val)
+
+        ; ── softmax over the kv axis (skeleton shared with the paged rules) ──
+        (= ?smax (Op (Max ?smax_shape ?kv ?smax_in ?smax_iter ?smax_out)
+            (ICons ?scaled (INil))))
+        (= ?negmax (Op (Mul ?nm_shape ?nm_a ?nm_b ?nm_o)
+            (ICons ?smax (ICons ?nm_negone (INil)))))
+        (= ?shifted (Op (Add ?sh_shape ?sh_a ?sh_b ?sh_o)
+            (ICons ?scaled (ICons ?negmax (INil)))))
+        (= ?sc (Op (Mul ?sc_shape ?sc_a ?sc_b ?sc_o)
+            (ICons ?shifted (ICons ?sc_log2e (INil)))))
+        (const_like ?sc_log2e 1.442695)
+        (= ?sexp (Op (Exp2 ?se_shape ?se_in ?se_out) (ICons ?sc (INil))))
+        (= ?sexpsum (Op (Sum ?ss_shape ?kv ?ss_in ?ss_iter ?ss_out)
+            (ICons ?sexp (INil))))
+        (= ?srecip (Op (Recip ?sr_shape ?sr_in ?sr_out) (ICons ?sexpsum (INil))))
+        (= ?soft (Op (Mul ?sf_shape ?sf_a ?sf_b ?sf_o)
+            (ICons ?sexp (ICons ?srecip (INil)))))
+
+        ; ── attn @ V: out [h, s, d], reduction over kv ──
+        (= ?out (Op (GenericMatmul
+            ?pv_out_shape ?pv_mul_shape ?kv
+            ?soft_stride ?v_stride
+            ?pv_sum_in ?pv_k_stride ?pv_sum_out
+            ?pv_dtype)
+            (ICons ?soft (ICons ?v (INil)))))
+        (generic_matmul_exact_3d ?out ?h ?s ?d ?kv ?dt2)
+        (= ?pv_dtype ?dt2)
+        (= ?dt2 ?dt)
+        (= ?pv_out_shape (ECons ?h (ECons ?s (ECons ?d (ENil)))))
+
+        ; Operand strides in [h, s(m), d(n), kv(k)] space. The softmax
+        ; output's memory layout is irrelevant to FlashInfer — it only proves
+        ; which axis is contracted.
+        (= ?soft_stride (ECons ?soft_h (ECons ?soft_m (ECons (MNum 0) (ECons (MIter) (ENil))))))
+        (= ?v_stride (ECons ?v_h (ECons (MNum 0) (ECons (MIter) (ECons ?v_kv (ENil))))))
+        (= ?pv_k_stride (MIter))
+
+        (= ?dt (dtype ?q))
+        (= ?dt (dtype ?k))
+        (= ?dt (dtype ?v))
+        (flashinfer_prefill_dt ?dt)
+        (flashinfer_head_dim_ok_16bit ?d)
+    )
+    (
+        (let ?fi (Op (flashinfer_dense_attention
+            ?h ?d ?s ?kv
+            ?q_n            ; q_stride_n (per-token)
+            ?q_h            ; q_stride_h (per-head)
+            ?k_n            ; k_stride_n
+            ?k_h            ; k_stride_h
+            ?v_kv           ; v_stride_n
+            ?v_h            ; v_stride_h
+            ?dt ?scale_val)
+            (ICons ?q (ICons ?k (ICons ?v (INil))))))
+        (union ?out ?fi)
+        (set (dtype ?fi) ?dt)
+    )
+    :ruleset kernel_fuse_late2
+    :name "FlashInfer dense bidirectional attention"
+)

@@ -50,6 +50,22 @@ pub struct FlashInferAttention {
     /// (number of previous kv positions visible); -1 = no window.
     pub window_left: i64,
 
+    /// Dense bidirectional attention (no KV cache, no mask): inputs are
+    /// (Q, K, V) as plain tensors read through the element strides below
+    /// (head_dim contiguous), run as a FlashInfer single-prefill with
+    /// MaskMode::kNone — no plan phase, no page table. The paged fields keep
+    /// their cache semantics when this is false.
+    pub dense: bool,
+    /// Dense-mode KV sequence length.
+    pub kv_len: Expression,
+    /// Dense-mode Q/K/V strides in elements: token axis / head axis.
+    pub q_stride_n: Expression,
+    pub q_stride_h: Expression,
+    pub k_stride_n: Expression,
+    pub k_stride_h: Expression,
+    pub v_stride_n: Expression,
+    pub v_stride_h: Expression,
+
     pub plan_info: Mutex<Vec<i64>>,
 }
 
@@ -71,6 +87,16 @@ pub(crate) struct FlashInferDecodeSpec {
     /// the shared prepare cache and capture signatures distinguish kernel
     /// variants.
     window_left: i32,
+    /// Dense bidirectional attention (see [`FlashInferAttention::dense`]):
+    /// Q/K/V read through the element strides below, run as a plan-free
+    /// single-prefill with MaskMode::kNone.
+    dense: bool,
+    q_stride_n: i32,
+    q_stride_h: i32,
+    k_stride_n: i32,
+    k_stride_h: i32,
+    v_stride_n: i32,
+    v_stride_h: i32,
     kv_indptr_host: Vec<i32>,
     qo_indptr_host: Vec<i32>,
 }
@@ -320,12 +346,26 @@ impl Default for FlashInferAttention {
             dtype: DType::F32,
             sm_scale: 0.0,
             window_left: -1,
+            dense: false,
+            kv_len: Expression::default(),
+            q_stride_n: Expression::default(),
+            q_stride_h: Expression::default(),
+            k_stride_n: Expression::default(),
+            k_stride_h: Expression::default(),
+            v_stride_n: Expression::default(),
+            v_stride_h: Expression::default(),
             plan_info: Mutex::new(Vec::new()),
         }
     }
 }
 
 impl EgglogOp for FlashInferAttention {
+    fn seed_priority(&self) -> u8 {
+        // Above cuBLASLt: when an attention island and the cuBLASLt matmuls
+        // inside it are alternatives in one e-class, seed the fused island.
+        2
+    }
+
     fn sort(&self) -> SortDef {
         sort(
             OP_KIND,
@@ -415,7 +455,7 @@ impl EgglogOp for FlashInferAttention {
             dtype,
             sm_scale,
             window_left,
-            plan_info: Mutex::new(Vec::new()),
+            ..Default::default()
         };
 
         // Trigger JIT compilation (or .so cache hit) at extract time, not at
@@ -443,9 +483,159 @@ impl EgglogOp for FlashInferAttention {
     }
 }
 
+/// Dense bidirectional attention (no KV cache, no mask):
+/// `softmax((Q @ K^T) * scale) @ V` over materialized head-major Q/K/V —
+/// diffusion-transformer (MMDiT/FLUX) attention.
+///
+/// A second egglog sort that extracts into the same [`FlashInferAttention`]
+/// host op with `dense: true`, keeping the paged rules' positional
+/// `(FlashInferAttention ...)` sites untouched (the `CuBlasLtB2` pattern).
+#[derive(Debug, Default)]
+pub struct FlashInferDenseAttention;
+
+impl EgglogOp for FlashInferDenseAttention {
+    fn seed_priority(&self) -> u8 {
+        2
+    }
+
+    fn sort(&self) -> SortDef {
+        sort(
+            OP_KIND,
+            "flashinfer_dense_attention",
+            &[
+                ("num_heads", EXPRESSION),
+                ("head_dim", EXPRESSION),
+                ("q_len", EXPRESSION),
+                ("kv_len", EXPRESSION),
+                ("q_stride_n", EXPRESSION),
+                ("q_stride_h", EXPRESSION),
+                ("k_stride_n", EXPRESSION),
+                ("k_stride_h", EXPRESSION),
+                ("v_stride_n", EXPRESSION),
+                ("v_stride_h", EXPRESSION),
+                ("dtype", DTYPE),
+                ("sm_scale", F64),
+            ],
+        )
+    }
+
+    fn n_inputs(&self) -> usize {
+        3
+    }
+
+    fn rewrites(&self) -> Vec<Rule> {
+        // Same Ampere+ gate as the paged rules (cp.async).
+        if crate::device_compute_major() < 8 {
+            return vec![];
+        }
+        vec![Rule::raw(include_str!["flashinfer_dense_rewrite.egg"])]
+    }
+
+    fn extract<'a>(
+        &'a self,
+        egraph: &'a luminal::egglog_utils::SerializedEGraph,
+        kind_children: &[&'a ENodeId],
+        input_enodes: Vec<&'a ENodeId>,
+        _list_cache: &mut FxHashMap<&'a ENodeId, Vec<Expression>>,
+        expr_cache: &mut FxHashMap<&'a ENodeId, Expression>,
+    ) -> (LLIROp, Vec<&'a ENodeId>) {
+        let num_heads = extract_expr(egraph, kind_children[0], expr_cache)
+            .unwrap()
+            .exec(&FxHashMap::default())
+            .unwrap();
+        let head_dim = extract_expr(egraph, kind_children[1], expr_cache)
+            .unwrap()
+            .exec(&FxHashMap::default())
+            .unwrap();
+        let q_len = extract_expr(egraph, kind_children[2], expr_cache).unwrap();
+        let kv_len = extract_expr(egraph, kind_children[3], expr_cache).unwrap();
+        let q_stride_n = extract_expr(egraph, kind_children[4], expr_cache).unwrap();
+        let q_stride_h = extract_expr(egraph, kind_children[5], expr_cache).unwrap();
+        let k_stride_n = extract_expr(egraph, kind_children[6], expr_cache).unwrap();
+        let k_stride_h = extract_expr(egraph, kind_children[7], expr_cache).unwrap();
+        let v_stride_n = extract_expr(egraph, kind_children[8], expr_cache).unwrap();
+        let v_stride_h = extract_expr(egraph, kind_children[9], expr_cache).unwrap();
+        let dtype = extract_dtype(egraph, kind_children[10]);
+        let sm_scale: f64 = egraph.enodes[kind_children[11]]
+            .0
+            .replace('"', "")
+            .parse()
+            .unwrap();
+        assert!(
+            FlashInferDType::from_dtype(dtype).is_some(),
+            "flashinfer_dense_attention extracted with unsupported dtype {dtype:?}"
+        );
+
+        let extracted = FlashInferAttention {
+            num_qo_heads: num_heads,
+            num_kv_heads: num_heads,
+            head_dim,
+            batch_dim: q_len,
+            dtype,
+            sm_scale,
+            window_left: -1,
+            dense: true,
+            kv_len,
+            q_stride_n,
+            q_stride_h,
+            k_stride_n,
+            k_stride_h,
+            v_stride_n,
+            v_stride_h,
+            ..Default::default()
+        };
+
+        // Pay the JIT cost at extract time, not inside the GA profiling loop.
+        let _ = jit::ensure_compiled(head_dim, false);
+
+        let op = LLIROp::new::<dyn HostOp>(Box::new(extracted) as Box<dyn HostOp>);
+        (op, input_enodes)
+    }
+
+    fn cleanup(&self) -> bool {
+        false
+    }
+}
+
 impl FlashInferAttention {
     pub(crate) fn graph_inputs(&self) -> usize {
-        4
+        if self.dense { 3 } else { 4 }
+    }
+
+    /// Build the dense-mode spec: batch 1, one full head-major (HND) KV page.
+    fn dense_spec(&self, dyn_map: &FxHashMap<char, usize>) -> Option<FlashInferDecodeSpec> {
+        let resolve = |e: &Expression| e.substitute('z', Expression::from(1)).exec(dyn_map);
+        let total_q_tokens = resolve(&self.batch_dim)?;
+        let c = resolve(&self.kv_len)?;
+        let dtype = FlashInferDType::from_dtype(self.dtype)?;
+        let sm_scale = if self.sm_scale == 0.0 {
+            1.0 / (self.head_dim as f32).sqrt()
+        } else {
+            self.sm_scale as f32
+        };
+        Some(FlashInferDecodeSpec {
+            total_q_tokens,
+            batch_size: 1,
+            c,
+            num_qo_heads: self.num_qo_heads,
+            num_kv_heads: self.num_kv_heads,
+            page_size: c,
+            head_dim: self.head_dim,
+            kv_dim: self.num_kv_heads * self.head_dim,
+            max_kv_pages: 1,
+            dtype,
+            sm_scale_bits: sm_scale.to_bits(),
+            window_left: -1,
+            dense: true,
+            q_stride_n: resolve(&self.q_stride_n)? as i32,
+            q_stride_h: resolve(&self.q_stride_h)? as i32,
+            k_stride_n: resolve(&self.k_stride_n)? as i32,
+            k_stride_h: resolve(&self.k_stride_h)? as i32,
+            v_stride_n: resolve(&self.v_stride_n)? as i32,
+            v_stride_h: resolve(&self.v_stride_h)? as i32,
+            kv_indptr_host: Vec::new(),
+            qo_indptr_host: Vec::new(),
+        })
     }
 
     /// Resolve only dimensions and allocation sizes. No pointer is fabricated
@@ -458,6 +648,28 @@ impl FlashInferAttention {
         dyn_map: &FxHashMap<char, usize>,
         enable_cuda_graph: bool,
     ) -> Result<FlashInferDeviceResourceSpec, ResourceViolation> {
+        if self.dense {
+            if inputs.len() != 3 {
+                return Err(ResourceViolation::HostResourcePlanning {
+                    name: "FlashInferAttention dense input arity",
+                });
+            }
+            let spec = self
+                .dense_spec(dyn_map)
+                .ok_or(ResourceViolation::UnresolvedExpression {
+                    resource: "FlashInfer dense attention dims",
+                })?;
+            return Ok(FlashInferDeviceResourceSpec {
+                // Dense metadata is derived from the spec alone (no gather
+                // producer), but prepared buffers include the temp output, so
+                // skip dedup rather than share across differently-sized islands.
+                cache_key: None,
+                spec,
+                explicit_qo_indptr: false,
+                explicit_kv_indptr: false,
+                enable_cuda_graph,
+            });
+        }
         let total_q_tokens =
             self.batch_dim
                 .exec(dyn_map)
@@ -538,6 +750,13 @@ impl FlashInferAttention {
             dtype,
             sm_scale_bits: sm_scale.to_bits(),
             window_left: self.window_left as i32,
+            dense: false,
+            q_stride_n: 0,
+            q_stride_h: 0,
+            k_stride_n: 0,
+            k_stride_h: 0,
+            v_stride_n: 0,
+            v_stride_h: 0,
             kv_indptr_host: Vec::new(),
             qo_indptr_host: Vec::new(),
         };
@@ -562,6 +781,35 @@ impl FlashInferAttention {
         buffers: &FxHashMap<NodeIndex, DeviceBuffer>,
         dyn_map: &FxHashMap<char, usize>,
     ) -> anyhow::Result<FlashInferResolvedDecode> {
+        let get_buf = |name: &str, node: NodeIndex| -> anyhow::Result<DeviceBuffer> {
+            buffers.get(&node).copied().ok_or_else(|| {
+                anyhow::anyhow!("FlashInferAttention missing {name} buffer for {node:?}")
+            })
+        };
+
+        if self.dense {
+            anyhow::ensure!(
+                inputs.len() == 3,
+                "FlashInferAttention dense expects 3 inputs (Q, K, V), got {}",
+                inputs.len()
+            );
+            let spec = self.dense_spec(dyn_map).ok_or_else(|| {
+                anyhow::anyhow!("FlashInferAttention dense dims/strides are unresolved")
+            })?;
+            return Ok(FlashInferResolvedDecode {
+                ptrs: FlashInferDecodePointers {
+                    q: get_buf("Q", inputs[0])?.ptr(),
+                    k_cache: get_buf("K", inputs[1])?.ptr(),
+                    v_cache: get_buf("V", inputs[2])?.ptr(),
+                    gather_idx: 0,
+                    output: get_buf("output", self_node)?.ptr(),
+                    explicit_qo_indptr: None,
+                    explicit_kv_indptr: None,
+                },
+                spec,
+            });
+        }
+
         let total_q_tokens = self
             .batch_dim
             .exec(dyn_map)
@@ -575,12 +823,6 @@ impl FlashInferAttention {
                 inputs.len()
             );
         }
-
-        let get_buf = |name: &str, node: NodeIndex| -> anyhow::Result<DeviceBuffer> {
-            buffers.get(&node).copied().ok_or_else(|| {
-                anyhow::anyhow!("FlashInferAttention missing {name} buffer for {node:?}")
-            })
-        };
 
         let q_buf = get_buf("Q", inputs[0])?;
         let k_buf = get_buf("K_cache", inputs[1])?;
@@ -650,6 +892,13 @@ impl FlashInferAttention {
                 dtype,
                 sm_scale_bits: sm_scale.to_bits(),
                 window_left: self.window_left as i32,
+                dense: false,
+                q_stride_n: 0,
+                q_stride_h: 0,
+                k_stride_n: 0,
+                k_stride_h: 0,
+                v_stride_n: 0,
+                v_stride_h: 0,
                 kv_indptr_host,
                 qo_indptr_host: Vec::new(),
             },
@@ -702,6 +951,9 @@ impl FlashInferAttention {
             let r = spec.batch_size + 1;
             spec.kv_indptr_host = read_device_i32s(kv_indptr_ptr, r)?;
             (None, None)
+        } else if spec.dense {
+            // Dense single-prefill: plan-free, no page table.
+            (None, None)
         } else if is_prefill {
             // Single-sequence prefill: s q tokens attending causally to a
             // c-token context whose last s slots are the q tokens themselves.
@@ -740,7 +992,7 @@ impl FlashInferAttention {
         };
 
         // Prefill also needs qo_indptr (host for plan, device for run).
-        let (owned_qo_indptr, owned_qo_indptr_ptr) = if is_prefill {
+        let (owned_qo_indptr, owned_qo_indptr_ptr) = if is_prefill && !spec.dense {
             if let Some(qo_indptr_ptr) = resolved.ptrs.explicit_qo_indptr {
                 let r = spec.batch_size + 1;
                 spec.qo_indptr_host = read_device_i32s(qo_indptr_ptr, r)?;
@@ -763,7 +1015,12 @@ impl FlashInferAttention {
             );
         }
 
-        let indices = unsafe { stream.alloc::<i32>(spec.c.max(1))? };
+        let indices = if spec.dense {
+            // Plan-free single-prefill: no page-table metadata at all.
+            unsafe { stream.alloc::<i32>(1)? }
+        } else {
+            unsafe { stream.alloc::<i32>(spec.c.max(1))? }
+        };
         let indices_ptr = indices.device_ptr(stream).0;
         let last_page_len_host = vec![1i32; spec.batch_size];
         let last_page_len = if last_page_len_host.is_empty() {
@@ -790,7 +1047,10 @@ impl FlashInferAttention {
 
         let mut plan_info_buf = [0i64; 16];
         let mut plan_info_len: i32 = 0;
-        let plan_ret = if is_prefill {
+        let plan_ret = if spec.dense {
+            // Dense single-prefill has no plan phase.
+            0
+        } else if is_prefill {
             unsafe {
                 (lib.prefill_plan)(
                     float_workspace_ptr as *mut std::ffi::c_void,
@@ -900,6 +1160,50 @@ impl PreparedFlashInferDecode {
         include_metadata: bool,
     ) -> anyhow::Result<()> {
         let cu_stream = stream.cu_stream() as *mut std::ffi::c_void;
+
+        if self.spec.dense {
+            // Plan-free single-prefill into the packed temp buffer, then the
+            // shared (qo, heads, dim) → (heads, qo, dim) output transpose.
+            let run_ret = unsafe {
+                (self.lib.single_prefill_run)(
+                    ptrs.q as *mut std::ffi::c_void,
+                    ptrs.k_cache as *mut std::ffi::c_void,
+                    ptrs.v_cache as *mut std::ffi::c_void,
+                    self.temp_output_ptr as *mut std::ffi::c_void,
+                    self.spec.total_q_tokens as i32,
+                    self.spec.c as i32,
+                    self.spec.num_qo_heads as i32,
+                    self.spec.num_kv_heads as i32,
+                    self.spec.q_stride_n,
+                    self.spec.q_stride_h,
+                    self.spec.k_stride_n,
+                    self.spec.k_stride_h,
+                    self.spec.v_stride_n,
+                    self.spec.v_stride_h,
+                    self.spec.dtype as i32,
+                    f32::from_bits(self.spec.sm_scale_bits),
+                    cu_stream,
+                )
+            };
+            if run_ret != 0 {
+                return Err(anyhow::anyhow!(
+                    "FlashInfer dense single-prefill run failed with error code {run_ret}"
+                ));
+            }
+            unsafe {
+                (self.lib.transpose_output)(
+                    self.temp_output_ptr as *const std::ffi::c_void,
+                    ptrs.output as *mut std::ffi::c_void,
+                    self.spec.total_q_tokens as i32,
+                    self.spec.num_qo_heads as i32,
+                    self.spec.head_dim as i32,
+                    self.spec.dtype as i32,
+                    cu_stream,
+                );
+            }
+            return Ok(());
+        }
+
         let kv_indptr_ptr = ptrs
             .explicit_kv_indptr
             .or(self.owned_kv_indptr_ptr)
@@ -1179,7 +1483,7 @@ mod resource_tests {
             dtype: DType::F16,
             sm_scale: 0.0,
             window_left: -1,
-            plan_info: Mutex::new(Vec::new()),
+            ..Default::default()
         };
         let inputs = (0..4).map(NodeIndex::new).collect_vec();
         let kv_row_bytes = 2 * 64 * 2;
@@ -1219,7 +1523,7 @@ mod resource_tests {
             dtype: DType::F16,
             sm_scale: 0.0,
             window_left: -1,
-            plan_info: Mutex::new(Vec::new()),
+            ..Default::default()
         };
         let inputs = (0..4).map(NodeIndex::new).collect_vec();
         let dyn_map = FxHashMap::from_iter([('c', 100)]);
@@ -1253,7 +1557,7 @@ mod resource_tests {
             dtype: DType::F16,
             sm_scale: 0.0,
             window_left: -1,
-            plan_info: Mutex::new(Vec::new()),
+            ..Default::default()
         };
         let inputs = (0..6).map(NodeIndex::new).collect_vec();
         let kv_row_bytes = 2 * 64 * 2;

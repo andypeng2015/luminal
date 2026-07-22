@@ -175,6 +175,26 @@ pub type PrefillRunFn = unsafe extern "C" fn(
     stream: *mut c_void,
 ) -> i32;
 
+pub type SinglePrefillRunFn = unsafe extern "C" fn(
+    q: *mut c_void,
+    k: *mut c_void,
+    v: *mut c_void,
+    output: *mut c_void,
+    qo_len: i32,
+    kv_len: i32,
+    num_qo_heads: i32,
+    num_kv_heads: i32,
+    q_stride_n: i32,
+    q_stride_h: i32,
+    k_stride_n: i32,
+    k_stride_h: i32,
+    v_stride_n: i32,
+    v_stride_h: i32,
+    dtype: i32,
+    sm_scale: f32,
+    stream: *mut c_void,
+) -> i32;
+
 // ── Embedded CUDA sources ──
 
 const WRAPPER_CU: &str = include_str!("wrapper.cu");
@@ -192,6 +212,7 @@ pub struct FlashInferLib {
     pub transpose_output: TransposeOutputFn,
     pub prefill_plan: PrefillPlanFn,
     pub prefill_run: PrefillRunFn,
+    pub single_prefill_run: SinglePrefillRunFn,
 }
 
 // SAFETY: The library handle and function pointers are valid for the lifetime
@@ -248,6 +269,8 @@ impl FlashInferLib {
             unsafe { *lib.get::<PrefillPlanFn>(b"flashinfer_batch_prefill_plan\0")? };
         let prefill_run: PrefillRunFn =
             unsafe { *lib.get::<PrefillRunFn>(b"flashinfer_batch_prefill_run\0")? };
+        let single_prefill_run: SinglePrefillRunFn =
+            unsafe { *lib.get::<SinglePrefillRunFn>(b"flashinfer_single_prefill_run\0")? };
         Ok(Self {
             _lib: lib,
             plan,
@@ -257,6 +280,7 @@ impl FlashInferLib {
             transpose_output,
             prefill_plan,
             prefill_run,
+            single_prefill_run,
         })
     }
 }

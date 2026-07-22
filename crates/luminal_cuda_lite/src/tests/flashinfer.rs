@@ -155,7 +155,7 @@ fn run_flashinfer(
         dtype: luminal::dtype::DType::F32,
         sm_scale: 0.0,
         window_left: -1,
-        plan_info: Mutex::new(Vec::new()),
+        ..Default::default()
     };
 
     // Reserve dedicated NodeIndex values for the test ports.
@@ -229,7 +229,7 @@ fn run_flashinfer_with_compact_decode_indices(
         dtype: luminal::dtype::DType::F32,
         sm_scale: 0.0,
         window_left: -1,
-        plan_info: Mutex::new(Vec::new()),
+        ..Default::default()
     };
 
     let nodes: Vec<NodeIndex> = (0..5).map(NodeIndex::new).collect();
@@ -284,7 +284,7 @@ fn resolve_flashinfer_decode_for_signature_test(
         dtype: luminal::dtype::DType::F32,
         sm_scale: 0.0,
         window_left: -1,
-        plan_info: Mutex::new(Vec::new()),
+        ..Default::default()
     };
     let nodes: Vec<NodeIndex> = (0..5).map(NodeIndex::new).collect();
     let (q_n, k_n, v_n, idx_n, out_n) = (nodes[0], nodes[1], nodes[2], nodes[3], nodes[4]);
@@ -1441,7 +1441,7 @@ fn run_flashinfer_bf16(
         dtype: luminal::dtype::DType::Bf16,
         sm_scale: 0.0,
         window_left: -1,
-        plan_info: Mutex::new(Vec::new()),
+        ..Default::default()
     };
 
     let nodes: Vec<NodeIndex> = (0..7).map(NodeIndex::new).collect();
@@ -2014,4 +2014,105 @@ fn dump_llama_swiglu_chain_egglog() {
     let _ = q.cast(DType::F32).output();
     let (program, _root) = luminal::egglog_utils::hlir_to_egglog(&cx);
     println!("{program}");
+}
+
+// ─── Dense bidirectional attention (single-prefill island) ───────────────
+
+/// CPU reference for the dense island: inputs are [seq, heads*dk] projections
+/// (bf16-rounded to match the on-device dtype), output is [heads, seq, dk]
+/// contiguous — per head `softmax((q_h @ k_h^T) * scale) @ v_h`.
+fn dense_attention_reference(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    heads: usize,
+    seq: usize,
+    dk: usize,
+    scale: f32,
+) -> Vec<f32> {
+    let hd = heads * dk;
+    let mut out = vec![0.0f32; heads * seq * dk];
+    for h in 0..heads {
+        for i in 0..seq {
+            let mut scores = vec![0.0f32; seq];
+            for (j, score) in scores.iter_mut().enumerate() {
+                for x in 0..dk {
+                    *score += q[i * hd + h * dk + x] * k[j * hd + h * dk + x];
+                }
+                *score *= scale;
+            }
+            let max = scores.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            let mut denom = 0.0f32;
+            for score in scores.iter_mut() {
+                *score = (*score - max).exp();
+                denom += *score;
+            }
+            for x in 0..dk {
+                let mut acc = 0.0f32;
+                for (j, score) in scores.iter().enumerate() {
+                    acc += (score / denom) * v[j * hd + h * dk + x];
+                }
+                out[(h * seq + i) * dk + x] = acc;
+            }
+        }
+    }
+    out
+}
+
+/// The dense rule must fire on a plain bidirectional SDPA chain over
+/// head-interleaved projection views (no mask, no KV cache) and the
+/// single-prefill runtime must match a dense reference.
+#[test]
+fn flashinfer_dense_attention_island_executes_correctly() {
+    let Some(stream) = get_cuda_stream() else {
+        return;
+    };
+    if crate::device_compute_major() < 8 {
+        return;
+    }
+
+    let (heads, seq, dk) = (3usize, 64usize, 64usize);
+    let scale = 1.0f32 / (dk as f32).sqrt();
+    let mut cx = Graph::new();
+    let q_proj = cx.tensor((seq, heads * dk));
+    let k_proj = cx.tensor((seq, heads * dk));
+    let v_proj = cx.tensor((seq, heads * dk));
+    let q = q_proj.cast(DType::Bf16).split_dims(1, dk).permute(&[1, 0, 2]);
+    let k = k_proj.cast(DType::Bf16).split_dims(1, dk).permute(&[1, 0, 2]);
+    let v = v_proj.cast(DType::Bf16).split_dims(1, dk).permute(&[1, 0, 2]);
+    let scores = q.matmul(k.transpose(1, 2)) * scale;
+    let out = scores.softmax(2).matmul(v).cast(DType::F32).output();
+
+    cx.build_search_space::<CudaRuntime>(CompileOptions::default());
+    let llir = crate::tests::utilities::try_extract_forced_op_llir_where(
+        &cx,
+        &["flashinfer_dense_attention"],
+        crate::tests::utilities::ForcedExtractionConfig::new(0xF1A5_0001),
+        |_| true,
+    )
+    .expect("dense SDPA chain should offer a flashinfer_dense_attention candidate");
+
+    let round = |x: &f32| half::bf16::from_f32(*x).to_f32();
+    let q_data = crate::tests::utilities::random_f32_vec(seq * heads * dk, 0xF1A5_0002, -0.5, 0.5);
+    let k_data = crate::tests::utilities::random_f32_vec(seq * heads * dk, 0xF1A5_0003, -0.5, 0.5);
+    let v_data = crate::tests::utilities::random_f32_vec(seq * heads * dk, 0xF1A5_0004, -0.5, 0.5);
+    let expected = dense_attention_reference(
+        &q_data.iter().map(round).collect::<Vec<_>>(),
+        &k_data.iter().map(round).collect::<Vec<_>>(),
+        &v_data.iter().map(round).collect::<Vec<_>>(),
+        heads,
+        seq,
+        dk,
+        scale,
+    );
+
+    let mut rt = CudaRuntime::initialize(stream);
+    rt.load_llir(&llir);
+    rt.set_data(q_proj.id, q_data);
+    rt.set_data(k_proj.id, k_data);
+    rt.set_data(v_proj.id, v_data);
+    rt.execute(&cx.dyn_map);
+
+    // bf16 inputs with f32 softmax/accumulation inside FlashInfer.
+    crate::tests::utilities::assert_close(&rt.get_f32(out.id), &expected, 2e-2, 2e-2);
 }

@@ -15,6 +15,7 @@ pub type Ops = (
     moe::GLUMoE,
     moe::fused::FusedMoE,
     flashinfer::FlashInferAttention,
+    flashinfer::FlashInferDenseAttention,
 );
 
 #[cfg(test)]

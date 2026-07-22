@@ -312,6 +312,56 @@ static int batch_decode_run_t(
     return (int)status;
 }
 
+// ── dtype-templated dense single prefill (no KV cache, no mask) ──
+// Dense bidirectional attention over plain Q/K/V tensors with free
+// per-tensor token/head strides (head_dim must be contiguous). No plan
+// phase, no page table. tmp=nullptr disables split-KV, which large-qo
+// diffusion workloads never trigger anyway.
+
+template <typename T>
+static int single_prefill_run_t(
+    T* q, T* k, T* v, T* output,
+    int qo_len, int kv_len, int num_qo_heads, int num_kv_heads,
+    int q_stride_n, int q_stride_h,
+    int k_stride_n, int k_stride_h,
+    int v_stride_n, int v_stride_h,
+    float sm_scale,
+    cudaStream_t stream)
+{
+    SinglePrefillParams<T, T, T> params;
+    params.q = q;
+    params.k = k;
+    params.v = v;
+    params.maybe_custom_mask = nullptr;
+    params.o = output;
+    params.lse = nullptr;
+    params.maybe_alibi_slopes = nullptr;
+    params.group_size = uint_fastdiv((uint32_t)(num_qo_heads / num_kv_heads));
+    params.qo_len = (uint32_t)qo_len;
+    params.kv_len = (uint32_t)kv_len;
+    params.num_qo_heads = (uint32_t)num_qo_heads;
+    params.num_kv_heads = (uint32_t)num_kv_heads;
+    params.q_stride_n = (uint32_t)q_stride_n;
+    params.q_stride_h = (uint32_t)q_stride_h;
+    params.k_stride_n = (uint32_t)k_stride_n;
+    params.k_stride_h = (uint32_t)k_stride_h;
+    params.v_stride_n = (uint32_t)v_stride_n;
+    params.v_stride_h = (uint32_t)v_stride_h;
+    params.head_dim = HEAD_DIM;
+    params.window_left = -1;
+    params.logits_soft_cap = 0.0f;
+    params.sm_scale = sm_scale;
+    params.rope_rcp_scale = 1.0f;
+    params.rope_rcp_theta = 1.0f;
+    params.partition_kv = false;
+
+    cudaError_t status = flashinfer::SinglePrefillWithKVCacheDispatched<
+        HEAD_DIM, HEAD_DIM, POS_ENCODING_MODE, /*use_fp16_qk_reduction=*/false,
+        MaskMode::kNone, Variant, SinglePrefillParams<T, T, T>>(
+        params, /*tmp=*/nullptr, stream);
+    return (int)status;
+}
+
 // ── dtype-templated prefill plan / run implementations ──
 
 template <typename T>
@@ -627,6 +677,37 @@ int flashinfer_batch_prefill_run(
                 qo_indptr, kv_indptr, kv_indices, kv_last_page_len,
                 (__nv_bfloat16*)output, batch_size, num_qo_heads, num_kv_heads,
                 page_size, sm_scale, window_left, stream);
+        default:
+            return -1; // f32 prefill is physically unsupported
+    }
+}
+
+// Dense bidirectional single prefill (no KV cache, no mask). Strides are in
+// elements; head_dim is contiguous in all three tensors. Output is written
+// packed [qo_len, num_qo_heads, head_dim].
+int flashinfer_single_prefill_run(
+    void* q, void* k, void* v, void* output,
+    int qo_len, int kv_len, int num_qo_heads, int num_kv_heads,
+    int q_stride_n, int q_stride_h,
+    int k_stride_n, int k_stride_h,
+    int v_stride_n, int v_stride_h,
+    int dtype, float sm_scale,
+    cudaStream_t stream)
+{
+    switch (dtype) {
+        case LUMINAL_DTYPE_F16:
+            return single_prefill_run_t<half>(
+                (half*)q, (half*)k, (half*)v, (half*)output,
+                qo_len, kv_len, num_qo_heads, num_kv_heads,
+                q_stride_n, q_stride_h, k_stride_n, k_stride_h,
+                v_stride_n, v_stride_h, sm_scale, stream);
+        case LUMINAL_DTYPE_BF16:
+            return single_prefill_run_t<__nv_bfloat16>(
+                (__nv_bfloat16*)q, (__nv_bfloat16*)k, (__nv_bfloat16*)v,
+                (__nv_bfloat16*)output,
+                qo_len, kv_len, num_qo_heads, num_kv_heads,
+                q_stride_n, q_stride_h, k_stride_n, k_stride_h,
+                v_stride_n, v_stride_h, sm_scale, stream);
         default:
             return -1; // f32 prefill is physically unsupported
     }

@@ -107,6 +107,22 @@ int flashinfer_batch_prefill_run(
     float sm_scale, int window_left,
     cudaStream_t stream);
 
+// ── Dense bidirectional single prefill (f16 / bf16 only) ──
+
+// Fused softmax(Q·K^T·scale)·V over plain Q/K/V tensors — no KV cache, no
+// mask, no plan phase. Strides are in elements (token axis / head axis);
+// head_dim must be contiguous in all three tensors. Output is written packed
+// [qo_len, num_qo_heads, head_dim].
+// Returns 0 on success, non-zero on failure.
+int flashinfer_single_prefill_run(
+    void* q, void* k, void* v, void* output,
+    int qo_len, int kv_len, int num_qo_heads, int num_kv_heads,
+    int q_stride_n, int q_stride_h,
+    int k_stride_n, int k_stride_h,
+    int v_stride_n, int v_stride_h,
+    int dtype, float sm_scale,
+    cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif
