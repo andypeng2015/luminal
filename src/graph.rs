@@ -1008,6 +1008,38 @@ impl Graph {
             cache.insert(node, op.1);
             return op.1;
         }
+        // Loop markers are stamped with their dtype at creation time (while
+        // the pre-rewire edges were still intact), so trust the stamp instead
+        // of walking edges. This matters twice over: LoopInput source edges
+        // are deferred (`add_iteration_ordered_edges`), so mid-pass the marker
+        // has no predecessors and edge-walking would hit the F32 fallback; and
+        // marker chains can cycle, where the cycle-breaker would also yield
+        // F32. Either path silently corrupts a Bf16 class's dtype fact via the
+        // last-write-wins `dtype` merge (fusion-region reject storms).
+        if let Some(op) = self.try_get_op::<crate::hlir::LoopStart>(node) {
+            cache.insert(node, op.dtype);
+            return op.dtype;
+        }
+        if let Some(op) = self.try_get_op::<crate::hlir::LoopEnd>(node) {
+            cache.insert(node, op.dtype);
+            return op.dtype;
+        }
+        if let Some(op) = self.try_get_op::<crate::hlir::LoopInput>(node) {
+            cache.insert(node, op.dtype);
+            return op.dtype;
+        }
+        if let Some(op) = self.try_get_op::<crate::hlir::LoopInputStatic>(node) {
+            cache.insert(node, op.dtype);
+            return op.dtype;
+        }
+        if let Some(op) = self.try_get_op::<crate::hlir::LoopOutput>(node) {
+            cache.insert(node, op.dtype);
+            return op.dtype;
+        }
+        if let Some(op) = self.try_get_op::<crate::hlir::LoopOutputSelect>(node) {
+            cache.insert(node, op.dtype);
+            return op.dtype;
+        }
         // Mirror the egglog `dtype_prop` rules exactly. Loop markers created
         // from this inference are later unioned with their sources by the
         // "LoopInputStatic inline" rule, and `dtype` merges with `:merge new`
